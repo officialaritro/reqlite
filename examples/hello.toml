@@ -1,0 +1,7 @@
+version = 1
+name = "Hello"
+method = "GET"
+url = "https://httpbin.org/get"
+
+[query]
+from = "reqlite"

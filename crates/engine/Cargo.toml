@@ -1,0 +1,14 @@
+[package]
+name = "reqlite-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reqlite-format = { version = "0.0.1", path = "../format" }
+reqwest = { version = "0.13.5", default-features = false, features = ["query", "rustls"] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "macros"] }
