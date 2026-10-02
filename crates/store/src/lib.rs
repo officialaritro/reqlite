@@ -111,6 +111,7 @@ enum Cmd {
         usize,
         oneshot::Sender<Result<Vec<Summary>, rusqlite::Error>>,
     ),
+    Get(i64, oneshot::Sender<Result<Option<Entry>, rusqlite::Error>>),
 }
 
 /// A handle to the history thread. Clones share the thread. The thread ends
@@ -194,6 +195,12 @@ impl Store {
     pub async fn recent(&self, limit: usize) -> Result<Vec<Summary>, StoreError> {
         let (reply, rx) = oneshot::channel();
         self.call(Cmd::Recent(limit, reply), rx).await
+    }
+
+    /// One send in full, as recorded. `None` when no entry has this id.
+    pub async fn get(&self, id: i64) -> Result<Option<Entry>, StoreError> {
+        let (reply, rx) = oneshot::channel();
+        self.call(Cmd::Get(id, reply), rx).await
     }
 
     async fn call<T>(
@@ -289,6 +296,7 @@ fn serve(conn: Connection, rx: mpsc::Receiver<Cmd>) {
         match cmd {
             Cmd::Record(entry, reply) => drop(reply.send(insert(&conn, &entry))),
             Cmd::Recent(limit, reply) => drop(reply.send(recent(&conn, limit))),
+            Cmd::Get(id, reply) => drop(reply.send(get(&conn, id))),
         }
     }
 }
@@ -357,6 +365,62 @@ fn recent(conn: &Connection, limit: usize) -> Result<Vec<Summary>, rusqlite::Err
         })
     })?;
     rows.collect()
+}
+
+fn get(conn: &Connection, id: i64) -> Result<Option<Entry>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT file, env, request, status, response_headers, response_body, body_len,
+             elapsed_ms, error
+         FROM history WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query(params![id])?;
+    let Some(r) = rows.next()? else {
+        return Ok(None);
+    };
+    let request: String = r.get(2)?;
+    let request: SentRequest = serde_json::from_str(&request).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    let status: Option<i64> = r.get(3)?;
+    let error: Option<String> = r.get(8)?;
+    let outcome = match (status, error) {
+        (Some(status), _) => Outcome::Response {
+            status: u16::try_from(status).unwrap_or_default(),
+            headers: from_wire(&r.get::<_, Option<Vec<u8>>>(4)?.unwrap_or_default()),
+            body: r.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default(),
+            body_len: r
+                .get::<_, Option<i64>>(6)?
+                .map_or(0, |n| u64::try_from(n).unwrap_or(0)),
+            elapsed_ms: r
+                .get::<_, Option<i64>>(7)?
+                .map_or(0, |n| u64::try_from(n).unwrap_or(0)),
+        },
+        (None, error) => Outcome::Failed {
+            error: error.unwrap_or_default(),
+        },
+    };
+    Ok(Some(Entry {
+        file: r.get(0)?,
+        env: r.get(1)?,
+        request,
+        outcome,
+    }))
+}
+
+/// Reads back [`wire_headers`]. HTTP values hold no CR or LF, so splitting on
+/// them is exact.
+fn from_wire(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+    bytes
+        .split(|&b| b == b'\n')
+        .filter_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let at = line.windows(2).position(|w| w == b": ")?;
+            Some((
+                String::from_utf8_lossy(&line[..at]).into_owned(),
+                line[at + 2..].to_vec(),
+            ))
+        })
+        .collect()
 }
 
 /// Headers in HTTP wire form, `name: value\r\n`. Lossless for any value bytes.
@@ -492,6 +556,39 @@ mod tests {
         assert_eq!(rows[1].status, Some(200));
         assert_eq!(rows[1].elapsed_ms, Some(12));
         assert_eq!(store.recent(1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_entry_comes_back_whole_by_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir.path().join("history.db")).unwrap().store;
+        let sent = Outcome::Response {
+            status: 201,
+            headers: vec![
+                ("x-raw".into(), b"caf\xe9".to_vec()),
+                ("set-cookie".into(), b"a=1".to_vec()),
+                ("set-cookie".into(), b"b=2; Path=/".to_vec()),
+            ],
+            body: b"{\"id\": 7}".to_vec(),
+            body_len: 9,
+            elapsed_ms: 40,
+        };
+        let mut posted = entry("http://a/users", sent);
+        posted.request.method = "POST".into();
+        posted.request.query = vec![("tag".into(), "a".into()), ("tag".into(), "b".into())];
+        posted.request.body = Some("{\"name\": \"ada\"}".into());
+        let failed = entry(
+            "http://a/down",
+            Outcome::Failed {
+                error: "cannot connect".into(),
+            },
+        );
+        let first = store.record(posted.clone()).await.unwrap();
+        let second = store.record(failed.clone()).await.unwrap();
+
+        assert_eq!(store.get(first).await.unwrap(), Some(posted));
+        assert_eq!(store.get(second).await.unwrap(), Some(failed));
+        assert_eq!(store.get(second + 100).await.unwrap(), None);
     }
 
     #[tokio::test]
