@@ -24,6 +24,7 @@ fn main() -> ExitCode {
 fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let req = reqlite_format::parse(&text)?;
+    let req = reqlite_engine::resolve(&req, &reqlite_format::Environment::default())?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

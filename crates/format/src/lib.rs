@@ -8,6 +8,9 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+mod env;
+pub use env::{EnvError, Environment, Var, is_var_name, load_env, local_path, parse_env};
+
 /// Current schema version written to and accepted from request files.
 pub const VERSION: u32 = 1;
 

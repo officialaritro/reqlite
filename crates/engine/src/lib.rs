@@ -1,8 +1,9 @@
-//! Sends a [`Request`] and returns the [`Response`]. No UI knowledge lives here.
+//! Resolves and sends requests. No UI knowledge lives here.
 
-use reqlite_format::Request;
 use std::time::{Duration, Instant};
 
+mod resolve;
+pub use resolve::{Parts, ResolveError, Resolved, resolve};
 #[derive(Debug)]
 pub struct Response {
     pub status: u16,
@@ -24,16 +25,16 @@ pub fn client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder().build()
 }
 
-pub async fn send(client: &reqwest::Client, req: &Request) -> Result<Response, SendError> {
+pub async fn send(client: &reqwest::Client, req: &Resolved) -> Result<Response, SendError> {
+    let req = req.sent();
     let method = reqwest::Method::from_bytes(req.method.as_str().as_bytes()).map_err(|e| {
         SendError::Method {
             method: req.method.as_str().to_string(),
             reason: e.to_string(),
         }
     })?;
-    let query: Vec<(&str, &str)> = req.query.pairs().collect();
-    let mut builder = client.request(method, &req.url).query(&query);
-    for (k, v) in req.headers.pairs() {
+    let mut builder = client.request(method, &req.url).query(&req.query);
+    for (k, v) in &req.headers {
         builder = builder.header(k, v);
     }
     if let Some(body) = &req.body {
@@ -67,6 +68,7 @@ pub async fn send(client: &reqwest::Client, req: &Request) -> Result<Response, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqlite_format::{Environment, Request};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -96,7 +98,12 @@ mod tests {
         let (url, _srv) =
             serve_once("HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                 .await;
-        let resp = send(&client().unwrap(), &request(&url)).await.unwrap();
+        let resp = send(
+            &client().unwrap(),
+            &resolve(&request(&url), &Environment::default()).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.status, 201);
         assert_eq!(resp.body, b"ok");
     }
@@ -112,7 +119,16 @@ mod tests {
         req.query.append("tag", "b");
         req.headers.append("X-Test", "yes");
         req.body = Some("hello".into());
-        send(&client().unwrap(), &req).await.unwrap();
+        let env = reqlite_format::parse_env(
+            std::path::Path::new("dev.toml"),
+            "version = 1\nsecrets = ['key']\n",
+            Some("version = 1\n[vars]\nkey = 's3cret'\n"),
+        )
+        .unwrap();
+        req.headers.append("X-Key", "{{key}}");
+        send(&client().unwrap(), &resolve(&req, &env).unwrap())
+            .await
+            .unwrap();
 
         let raw = srv.await.unwrap();
         assert!(
@@ -120,6 +136,7 @@ mod tests {
             "{raw}"
         );
         assert!(raw.to_ascii_lowercase().contains("x-test: yes"), "{raw}");
+        assert!(raw.to_ascii_lowercase().contains("x-key: s3cret"), "{raw}");
         assert!(raw.ends_with("hello"), "{raw}");
     }
 }
