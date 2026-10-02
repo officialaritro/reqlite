@@ -1,5 +1,5 @@
-//! `reqlite-gui [FILE] [--env ENV]`: open, edit, save and send request files,
-//! one per tab.
+//! `reqlite-gui [FILE | DIR] [--env ENV]`: open, edit, save and send request
+//! files, one per tab, from a workspace folder.
 
 use clap::Parser;
 use doc::{Doc, DocId, Opened, Section, Send, Summary, Viewer};
@@ -9,13 +9,15 @@ use iced::{Subscription, Task, event, keyboard::Modifiers, time, window};
 use reqlite_gui::chain;
 use reqlite_gui::present::glass_supported;
 use reqlite_viewer::Document;
-use std::path::PathBuf;
+use sidebar::{SideMsg, Sidebar, Workspace};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 mod doc;
 mod motion;
 mod scrollbar;
+mod sidebar;
 mod style;
 mod view;
 
@@ -30,14 +32,19 @@ const TITLE_ROW: bool = cfg!(target_os = "macos");
 #[derive(Parser, Clone)]
 #[command(version)]
 struct Args {
-    /// The request file. It is created on the first save if it does not exist.
-    file: Option<PathBuf>,
+    /// A request file, or a folder to open as a workspace. A request file that
+    /// does not exist yet is created on the first save. A file opens the
+    /// folder it is in as the workspace.
+    path: Option<PathBuf>,
     /// Environment file that fills `{{var}}` placeholders.
     #[arg(long, short)]
     env: Option<PathBuf>,
 }
 
 struct App {
+    /// The folder of request files. `None` when the app was started with no path.
+    workspace: Option<Workspace>,
+    sidebar: Sidebar,
     /// The open tabs, left to right. It can be empty.
     docs: Vec<Doc>,
     /// The index of the shown tab in `docs`.
@@ -83,6 +90,13 @@ enum Msg {
     Close(DocId),
     /// The answer to "discard changes?".
     Discard(bool),
+    Side(SideMsg),
+    /// Cmd+W: close the shown tab.
+    CloseActive,
+    /// Leaves a name edit or a prompt first, and otherwise cancels the send.
+    Escape,
+    /// Cmd+N: a new request in the sidebar, or a new untitled tab.
+    New,
     FirstFrame,
 }
 
@@ -100,9 +114,28 @@ struct Finished {
     warning: Option<String>,
 }
 
-fn boot(args: &Args, opened: &Opened, started: Instant) -> (App, Task<Msg>) {
+/// What the path on the command line names.
+enum Start {
+    Nothing,
+    Folder(PathBuf),
+    File(PathBuf, Opened),
+}
+
+/// Reads the start path before the window opens, so nothing the user types
+/// can be replaced by a late load.
+fn start(path: Option<&Path>) -> Start {
+    match path {
+        None => Start::Nothing,
+        Some(p) if p.is_dir() => Start::Folder(p.to_path_buf()),
+        Some(p) => Start::File(p.to_path_buf(), doc::open(p)),
+    }
+}
+
+fn boot(args: &Args, start: &Start, started: Instant) -> (App, Task<Msg>) {
     let reduced_motion = std::env::var_os("REQLITE_REDUCE_MOTION").is_some_and(|v| v != "0");
     let mut app = App {
+        workspace: None,
+        sidebar: Sidebar::default(),
         docs: Vec::new(),
         active: 0,
         next_id: 0,
@@ -116,7 +149,20 @@ fn boot(args: &Args, opened: &Opened, started: Instant) -> (App, Task<Msg>) {
         exit_after_first_frame: std::env::var_os("REQLITE_GUI_EXIT_ON_FIRST_FRAME").is_some(),
         reduced_motion,
     };
-    app.open_tab(args.file.clone(), opened);
+    match start {
+        Start::Nothing => {
+            app.open_tab(None, &Opened::Missing);
+        }
+        Start::Folder(dir) => app.workspace = Some(Workspace::open(dir.clone())),
+        Start::File(file, opened) => {
+            let dir = file
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            app.workspace = Some(Workspace::open(dir.to_path_buf()));
+            app.open_tab(Some(file.clone()), opened);
+        }
+    }
     match reqlite_engine::client() {
         Ok(client) => app.client = Some(client),
         Err(e) => app.notice = Some(format!("cannot start the HTTP client: {}", chain(&e))),
@@ -228,6 +274,8 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
                     doc.refresh();
                 }
                 app.notice = None;
+                // A first save adds the file to the tree.
+                sidebar::rescan(app);
             }
             Err(e) => app.notice = Some(e),
         },
@@ -258,9 +306,44 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
                 app.close(id);
             }
         }
+        Msg::Escape => {
+            if app.sidebar.edit.is_some()
+                || app.sidebar.menu.is_some()
+                || app.sidebar.deleting.is_some()
+            {
+                app.sidebar.edit = None;
+                app.sidebar.menu = None;
+                app.sidebar.deleting = None;
+            } else if app.closing.is_some() {
+                app.closing = None;
+            } else {
+                return update(app, Msg::Cancel);
+            }
+        }
+        Msg::CloseActive => {
+            if let Some(id) = app.doc().map(|d| d.id) {
+                return update(app, Msg::Close(id));
+            }
+        }
         Msg::Discard(yes) => match app.closing {
             Some(id) if yes => app.close(id),
             _ => app.closing = None,
+        },
+        Msg::Side(m) => return sidebar::update(app, m),
+        Msg::New => match &app.workspace {
+            Some(w) => {
+                let dir = app
+                    .doc()
+                    .and_then(|d| d.file.as_deref())
+                    .and_then(Path::parent)
+                    .filter(|d| d.starts_with(&w.root) && d.is_dir())
+                    .map_or_else(|| w.root.clone(), Path::to_path_buf);
+                app.sidebar.hidden = false;
+                return sidebar::update(app, SideMsg::Start(sidebar::Action::NewRequest { dir }));
+            }
+            None => {
+                app.open_tab(None, &Opened::Missing);
+            }
         },
         Msg::FirstFrame => {
             println!(
@@ -459,6 +542,9 @@ fn shortcut(key: &Key, modifiers: Modifiers) -> Option<Msg> {
         Key::Character("1") => Some(Msg::Section(Section::Query)),
         Key::Character("2") => Some(Msg::Section(Section::Headers)),
         Key::Character("3") => Some(Msg::Section(Section::Body)),
+        Key::Character("n") => Some(Msg::New),
+        Key::Character("w") => Some(Msg::CloseActive),
+        Key::Character("b") => Some(Msg::Side(SideMsg::ToggleHidden)),
         _ => None,
     }
 }
@@ -481,7 +567,7 @@ fn keys(event: iced::Event, status: event::Status, _: window::Id) -> Option<Msg>
         return Some(msg);
     }
     match key.as_ref() {
-        Key::Named(Named::Escape) => Some(Msg::Cancel),
+        Key::Named(Named::Escape) => Some(Msg::Escape),
         _ if status == event::Status::Captured => None,
         Key::Named(Named::PageDown) => Some(Msg::Scroll(PAGE)),
         Key::Named(Named::PageUp) => Some(Msg::Scroll(-PAGE)),
@@ -520,9 +606,9 @@ fn glass() -> bool {
 fn main() -> iced::Result {
     let started = Instant::now();
     let args = Args::parse();
-    let opened = args.file.as_deref().map_or(Opened::Missing, doc::open);
+    let start = start(args.path.as_deref());
     let glass = glass();
-    let mut app = iced::application(move || boot(&args, &opened, started), update, view::view)
+    let mut app = iced::application(move || boot(&args, &start, started), update, view::view)
         .title(title)
         .subscription(subscription)
         .theme(style::theme())

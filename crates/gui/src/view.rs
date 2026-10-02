@@ -2,7 +2,7 @@
 //!
 //! ```text
 //!  title row (macOS)    file name, unsaved dot
-//!  tab strip            one tab per open request
+//!  sidebar | tab strip  the workspace tree beside one tab per open request
 //!  request bar          method · URL · Send · Save
 //!  split                request sections | response   (stacked below SPLIT_WIDTH)
 //!  status bar           environment · notice · shortcuts
@@ -18,8 +18,9 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Length, Padding, mouse};
 use reqlite_gui::present::{Token, human_size, json_tokens};
 
-/// Below this width the response moves under the request.
-const SPLIT_WIDTH: f32 = 900.0;
+/// Below this width of the area right of the sidebar, the response moves under
+/// the request.
+const SPLIT_WIDTH: f32 = 680.0;
 /// macOS draws the traffic lights over the content, left of this inset.
 const TRAFFIC_LIGHTS: f32 = 78.0;
 /// The macOS title bar height, so the name lines up with the traffic lights.
@@ -31,13 +32,25 @@ const MOD: &str = "⌘";
 const MOD: &str = "Ctrl+";
 
 pub fn view(app: &App) -> Element<'_, Msg> {
-    let mut page = column![].spacing(10).padding(Padding {
+    let mut outer = column![].spacing(10).padding(Padding {
         top: if super::TITLE_ROW { 0.0 } else { 12.0 },
         ..Padding::new(12.0)
     });
     if super::TITLE_ROW {
-        page = page.push(title_row(app.doc()));
+        outer = outer.push(title_row(app.doc()));
     }
+    let main = column![main(app), status_bar(app)].spacing(10);
+    match &app.workspace {
+        Some(w) if !app.sidebar.hidden => outer
+            .push(row![crate::sidebar::view(app, w), main].spacing(10))
+            .into(),
+        _ => outer.push(main).into(),
+    }
+}
+
+/// Everything right of the sidebar, above the status bar.
+fn main(app: &App) -> Element<'_, Msg> {
+    let mut page = column![].spacing(10);
     if !app.docs.is_empty() {
         page = page.push(tab_strip(app));
     }
@@ -50,8 +63,7 @@ pub fn view(app: &App) -> Element<'_, Msg> {
     }
     let Some(doc) = app.doc() else {
         return page
-            .push(container(empty()).height(Length::Fill))
-            .push(status_bar(app))
+            .push(container(empty(app.workspace.is_some())).height(Length::Fill))
             .into();
     };
     page = page.push(request_bar(doc));
@@ -72,7 +84,6 @@ pub fn view(app: &App) -> Element<'_, Msg> {
                 .into()
         }
     }))
-    .push(status_bar(app))
     .into()
 }
 
@@ -153,10 +164,22 @@ fn discard_prompt(name: &str) -> Element<'_, Msg> {
 }
 
 /// No tab is open.
-fn empty() -> Element<'static, Msg> {
-    container(text("No request is open.").size(13).color(style::MUTED))
-        .center(Length::Fill)
-        .into()
+fn empty(workspace: bool) -> Element<'static, Msg> {
+    let hint = if workspace {
+        format!("Choose a request in the sidebar, or press {MOD}N for a new one.")
+    } else {
+        format!("Press {MOD}N for a new request.")
+    };
+    container(
+        column![
+            text("No request is open.").size(13).color(style::MUTED),
+            text(hint).size(12).color(style::FAINT),
+        ]
+        .spacing(6)
+        .align_x(Alignment::Center),
+    )
+    .center(Length::Fill)
+    .into()
 }
 
 fn request_bar(doc: &Doc) -> Element<'_, Msg> {
@@ -475,7 +498,7 @@ fn status_bar(app: &App) -> Element<'_, Msg> {
     bar.push(Space::new().width(Length::Fill))
         .push(
             text(format!(
-                "{MOD}↵ send · {MOD}S save · {MOD}L URL · {MOD}1–3 sections · Ctrl+Tab next tab · Esc cancel"
+                "{MOD}↵ send · {MOD}S save · {MOD}L URL · {MOD}1–3 sections · {MOD}N new · Ctrl+Tab next tab · Esc cancel"
             ))
             .size(12)
             .color(style::FAINT),

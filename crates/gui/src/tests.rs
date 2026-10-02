@@ -37,11 +37,10 @@ fn app(text: Option<&str>) -> App {
         std::fs::write(&file, text).unwrap();
     }
     let args = Args {
-        file: Some(file),
+        path: Some(file),
         env: None,
     };
-    let opened = args.file.as_deref().map_or(Opened::Missing, doc::open);
-    boot(&args, &opened, Instant::now()).0
+    boot(&args, &start(args.path.as_deref()), Instant::now()).0
 }
 
 /// The shown tab.
@@ -161,7 +160,9 @@ fn scrolled(top: usize) -> (App, f32) {
         elapsed: Duration::ZERO,
         bytes: 5000,
     }));
-    // Window edge, page padding 12, panel padding 10, half the 12 px bar.
+    // The side-by-side layout, without the sidebar: the scrollbar sits at the
+    // window edge, past page padding 12, panel padding 10 and half the 12 px bar.
+    a.sidebar.hidden = true;
     (a, 1024.0 - 12.0 - 10.0 - 6.0)
 }
 
@@ -303,4 +304,165 @@ fn closing_a_tab_with_unsaved_changes_asks_first() {
     assert!(a.docs.is_empty(), "a clean tab closes at once");
     let mut ui = simulator(view::view(&a));
     assert!(ui.find("No request is open.").is_ok());
+}
+
+/// A window on a workspace folder holding `get.toml` and `users/list.toml`.
+fn workspace() -> (tempfile::TempDir, App) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("users")).unwrap();
+    std::fs::write(dir.path().join("get.toml"), FILE).unwrap();
+    std::fs::write(dir.path().join("users/list.toml"), FILE).unwrap();
+    let args = Args {
+        path: Some(dir.path().to_path_buf()),
+        env: None,
+    };
+    let a = boot(&args, &start(args.path.as_deref()), Instant::now()).0;
+    (dir, a)
+}
+
+fn side(a: &mut App, m: SideMsg) {
+    drop(update(a, Msg::Side(m)));
+}
+
+fn name(a: &mut App, action: sidebar::Action, text: &str) {
+    side(a, SideMsg::Start(action));
+    side(a, SideMsg::Text(text.into()));
+    side(a, SideMsg::Commit);
+}
+
+#[test]
+fn a_folder_opens_as_a_workspace_with_no_tab() {
+    let (_dir, mut a) = workspace();
+    assert!(a.docs.is_empty());
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("get").is_ok());
+    assert!(ui.find("users").is_ok());
+    ui.click("list").unwrap();
+    let opened: Vec<_> = ui.into_messages().collect();
+    for m in opened {
+        drop(update(&mut a, m));
+    }
+    assert_eq!(a.docs.len(), 1);
+    assert!(
+        a.docs[0]
+            .file
+            .as_ref()
+            .unwrap()
+            .ends_with("users/list.toml")
+    );
+}
+
+#[test]
+fn opening_a_file_twice_shows_its_tab_again() {
+    let (dir, mut a) = workspace();
+    let get = dir.path().join("get.toml");
+    side(&mut a, SideMsg::Open(get.clone()));
+    side(&mut a, SideMsg::Open(dir.path().join("users/list.toml")));
+    side(&mut a, SideMsg::Open(get));
+    assert_eq!(a.docs.len(), 2);
+    assert_eq!(a.active, 0);
+}
+
+#[test]
+fn a_new_request_is_written_by_its_first_save() {
+    let (dir, mut a) = workspace();
+    let root = dir.path().to_path_buf();
+    name(
+        &mut a,
+        sidebar::Action::NewRequest { dir: root.clone() },
+        "Get user",
+    );
+    let path = root.join("Get user.toml");
+    assert!(!path.exists(), "nothing is written before Save");
+    assert_eq!(a.doc().unwrap().file.as_deref(), Some(path.as_path()));
+    assert!(a.doc().unwrap().unsaved());
+
+    name(&mut a, sidebar::Action::NewRequest { dir: root }, "get");
+    assert!(
+        a.sidebar
+            .edit
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("already exists")
+    );
+}
+
+#[test]
+fn a_new_folder_shows_in_the_tree() {
+    let (dir, mut a) = workspace();
+    name(
+        &mut a,
+        sidebar::Action::NewFolder {
+            dir: dir.path().join("users"),
+        },
+        "admin",
+    );
+    assert!(dir.path().join("users/admin").is_dir());
+    assert!(a.sidebar.edit.is_none());
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("admin").is_ok());
+}
+
+#[test]
+fn a_bad_name_is_refused_and_nothing_changes() {
+    let (dir, mut a) = workspace();
+    name(
+        &mut a,
+        sidebar::Action::NewFolder {
+            dir: dir.path().into(),
+        },
+        "../out",
+    );
+    assert!(a.sidebar.edit.as_ref().unwrap().error.is_some());
+    assert!(!dir.path().parent().unwrap().join("out").exists());
+}
+
+#[test]
+fn renaming_moves_the_file_and_its_open_tab_follows() {
+    let (dir, mut a) = workspace();
+    let users = dir.path().join("users");
+    side(&mut a, SideMsg::Open(users.join("list.toml")));
+    name(
+        &mut a,
+        sidebar::Action::Rename {
+            path: users.clone(),
+        },
+        "people",
+    );
+    let moved = dir.path().join("people/list.toml");
+    assert!(moved.is_file() && !users.exists());
+    assert_eq!(a.docs[0].file.as_deref(), Some(moved.as_path()));
+
+    name(&mut a, sidebar::Action::Rename { path: moved }, "all");
+    let renamed = dir.path().join("people/all.toml");
+    assert!(renamed.is_file());
+    assert_eq!(a.docs[0].file.as_deref(), Some(renamed.as_path()));
+    assert_eq!(a.docs[0].label, "all.toml");
+}
+
+#[test]
+fn delete_asks_first_closes_the_tab_and_keeps_full_folders() {
+    let (dir, mut a) = workspace();
+    let get = dir.path().join("get.toml");
+    side(&mut a, SideMsg::Open(get.clone()));
+    side(&mut a, SideMsg::Delete(get.clone()));
+    side(&mut a, SideMsg::ConfirmDelete(false));
+    assert!(get.exists(), "Keep keeps the file");
+
+    side(&mut a, SideMsg::Delete(get.clone()));
+    side(&mut a, SideMsg::ConfirmDelete(true));
+    assert!(!get.exists());
+    assert!(a.docs.is_empty(), "its tab closes");
+
+    let users = dir.path().join("users");
+    side(&mut a, SideMsg::Delete(users.clone()));
+    side(&mut a, SideMsg::ConfirmDelete(true));
+    assert!(
+        users.join("list.toml").exists(),
+        "a folder with requests stays"
+    );
+    assert!(a.notice.as_deref().unwrap().contains("not empty"));
 }
