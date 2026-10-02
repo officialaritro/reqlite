@@ -1,23 +1,102 @@
 //! Resolves and sends requests. No UI knowledge lives here.
 
+use std::io::{self, Read, Write};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 mod resolve;
 pub use resolve::{Parts, ResolveError, Resolved, resolve};
+
+/// Bodies larger than this go to a temp file instead of memory.
+pub const SPILL_AT: usize = 1 << 20;
+
 #[derive(Debug)]
 pub struct Response {
     pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    /// Values stay as received. Decode only for display.
+    pub headers: Vec<(String, Vec<u8>)>,
+    pub body: Body,
     pub elapsed: Duration,
+}
+
+/// A response body, held once: in memory when small, in a temp file when large.
+/// The temp file is deleted when the body is dropped.
+#[derive(Debug)]
+pub struct Body(Store);
+
+#[derive(Debug)]
+enum Store {
+    Memory(Vec<u8>),
+    File {
+        file: tempfile::NamedTempFile,
+        len: u64,
+    },
+}
+
+impl Body {
+    pub fn len(&self) -> u64 {
+        match &self.0 {
+            Store::Memory(b) => b.len() as u64,
+            Store::File { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The temp file holding a large body, for readers that map or seek it.
+    pub fn path(&self) -> Option<&Path> {
+        match &self.0 {
+            Store::Memory(_) => None,
+            Store::File { file, .. } => Some(file.path()),
+        }
+    }
+
+    pub fn reader(&self) -> io::Result<Box<dyn Read + '_>> {
+        Ok(match &self.0 {
+            Store::Memory(b) => Box::new(b.as_slice()),
+            Store::File { file, .. } => Box::new(io::BufReader::new(file.reopen()?)),
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
     #[error("invalid HTTP method {method:?}: {reason}")]
     Method { method: String, reason: String },
-    #[error("{0}")]
-    Http(#[from] reqwest::Error),
+    #[error("cannot build the request")]
+    Build(#[source] reqwest::Error),
+    #[error("cannot connect")]
+    Connect(#[source] reqwest::Error),
+    #[error("timed out")]
+    Timeout(#[source] reqwest::Error),
+    #[error("too many redirects")]
+    Redirect(#[source] reqwest::Error),
+    #[error("the response body was cut off or unreadable")]
+    Body(#[source] reqwest::Error),
+    #[error("the request failed")]
+    Transport(#[source] reqwest::Error),
+    #[error("cannot write the response body to a temp file")]
+    Spill(#[source] io::Error),
+}
+
+impl From<reqwest::Error> for SendError {
+    fn from(e: reqwest::Error) -> Self {
+        if e.is_builder() {
+            SendError::Build(e)
+        } else if e.is_timeout() {
+            SendError::Timeout(e)
+        } else if e.is_connect() {
+            SendError::Connect(e)
+        } else if e.is_redirect() {
+            SendError::Redirect(e)
+        } else if e.is_body() || e.is_decode() {
+            SendError::Body(e)
+        } else {
+            SendError::Transport(e)
+        }
+    }
 }
 
 /// Reuse one `Client` for many sends so connections and TLS sessions are shared.
@@ -42,27 +121,51 @@ pub async fn send(client: &reqwest::Client, req: &Resolved) -> Result<Response, 
     }
 
     let start = Instant::now();
-    let resp = builder.send().await?;
+    let mut resp = builder.send().await?;
     let status = resp.status().as_u16();
     let headers = resp
         .headers()
         .iter()
-        .map(|(k, v)| {
-            (
-                k.to_string(),
-                String::from_utf8_lossy(v.as_bytes()).into_owned(),
-            )
-        })
+        .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
         .collect();
-    // SHORTCUT: whole body is buffered in memory. Stream to a temp file above a size
-    // threshold once the 50 MB response budget is measured in the GUI (v0.1).
-    let body = resp.bytes().await?.to_vec();
+    let mut body = Store::Memory(Vec::new());
+    while let Some(chunk) = resp.chunk().await? {
+        // SHORTCUT: blocking file writes on the async task. Move to spawn_blocking
+        // if the GUI shows dropped frames while a large body downloads.
+        body = append(body, &chunk).map_err(SendError::Spill)?;
+    }
+    if let Store::File { file, .. } = &mut body {
+        file.flush().map_err(SendError::Spill)?;
+    }
     Ok(Response {
         status,
         headers,
-        body,
+        body: Body(body),
         elapsed: start.elapsed(),
     })
+}
+
+fn append(store: Store, chunk: &[u8]) -> io::Result<Store> {
+    match store {
+        Store::Memory(mut buf) if buf.len() + chunk.len() <= SPILL_AT => {
+            buf.extend_from_slice(chunk);
+            Ok(Store::Memory(buf))
+        }
+        Store::Memory(buf) => {
+            let mut file = tempfile::NamedTempFile::new()?;
+            file.write_all(&buf)?;
+            file.write_all(chunk)?;
+            let len = (buf.len() + chunk.len()) as u64;
+            Ok(Store::File { file, len })
+        }
+        Store::File { mut file, len } => {
+            file.write_all(chunk)?;
+            Ok(Store::File {
+                file,
+                len: len + chunk.len() as u64,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -72,18 +175,25 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    /// One-shot HTTP server: returns the raw request it received via the channel.
-    async fn serve_once(reply: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+    /// One-shot HTTP server. The handle yields the raw request it received.
+    async fn serve_once(reply: Vec<u8>) -> (String, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let handle = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 4096];
             let n = sock.read(&mut buf).await.unwrap();
-            sock.write_all(reply.as_bytes()).await.unwrap();
+            sock.write_all(&reply).await.unwrap();
             String::from_utf8_lossy(&buf[..n]).into_owned()
         });
         (url, handle)
+    }
+
+    fn ok_with(body: &[u8]) -> Vec<u8> {
+        let mut r = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n", body.len()).into_bytes();
+        r.extend_from_slice(b"X-Raw: caf\xe9\r\nConnection: close\r\n\r\n");
+        r.extend_from_slice(body);
+        r
     }
 
     fn request(url: &str) -> Request {
@@ -93,31 +203,60 @@ mod tests {
         .unwrap()
     }
 
-    #[tokio::test]
-    async fn returns_status_and_body() {
-        let (url, _srv) =
-            serve_once("HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-                .await;
-        let resp = send(
+    async fn send_plain(req: &Request) -> Result<Response, SendError> {
+        send(
             &client().unwrap(),
-            &resolve(&request(&url), &Environment::default()).unwrap(),
+            &resolve(req, &Environment::default()).unwrap(),
         )
         .await
-        .unwrap();
-        assert_eq!(resp.status, 201);
-        assert_eq!(resp.body, b"ok");
+    }
+
+    fn read_all(body: &Body) -> Vec<u8> {
+        let mut out = Vec::new();
+        body.reader().unwrap().read_to_end(&mut out).unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn small_body_stays_in_memory() {
+        let (url, _srv) = serve_once(ok_with(b"ok")).await;
+        let resp = send_plain(&request(&url)).await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(read_all(&resp.body), b"ok");
+        assert_eq!(resp.body.path(), None);
+    }
+
+    #[tokio::test]
+    async fn large_body_spills_to_a_temp_file_that_is_removed_on_drop() {
+        let big: Vec<u8> = (0..5 * SPILL_AT).map(|i| (i % 251) as u8).collect();
+        let (url, _srv) = serve_once(ok_with(&big)).await;
+        let resp = send_plain(&request(&url)).await.unwrap();
+        let path = resp.body.path().unwrap().to_path_buf();
+        assert_eq!(resp.body.len(), big.len() as u64);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), big.len() as u64);
+        assert!(read_all(&resp.body) == big, "body bytes differ");
+        drop(resp);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn header_values_keep_their_bytes() {
+        let (url, _srv) = serve_once(ok_with(b"")).await;
+        let resp = send_plain(&request(&url)).await.unwrap();
+        let raw = resp.headers.iter().find(|(k, _)| k == "x-raw").unwrap();
+        assert_eq!(raw.1, b"caf\xe9");
     }
 
     #[tokio::test]
     async fn sends_method_query_headers_and_body() {
-        let (url, srv) =
-            serve_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+        let (url, srv) = serve_once(ok_with(b"")).await;
         let mut req = request(&url);
         req.method = "post".to_string().try_into().unwrap();
         req.query.append("dry_run", "true");
         req.query.append("tag", "a");
         req.query.append("tag", "b");
         req.headers.append("X-Test", "yes");
+        req.headers.append("X-Key", "{{key}}");
         req.body = Some("hello".into());
         let env = reqlite_format::parse_env(
             std::path::Path::new("dev.toml"),
@@ -125,7 +264,6 @@ mod tests {
             Some("version = 1\n[vars]\nkey = 's3cret'\n"),
         )
         .unwrap();
-        req.headers.append("X-Key", "{{key}}");
         send(&client().unwrap(), &resolve(&req, &env).unwrap())
             .await
             .unwrap();
@@ -138,5 +276,23 @@ mod tests {
         assert!(raw.to_ascii_lowercase().contains("x-test: yes"), "{raw}");
         assert!(raw.to_ascii_lowercase().contains("x-key: s3cret"), "{raw}");
         assert!(raw.ends_with("hello"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn refused_connection_is_a_connect_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let err = send_plain(&request(&url)).await.unwrap_err();
+        assert!(matches!(err, SendError::Connect(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn truncated_body_is_a_body_error() {
+        let reply =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nok".to_vec();
+        let (url, _srv) = serve_once(reply).await;
+        let err = send_plain(&request(&url)).await.unwrap_err();
+        assert!(matches!(err, SendError::Body(_)), "{err:?}");
     }
 }

@@ -40,8 +40,8 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
         resp.body.len()
     );
     for (k, v) in &resp.headers {
-        eprintln!("{k}: {v}");
+        eprintln!("{k}: {}", String::from_utf8_lossy(v));
     }
-    println!("{}", String::from_utf8_lossy(&resp.body));
+    std::io::copy(&mut resp.body.reader()?, &mut std::io::stdout().lock())?;
     Ok(())
 }
