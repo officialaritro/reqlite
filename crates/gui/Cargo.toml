@@ -17,3 +17,6 @@ tokio = { version = "1.53.1", features = ["rt"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+iced_test = "0.14.0"

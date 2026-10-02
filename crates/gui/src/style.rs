@@ -5,10 +5,14 @@
 //! above, a 1 px rim and a soft drop shadow. It is plain paint: no blur and no
 //! extra GPU memory. Only the window background is blurred, by the OS.
 
-use iced::widget::{button, text_editor, text_input};
-use iced::{Background, Border, Color, Font, Gradient, Shadow, Theme, Vector, gradient};
+use iced::widget::{button, container, overlay::menu, pick_list, text_editor, text_input};
+use iced::{Background, Border, Color, Font, Gradient, Shadow, Theme, Vector, font, gradient};
 
 pub const SANS: Font = Font::with_name("Geist");
+pub const MEDIUM: Font = Font {
+    weight: font::Weight::Medium,
+    ..SANS
+};
 pub const MONO: Font = Font::with_name("Geist Mono");
 
 /// Bundled faces (SIL OFL 1.1, `assets/fonts/OFL.txt`).
@@ -28,6 +32,8 @@ pub const DANGER: Color = Color::from_rgb8(0xff, 0x64, 0x67);
 const DANGER_STRONG: Color = Color::from_rgb8(0xc7, 0x4b, 0x47);
 pub const WARNING: Color = Color::from_rgb8(0xff, 0xb9, 0x00);
 pub const SUCCESS: Color = Color::from_rgb8(0x00, 0xd4, 0x92);
+pub const BLUE: Color = Color::from_rgb8(0x4c, 0x9f, 0xff);
+pub const PURPLE: Color = Color::from_rgb8(0xbb, 0x8a, 0xef);
 
 /// How much of the window background stays over the blurred desktop.
 pub const GLASS_ALPHA: f32 = 0.80;
@@ -202,4 +208,115 @@ pub fn editor(_: &Theme, status: text_editor::Status) -> text_editor::Style {
         value: TEXT,
         selection: ACCENT.scale_alpha(0.35),
     }
+}
+
+/// The method picker. Its text takes the method's colour.
+pub fn method_picker(color: Color) -> impl Fn(&Theme, pick_list::Status) -> pick_list::Style {
+    move |_, status| {
+        let lift = if matches!(status, pick_list::Status::Active) {
+            0.0
+        } else {
+            0.03
+        };
+        let (background, border, _) = plate(lift);
+        pick_list::Style {
+            text_color: color,
+            placeholder_color: FAINT,
+            handle_color: MUTED,
+            background,
+            border,
+        }
+    }
+}
+
+pub fn method_menu(_: &Theme) -> menu::Style {
+    menu::Style {
+        background: Color::from_rgb8(0x16, 0x16, 0x16).into(),
+        border: hairline(white(0.14)),
+        text_color: TEXT,
+        selected_text_color: TEXT,
+        selected_background: white(0.08).into(),
+        shadow: drop(0.4, 8.0, 24.0),
+    }
+}
+
+/// Each common method has its own colour, so the eye finds it at once.
+pub fn method_color(method: &str) -> Color {
+    match method {
+        "GET" => SUCCESS,
+        "POST" => WARNING,
+        "PUT" => BLUE,
+        "PATCH" => PURPLE,
+        "DELETE" => DANGER,
+        _ => MUTED,
+    }
+}
+
+pub fn status_color(status: u16) -> Color {
+    match status {
+        200..=299 => SUCCESS,
+        300..=399 => BLUE,
+        400..=499 => WARNING,
+        500..=599 => DANGER,
+        _ => MUTED,
+    }
+}
+
+/// A request tab: a raised plate when active, bare text otherwise.
+pub fn tab(_: &Theme, status: button::Status, active: bool) -> button::Style {
+    if active {
+        let (background, border, shadow) = plate(0.0);
+        return button::Style {
+            background: Some(background),
+            text_color: TEXT,
+            border,
+            shadow,
+            snap: true,
+        };
+    }
+    button::Style {
+        background: (status == button::Status::Hovered).then(|| white(0.04).into()),
+        text_color: if status == button::Status::Hovered {
+            TEXT
+        } else {
+            MUTED
+        },
+        border: Border {
+            radius: RADIUS.into(),
+            ..Border::default()
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+/// The request and response panels: a faint lift off the window.
+pub fn panel(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(white(0.025).into()),
+        border: Border {
+            radius: 10.0.into(),
+            ..hairline(white(0.08))
+        },
+        ..container::Style::default()
+    }
+}
+
+pub fn pill(color: Color) -> container::Style {
+    container::Style {
+        background: Some(color.scale_alpha(0.12).into()),
+        border: Border {
+            radius: 999.0.into(),
+            ..hairline(color.scale_alpha(0.3))
+        },
+        ..container::Style::default()
+    }
+}
+
+pub fn danger_banner(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(DANGER.scale_alpha(0.08).into()),
+        ..container::Style::default()
+    }
+    .border(hairline(DANGER.scale_alpha(0.3)))
 }
