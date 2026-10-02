@@ -80,6 +80,22 @@ reqlite history -n 10
 
 If the history file is damaged, Reqlite moves it aside as `history.db.corrupt-<time>`, starts a new one, and says so. A history problem never stops a send.
 
+### Timeouts
+
+Every send has limits, so a server that never answers cannot hang Reqlite:
+
+| Limit | Default | What it covers |
+|---|---|---|
+| Connect | 10 s | Opening the connection, including TLS |
+| No data | 30 s | The wait for the next bytes, headers or body. It resets on every read, so a large download that keeps moving never reaches it. |
+| Total | none | The whole send. Set it with `--timeout SECS`. |
+
+```sh
+reqlite send slow.toml --timeout 5
+```
+
+A send that passes a limit exits with code 1, and the message names the limits that applied.
+
 ### Exit codes
 
 | Code | Meaning |
