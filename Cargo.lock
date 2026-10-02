@@ -3183,6 +3183,7 @@ dependencies = [
  "reqlite-store",
  "reqlite-viewer",
  "reqwest",
+ "tempfile",
  "tokio",
 ]
 

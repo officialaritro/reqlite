@@ -1,9 +1,11 @@
-//! Behaviour the window must keep: shortcuts, Save, Send and Cancel.
+//! Behaviour the window must keep: shortcuts, Save, Send, Cancel and tabs.
 
 use super::*;
+use crate::motion::Motion;
 use iced::keyboard::key::{Code, Physical};
 use iced::mouse;
 use iced_test::simulator;
+use std::time::Duration;
 
 fn ch(c: &str) -> Key {
     Key::Character(c.into())
@@ -38,8 +40,13 @@ fn app(text: Option<&str>) -> App {
         file: Some(file),
         env: None,
     };
-    let opened = open(args.file.as_deref());
+    let opened = args.file.as_deref().map_or(Opened::Missing, doc::open);
     boot(&args, &opened, Instant::now()).0
+}
+
+/// The shown tab.
+fn active(a: &mut App) -> &mut Doc {
+    a.doc_mut().unwrap()
 }
 
 const FILE: &str = "version = 1\nname = \"t\"\nmethod = \"GET\"\nurl = \"http://h/\"\n";
@@ -49,13 +56,16 @@ fn cmd_shortcuts_pick_their_action_and_plain_keys_do_nothing() {
     let cmd = Modifiers::COMMAND;
     assert!(matches!(
         shortcut(&ch("1"), cmd),
-        Some(Msg::Tab(Tab::Query))
+        Some(Msg::Section(Section::Query))
     ));
     assert!(matches!(
         shortcut(&ch("2"), cmd),
-        Some(Msg::Tab(Tab::Headers))
+        Some(Msg::Section(Section::Headers))
     ));
-    assert!(matches!(shortcut(&ch("3"), cmd), Some(Msg::Tab(Tab::Body))));
+    assert!(matches!(
+        shortcut(&ch("3"), cmd),
+        Some(Msg::Section(Section::Body))
+    ));
     assert!(matches!(shortcut(&ch("l"), cmd), Some(Msg::FocusUrl)));
     assert!(matches!(shortcut(&ch("s"), cmd), Some(Msg::Save)));
     assert!(matches!(
@@ -100,7 +110,7 @@ fn send_turns_into_cancel_while_a_send_runs() {
     assert!(matches!(ui.into_messages().next(), Some(Msg::Send)));
 
     let (_task, handle) = Task::<Msg>::none().abortable();
-    a.send = Send::Running(handle);
+    active(&mut a).send = Send::Running(handle);
     let mut ui = simulator(view::view(&a));
     assert!(ui.find("Send").is_err());
     ui.click("Cancel").unwrap();
@@ -110,7 +120,7 @@ fn send_turns_into_cancel_while_a_send_runs() {
 #[test]
 fn a_file_that_cannot_be_read_shows_why_and_never_saves() {
     let mut a = app(Some("version = 1\nnot toml at all"));
-    assert!(a.file.is_none());
+    assert!(active(&mut a).file.is_none());
     drop(update(&mut a, Msg::Url("http://other/".into())));
     assert!(title(&a).contains("(cannot save)"), "{}", title(&a));
     let mut ui = simulator(view::view(&a));
@@ -120,16 +130,20 @@ fn a_file_that_cannot_be_read_shows_why_and_never_saves() {
 
 #[test]
 fn tabs_show_how_many_entries_they_hold() {
-    let a = app(Some(
+    let mut a = app(Some(
         "version = 1\nname = \"t\"\nmethod = \"POST\"\nurl = \"http://h/\"\nbody = \"{}\"\n\n[headers]\nA = \"1\"\nB = [\"2\", \"3\"]\n",
     ));
-    assert_eq!(a.tab, Tab::Headers, "opens on the first tab with content");
+    assert_eq!(
+        active(&mut a).section,
+        Section::Headers,
+        "opens on the first section with content"
+    );
     let mut ui = simulator(view::view(&a));
     assert!(ui.find("3").is_ok(), "three header entries");
     ui.click("Body").unwrap();
     assert!(matches!(
         ui.into_messages().next(),
-        Some(Msg::Tab(Tab::Body))
+        Some(Msg::Section(Section::Body))
     ));
 }
 
@@ -138,11 +152,11 @@ fn scrolled(top: usize) -> (App, f32) {
     let mut a = app(Some(FILE));
     let body = "line\n".repeat(1000);
     let doc = Document::build(body.as_bytes()).unwrap();
-    a.viewer = Some(Viewer {
+    active(&mut a).viewer = Some(Viewer {
         doc: Arc::new(doc),
         top,
     });
-    a.send = Send::Finished(Ok(Summary {
+    active(&mut a).send = Send::Finished(Ok(Summary {
         status: 200,
         elapsed: Duration::ZERO,
         bytes: 5000,
@@ -218,4 +232,75 @@ fn reduced_motion_shows_every_change_at_once() {
     m.running.go_mut(true, t0);
     assert!(!m.animating(t0));
     assert_eq!(m.reveal.interpolate(0.0, 1.0, t0), 1.0);
+}
+
+/// A second tab for `text`, opened next to the first. It becomes the shown tab.
+fn add_tab(a: &mut App, text: &str) -> DocId {
+    let file = std::env::temp_dir().join(format!(
+        "reqlite-gui-test-{}/tab-{}.toml",
+        std::process::id(),
+        a.next_id
+    ));
+    std::fs::write(&file, text).unwrap();
+    let opened = doc::open(&file);
+    let id = a.open_tab(Some(file), &opened);
+    drop(update(a, Msg::Select(0)));
+    id
+}
+
+#[test]
+fn each_tab_keeps_its_own_form() {
+    let mut a = app(Some(FILE));
+    add_tab(&mut a, &FILE.replace("http://h/", "http://two/"));
+    drop(update(&mut a, Msg::Url("http://edited/".into())));
+    drop(update(&mut a, Msg::Select(1)));
+    assert_eq!(active(&mut a).url, "http://two/");
+    drop(update(&mut a, Msg::NextTab));
+    assert_eq!(active(&mut a).url, "http://edited/");
+    assert!(active(&mut a).unsaved());
+}
+
+#[test]
+fn a_result_goes_to_the_tab_that_sent_it() {
+    let mut a = app(Some(FILE));
+    let first = a.docs[0].id;
+    add_tab(&mut a, FILE);
+    drop(update(&mut a, Msg::Select(1)));
+    let done = Finished {
+        result: Err("connection refused".into()),
+        opened: None,
+        warning: None,
+    };
+    drop(update(&mut a, Msg::Sent(first, Box::new(done))));
+    assert!(matches!(a.docs[0].send, Send::Finished(Err(_))));
+    assert!(matches!(a.docs[1].send, Send::Idle));
+}
+
+#[test]
+fn closing_a_tab_with_unsaved_changes_asks_first() {
+    let mut a = app(Some(FILE));
+    let id = a.docs[0].id;
+    let clean = add_tab(&mut a, FILE);
+    drop(update(&mut a, Msg::Url("http://edited/".into())));
+
+    drop(update(&mut a, Msg::Close(id)));
+    assert_eq!(a.docs.len(), 2, "the first close only asks");
+    let mut ui = simulator(view::view(&a));
+    ui.click("Keep").unwrap();
+    assert!(matches!(
+        ui.into_messages().next(),
+        Some(Msg::Discard(false))
+    ));
+    drop(update(&mut a, Msg::Discard(false)));
+    assert_eq!(a.docs.len(), 2);
+
+    drop(update(&mut a, Msg::Close(id)));
+    drop(update(&mut a, Msg::Discard(true)));
+    assert_eq!(a.docs.len(), 1);
+    assert_eq!(a.docs[0].id, clean);
+
+    drop(update(&mut a, Msg::Close(clean)));
+    assert!(a.docs.is_empty(), "a clean tab closes at once");
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("No request is open.").is_ok());
 }
