@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Checks the GUI idle memory budgets on macOS (issue #1). Exits 1 on a miss.
+"""Checks the GUI idle memory budgets (issue #1) and cold start on macOS.
+Exits 1 on a miss.
 
 Usage: scripts/gui_idle.py EXECUTABLE [--runs N]
 
@@ -10,6 +11,8 @@ The app must open its default 1000x800 window. After 5 s of idle the script read
 Budgets:
   footprint              under 60 MB, on a 2x display only (it scales with the display)
   footprint - drawables  under 35 MB, on any display (memory Reqlite controls)
+  first frame            under 300 ms. The app prints `first-frame <ms>` and exits
+                         when REQLITE_GUI_EXIT_ON_FIRST_FRAME is set.
 Set REQLITE_BUDGET_SCALE=0.01 to shrink both budgets and watch the check fail.
 """
 
@@ -77,6 +80,17 @@ def measure(exe: str) -> tuple[int, int]:
         p.wait()
 
 
+def first_frame(exe: str) -> float:
+    env = dict(os.environ, REQLITE_GUI_EXIT_ON_FIRST_FRAME="1")
+    out = subprocess.run(
+        [exe], env=env, capture_output=True, text=True, timeout=60, check=False
+    ).stdout
+    m = re.search(r"first-frame ([\d.]+)", out)
+    if not m:
+        raise SystemExit(f"{exe} did not print first-frame; output: {out[-300:]!r}")
+    return float(m.group(1))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("exe")
@@ -111,6 +125,16 @@ def main() -> None:
             f"skip idle footprint: {footprint / MB:.1f} MB; its budget is defined on a 2x display only"
         )
     check("idle footprint minus drawables", own, 35 * MB)
+
+    starts = sorted(first_frame(args.exe) for _ in range(5))
+    start = starts[2]
+    start_budget = 300 * SCALE
+    ok = start <= start_budget
+    print(
+        f"{'ok  ' if ok else 'MISS'} first frame: {start:.0f} ms (budget {start_budget:.0f} ms, 5 runs, median)"
+    )
+    if not ok:
+        failures.append("first frame")
 
     if failures:
         sys.exit(1)
