@@ -1,0 +1,25 @@
+[package]
+name = "reqlite-tauri-spike"
+version = "0.0.1"
+edition = "2024"
+
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2.7.1", features = [] }
+
+[dependencies]
+tauri = { version = "2.12.1", features = [] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt", "sync"] }
+objc2 = "0.6.4"
+reqlite-format = { path = "../../../crates/format" }
+reqlite-engine = { path = "../../../crates/engine" }
+reqlite-viewer = { path = "../../../crates/viewer" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,69 @@
+import { Button, LineEdit, TextEdit, Slider, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export component App inherits Window {
+    title: "Reqlite (Slint spike)";
+    preferred-width: 1000px;
+    preferred-height: 760px;
+
+    in-out property <string> method: "GET";
+    in-out property <string> url;
+    in-out property <string> body;
+    in property <string> status: "idle";
+    in property <[string]> lines;
+    in property <int> line-count;
+    in-out property <float> top;
+    out property <int> visible-count: max(1, floor(viewer.height / 16px));
+
+    public function focus-body() { body-edit.focus(); }
+    callback send();
+    callback scrolled(int);
+
+    VerticalBox {
+        HorizontalBox {
+            padding: 0;
+            LineEdit { width: 90px; text <=> root.method; }
+            LineEdit { text <=> root.url; placeholder-text: "https://"; accepted => { root.send(); } }
+            Button { text: "Send"; primary: true; clicked => { root.send(); } }
+        }
+        body-edit := TextEdit {
+            height: 160px;
+            text <=> root.body;
+            font-family: "Menlo";
+            font-size: 12px;
+            placeholder-text: "request body";
+        }
+        Text { text: root.status; }
+        HorizontalLayout {
+            spacing: 4px;
+            viewer := Rectangle {
+                background: #1e1e1e;
+                clip: true;
+                for line[i] in root.lines: Text {
+                    x: 6px;
+                    y: i * 16px;
+                    height: 16px;
+                    text: line;
+                    color: #d4d4d4;
+                    font-family: "Menlo";
+                    font-size: 12px;
+                    wrap: no-wrap;
+                    overflow: clip;
+                }
+                TouchArea {
+                    scroll-event(event) => {
+                        root.scrolled(root.top - round(event.delta-y / 16px));
+                        accept
+                    }
+                }
+            }
+            Slider {
+                orientation: vertical;
+                width: 20px;
+                minimum: 0;
+                maximum: max(0, root.line-count - root.visible-count);
+                value <=> root.top;
+                changed(v) => { root.scrolled(round(v)); }
+            }
+        }
+    }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "reqlite-slint-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+slint = "1.18.1"
+reqlite-format = { path = "../../crates/format" }
+reqlite-engine = { path = "../../crates/engine" }
+reqlite-viewer = { path = "../../crates/viewer" }
+tokio = { version = "1.53.1", features = ["rt", "sync"] }
+
+[build-dependencies]
+slint-build = "1.18.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
