@@ -111,6 +111,8 @@ struct Body {
     mode: String,
     raw: Option<String>,
     #[serde(default)]
+    options: Value,
+    #[serde(default)]
     urlencoded: Vec<Kv>,
     graphql: Option<Graphql>,
     #[serde(default)]
@@ -283,9 +285,26 @@ fn request_of(
         None => None,
         Some(b) if b.disabled => None,
         Some(b) => match b.mode.as_str() {
-            "raw" => b.raw.clone().filter(|s| !s.is_empty()),
+            "raw" => {
+                let language = b.options.pointer("/raw/language").and_then(Value::as_str);
+                let implied = match language {
+                    Some("json") => Some("application/json"),
+                    Some("xml") => Some("application/xml"),
+                    Some("html") => Some("text/html"),
+                    Some("javascript") => Some("application/javascript"),
+                    Some("text") => Some("text/plain"),
+                    _ => None,
+                };
+                let raw = b.raw.clone().filter(|s| !s.is_empty());
+                if let Some(ct) = implied.filter(|_| raw.is_some()) {
+                    if !has_header(&headers, "Content-Type") {
+                        headers.append("Content-Type", ct);
+                    }
+                }
+                raw
+            }
             "urlencoded" => {
-                if headers.get("Content-Type").is_empty() {
+                if !has_header(&headers, "Content-Type") {
                     headers.append("Content-Type", "application/x-www-form-urlencoded");
                 }
                 let mut pairs = Vec::new();
@@ -302,7 +321,7 @@ fn request_of(
                 Some(pairs.join("&"))
             }
             "graphql" => {
-                if headers.get("Content-Type").is_empty() {
+                if !has_header(&headers, "Content-Type") {
                     headers.append("Content-Type", "application/json");
                 }
                 let g = b.graphql.as_ref();
@@ -401,6 +420,11 @@ fn scripts(events: &[Event], label: &str, warnings: &mut Vec<Warning>) {
             });
         }
     }
+}
+
+/// Header names compare without case, as HTTP defines them.
+fn has_header(headers: &Params, name: &str) -> bool {
+    headers.pairs().any(|(k, _)| k.eq_ignore_ascii_case(name))
 }
 
 fn field(kvs: &[AuthKv], key: &str) -> String {
@@ -584,6 +608,23 @@ mod tests {
             "item": [{"name": "Broken", "request": {"method": "GET"}}]}"#;
         let err = import(no_url).unwrap_err();
         assert_eq!(err.to_string(), "Broken: the request has no URL");
+    }
+
+    #[test]
+    fn raw_body_language_sets_the_content_type_postman_would_send() {
+        let c = import(r#"{"info": {"name": "r", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+            "item": [
+              {"name": "J", "request": {"method": "POST", "url": "http://h", "body": {"mode": "raw", "raw": "{}", "options": {"raw": {"language": "json"}}}}},
+              {"name": "K", "request": {"method": "POST", "url": "http://h", "header": [{"key": "content-type", "value": "text/x-custom"}],
+                "body": {"mode": "raw", "raw": "{}", "options": {"raw": {"language": "json"}}}}}
+            ]}"#)
+        .unwrap();
+        assert_eq!(
+            c.files[0].1.headers.get("Content-Type"),
+            ["application/json"]
+        );
+        assert!(c.files[1].1.headers.get("Content-Type").is_empty());
+        assert_eq!(c.files[1].1.headers.get("content-type"), ["text/x-custom"]);
     }
 
     #[test]
