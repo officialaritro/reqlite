@@ -1,0 +1,13 @@
+[package]
+name = "reqlite-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reqlite-format = { version = "0.0.1", path = "../format" }
+thiserror = "2.0.21"
+
+[lints]
+workspace = true

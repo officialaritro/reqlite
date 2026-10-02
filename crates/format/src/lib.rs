@@ -158,20 +158,23 @@ pub fn parse(text: &str) -> Result<Request, ParseError> {
     if req.version != VERSION {
         return Err(ParseError::UnsupportedVersion { found: req.version });
     }
-    validate(&req).map_err(ParseError::Invalid)?;
+    validate(&req)?;
     Ok(req)
 }
 
-fn validate(req: &Request) -> Result<(), String> {
+/// The rules every request file meets. [`parse`] applies them; code that builds
+/// a [`Request`] another way calls this before saving it.
+pub fn validate(req: &Request) -> Result<(), ParseError> {
+    let invalid = |msg: String| Err(ParseError::Invalid(msg));
     if req.url.trim().is_empty() {
-        return Err("url is empty".to_string());
+        return invalid("url is empty".to_string());
     }
     for (name, value) in req.headers.pairs() {
         if !is_token(name) {
-            return Err(format!("invalid header name {name:?}"));
+            return invalid(format!("invalid header name {name:?}"));
         }
         if value.chars().any(|c| c.is_control() && c != '\t') {
-            return Err(format!("header {name:?} has a control character"));
+            return invalid(format!("header {name:?} has a control character"));
         }
     }
     Ok(())

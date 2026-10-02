@@ -989,6 +989,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "reqlite-import"
+version = "0.0.1"
+dependencies = [
+ "reqlite-format",
+ "thiserror",
+]
+
+[[package]]
 name = "reqlite-store"
 version = "0.0.1"
 dependencies = [
