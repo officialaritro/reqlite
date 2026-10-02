@@ -149,10 +149,10 @@ Design rules:
 | GUI idle footprint, 1000×800 window on a 2× display | under 60 MB | 57 MB | locally (`scripts/gui_idle.py`); CI runners have no 2× display |
 | GUI idle footprint minus window frame buffers, any display | under 35 MB | 32 MB | yes, macOS |
 | Binary | under 25 MB | CLI 3.7 MB, GUI 7.3 MB | yes |
-| Cold start | under 300 ms | CLI 6 ms, GUI first frame 102 ms | yes (GUI on macOS) |
+| Cold start | under 300 ms | CLI 6 ms, GUI first frame 102 ms | CLI yes; GUI locally, because CI runners have no real GPU |
 | Peak RAM while opening a 50 MB JSON response | under 50 MB | viewer 1.6 to 2.3 MB, CLI send 7.3 MB | yes |
 
-The GUI rows use the physical footprint, which Activity Monitor shows as "Memory". The window's frame buffers grow with the window size and the display scale, so the first GUI row fixes both. The second row counts only the memory Reqlite controls. See [issue #1](https://github.com/officialaritro/reqlite/issues/1) for the measurements behind these numbers. `scripts/gui_idle.py target/release/reqlite-gui` checks both, plus the GUI cold start, on macOS. CI runs it on macOS.
+The GUI rows use the physical footprint, which Activity Monitor shows as "Memory". The window's frame buffers grow with the window size and the display scale, so the first GUI row fixes both. The second row counts only the memory Reqlite controls. See [issue #1](https://github.com/officialaritro/reqlite/issues/1) for the measurements behind these numbers. `scripts/gui_idle.py target/release/reqlite-gui` checks both, plus the GUI cold start, on macOS. CI runs it on macOS. CI runners are virtual machines with a 1× display and a paravirtual GPU, so there it checks only the memory Reqlite controls and prints the other two numbers.
 
 `scripts/budgets.py` runs the other checks on Linux and macOS in CI and fails the build on a miss. It also checks that each crate depends only on the crates below it. To run it yourself:
 
