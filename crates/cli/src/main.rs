@@ -21,6 +21,11 @@ enum Command {
         /// file next to it supplies secrets.
         #[arg(long, short)]
         env: Option<PathBuf>,
+        /// Stop when the whole send takes longer than SECS. Without it there is
+        /// no total limit, but a send still stops after 10 s without a
+        /// connection or 30 s without data.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
     },
     /// List recent sends, newest first. Set REQLITE_DATA_DIR to move the history file.
     History {
@@ -76,6 +81,8 @@ enum Failure {
     Input(Box<dyn Error>),
     /// The request did not complete. Exit 1.
     Send(reqlite_engine::SendError),
+    /// The request passed one of these limits. Exit 1.
+    Timeout(reqlite_engine::SendError, reqlite_engine::Timeouts),
     /// Writing the response out failed. Exit 1.
     Output(std::io::Error),
     /// History could not be read. Exit 1.
@@ -91,7 +98,7 @@ impl Failure {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Send { file, env } => send(&file, env.as_deref()),
+        Command::Send { file, env, timeout } => send(&file, env.as_deref(), timeout),
         Command::History { limit } => history(limit),
         Command::Import {
             from:
@@ -119,6 +126,14 @@ fn main() -> ExitCode {
             let (code, err): (u8, &dyn Error) = match &failure {
                 Failure::Input(e) => (3, e.as_ref()),
                 Failure::Send(e) => (1, e),
+                Failure::Timeout(e, limits) => {
+                    let cause = e
+                        .source()
+                        .map(|c| format!(": {}", chain(c)))
+                        .unwrap_or_default();
+                    eprintln!("error: {e} ({limits}){cause}");
+                    return ExitCode::from(1);
+                }
                 Failure::Output(e) => (1, e),
                 Failure::Store(e) => (1, e),
             };
@@ -211,7 +226,7 @@ fn read_request(file: &Path) -> Result<reqlite_format::Request, Failure> {
     })
 }
 
-fn send(file: &Path, env_path: Option<&Path>) -> Result<(), Failure> {
+fn send(file: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<(), Failure> {
     let req = read_request(file)?;
     let env = match env_path {
         Some(path) => reqlite_format::load_env(path).map_err(Failure::input)?,
@@ -224,10 +239,15 @@ fn send(file: &Path, env_path: Option<&Path>) -> Result<(), Failure> {
         })
     })?;
 
+    let limits = reqlite_engine::Timeouts {
+        total: timeout.map(std::time::Duration::from_secs),
+        ..reqlite_engine::Timeouts::default()
+    };
     let rt = runtime()?;
     let history = open_history();
     let resp = rt.block_on(async {
-        let client = reqlite_engine::client().map_err(reqlite_engine::SendError::from)?;
+        let client =
+            reqlite_engine::client_with(limits).map_err(reqlite_engine::SendError::from)?;
         reqlite_engine::send(&client, &req).await
     });
 
@@ -243,7 +263,10 @@ fn send(file: &Path, env_path: Option<&Path>) -> Result<(), Failure> {
             eprintln!("warning: this send was not saved to history: {}", chain(&e));
         }
     }
-    let resp = resp.map_err(Failure::Send)?;
+    let resp = resp.map_err(|e| match e {
+        reqlite_engine::SendError::Timeout(_) => Failure::Timeout(e, limits),
+        e => Failure::Send(e),
+    })?;
 
     eprintln!(
         "{} · {} ms · {} bytes",

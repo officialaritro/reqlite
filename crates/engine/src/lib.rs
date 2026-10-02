@@ -106,9 +106,65 @@ impl From<reqwest::Error> for SendError {
     }
 }
 
-/// Reuse one `Client` for many sends so connections and TLS sessions are shared.
+/// Limits on each send. A send that passes one fails with [`SendError::Timeout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    /// The TCP and TLS connect phase.
+    pub connect: Duration,
+    /// The longest wait for the next bytes, headers or body. It resets on every
+    /// read, so a large download that keeps moving never reaches it.
+    pub idle: Duration,
+    /// The whole send, from connect to the last body byte. `None` lets a moving
+    /// download take as long as it needs.
+    pub total: Option<Duration>,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Timeouts {
+            connect: Duration::from_secs(10),
+            idle: Duration::from_secs(30),
+            total: None,
+        }
+    }
+}
+
+impl std::fmt::Display for Timeouts {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let show = |d: Duration| {
+            if d.subsec_millis() == 0 {
+                format!("{} s", d.as_secs())
+            } else {
+                format!("{} ms", d.as_millis())
+            }
+        };
+        write!(
+            f,
+            "connect limit {}, no-data limit {}",
+            show(self.connect),
+            show(self.idle)
+        )?;
+        if let Some(total) = self.total {
+            write!(f, ", total limit {}", show(total))?;
+        }
+        Ok(())
+    }
+}
+
+/// A client with the default [`Timeouts`]. Reuse one `Client` for many sends so
+/// connections and TLS sessions are shared.
 pub fn client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder().build()
+    client_with(Timeouts::default())
+}
+
+pub fn client_with(limits: Timeouts) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(limits.connect)
+        .read_timeout(limits.idle);
+    if let Some(total) = limits.total {
+        builder = builder.timeout(total);
+    }
+    builder.build()
 }
 
 pub async fn send(client: &reqwest::Client, req: &Resolved) -> Result<Response, SendError> {
@@ -307,5 +363,115 @@ mod tests {
         let (url, _srv) = serve_once(reply).await;
         let err = send_plain(&request(&url)).await.unwrap_err();
         assert!(matches!(err, SendError::Body(_)), "{err:?}");
+    }
+
+    /// Accepts one connection, reads the request, writes `reply`, then keeps the
+    /// socket open. The handle yields true when the client closes it within 3 s.
+    async fn serve_and_hold(reply: Vec<u8>) -> (String, tokio::task::JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _n = sock.read(&mut buf).await.unwrap();
+            sock.write_all(&reply).await.unwrap();
+            let closed = tokio::time::timeout(Duration::from_secs(3), sock.read(&mut buf)).await;
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_)))
+        });
+        (url, handle)
+    }
+
+    fn short(total: Option<u64>) -> reqwest::Client {
+        client_with(Timeouts {
+            connect: Duration::from_millis(200),
+            idle: Duration::from_millis(200),
+            total: total.map(Duration::from_millis),
+        })
+        .unwrap()
+    }
+
+    async fn send_with(client: &reqwest::Client, url: &str) -> Result<Response, SendError> {
+        let req = resolve(&request(url), &Environment::default()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), send(client, &req))
+            .await
+            .expect("the send hung past the test's own 5 s guard")
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_times_out_at_the_no_data_limit() {
+        let (url, _srv) = serve_and_hold(Vec::new()).await;
+        let start = Instant::now();
+        let err = send_with(&short(None), &url).await.unwrap_err();
+        assert!(matches!(err, SendError::Timeout(_)), "{err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_that_stops_times_out_at_the_no_data_limit() {
+        let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nfirst 10 b".to_vec();
+        let (url, _srv) = serve_and_hold(reply).await;
+        let err = send_with(&short(None), &url).await.unwrap_err();
+        assert!(matches!(err, SendError::Timeout(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_moving_download_stops_at_the_total_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _n = sock.read(&mut buf).await.unwrap();
+            let head = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
+            if sock.write_all(head).await.is_err() {
+                return;
+            }
+            for _ in 0..1000 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if sock.write_all(b"x").await.is_err() {
+                    return;
+                }
+            }
+        });
+        let start = Instant::now();
+        let err = send_with(&short(Some(600)), &url).await.unwrap_err();
+        assert!(matches!(err, SendError::Timeout(_)), "{err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_send_in_flight_closes_the_connection() {
+        let (url, srv) = serve_and_hold(Vec::new()).await;
+        let task = tokio::spawn(async move { send_with(&client().unwrap(), &url).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        task.abort();
+        assert!(
+            srv.await.unwrap(),
+            "the server still had an open connection"
+        );
+    }
+
+    #[test]
+    fn timeouts_describe_their_limits() {
+        assert_eq!(
+            Timeouts::default().to_string(),
+            "connect limit 10 s, no-data limit 30 s"
+        );
+        let t = Timeouts {
+            total: Some(Duration::from_millis(1500)),
+            ..Timeouts::default()
+        };
+        assert_eq!(
+            t.to_string(),
+            "connect limit 10 s, no-data limit 30 s, total limit 1500 ms"
+        );
     }
 }

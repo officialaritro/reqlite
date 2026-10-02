@@ -12,7 +12,7 @@ tempfile = "3.27"
 thiserror = "2.0.21"
 
 [dev-dependencies]
-tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "macros"] }
+tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "macros", "time"] }
 
 [lints]
 workspace = true
