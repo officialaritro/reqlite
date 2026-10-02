@@ -17,6 +17,8 @@ cargo run --release -p reqlite-gui -- examples/hello.toml   # the desktop app
 reqlite-gui users.toml --env envs/dev.toml
 ```
 
+![reqlite-gui showing a 50 MB JSON response, 5,467,582 lines](docs/images/reqlite-gui.png)
+
 `reqlite-gui` opens one request file per window. If the file does not exist yet, the first save creates it.
 
 | Action | How |
