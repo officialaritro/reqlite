@@ -1,6 +1,7 @@
 //! Fills `{{var}}` placeholders from an [`Environment`]. Pure: no IO, no clock.
 
 use reqlite_format::{Environment, Method, Request, Var, is_var_name};
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// A request with every placeholder filled in.
@@ -19,11 +20,28 @@ pub struct Parts {
 pub struct Resolved {
     sent: Parts,
     redacted: Parts,
+    /// Secret values this request uses, longest first, with their names.
+    secrets: Vec<(String, String)>,
 }
 
 impl Resolved {
     pub fn redacted(&self) -> &Parts {
         &self.redacted
+    }
+
+    /// Replaces every secret value this request used with `{{name}}`. Servers
+    /// echo headers back, so anything stored from a response goes through this.
+    pub fn redact(&self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        for (name, value) in &self.secrets {
+            out = replace(&out, value.as_bytes(), format!("{{{{{name}}}}}").as_bytes());
+        }
+        out
+    }
+
+    /// The longest secret this request used, in bytes.
+    pub fn longest_secret(&self) -> usize {
+        self.secrets.first().map_or(0, |(_, v)| v.len())
     }
 
     pub(crate) fn sent(&self) -> &Parts {
@@ -53,11 +71,28 @@ pub enum ResolveError {
     HeaderValue { name: String },
 }
 
+fn replace(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < haystack.len() {
+        if haystack[i..].starts_with(needle) {
+            out.extend_from_slice(with);
+            i += needle.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 pub fn resolve(req: &Request, env: &Environment) -> Result<Resolved, ResolveError> {
-    let (url, url_r) = fill(&req.url, env, "url")?;
+    let mut used = BTreeMap::new();
+    let mut fill = |text: &str, field: &str| fill(text, env, field, &mut used);
+    let (url, url_r) = fill(&req.url, "url")?;
     let mut headers = (Vec::new(), Vec::new());
     for (name, value) in req.headers.pairs() {
-        let (v, v_r) = fill(value, env, &format!("header {name}"))?;
+        let (v, v_r) = fill(value, &format!("header {name}"))?;
         if v.chars().any(|c| c.is_control() && c != '\t') {
             return Err(ResolveError::HeaderValue { name: name.into() });
         }
@@ -66,18 +101,24 @@ pub fn resolve(req: &Request, env: &Environment) -> Result<Resolved, ResolveErro
     }
     let mut query = (Vec::new(), Vec::new());
     for (name, value) in req.query.pairs() {
-        let (v, v_r) = fill(value, env, &format!("query {name}"))?;
+        let (v, v_r) = fill(value, &format!("query {name}"))?;
         query.0.push((name.to_string(), v));
         query.1.push((name.to_string(), v_r));
     }
     let (body, body_r) = match &req.body {
         Some(b) => {
-            let (v, v_r) = fill(b, env, "body")?;
+            let (v, v_r) = fill(b, "body")?;
             (Some(v), Some(v_r))
         }
         None => (None, None),
     };
+    let mut secrets: Vec<(String, String)> = used
+        .into_iter()
+        .filter(|(_, v): &(String, String)| !v.is_empty())
+        .collect();
+    secrets.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
     Ok(Resolved {
+        secrets,
         sent: Parts {
             method: req.method.clone(),
             url,
@@ -97,7 +138,12 @@ pub fn resolve(req: &Request, env: &Environment) -> Result<Resolved, ResolveErro
 
 /// Returns the text to send and the text to show or store. Substituted values
 /// are not scanned again, so a value containing `{{` is sent as is.
-fn fill(text: &str, env: &Environment, field: &str) -> Result<(String, String), ResolveError> {
+fn fill(
+    text: &str,
+    env: &Environment,
+    field: &str,
+    secrets: &mut BTreeMap<String, String>,
+) -> Result<(String, String), ResolveError> {
     let mut sent = String::with_capacity(text.len());
     let mut shown = String::with_capacity(text.len());
     let mut rest = text;
@@ -121,6 +167,7 @@ fn fill(text: &str, env: &Environment, field: &str) -> Result<(String, String), 
                 shown.push_str(v);
             }
             Some(Var::Secret(v)) => {
+                secrets.insert(name.to_string(), v.clone());
                 sent.push_str(v);
                 shown.push_str("{{");
                 shown.push_str(name);
@@ -184,6 +231,17 @@ mod tests {
         );
         assert_eq!(r.redacted().body.as_deref(), Some("k={{token}}"));
         assert!(!format!("{r:?}").contains("s3cret"));
+        assert_eq!(
+            r.redact(b"echo: Bearer s3cret, s3cret"),
+            b"echo: Bearer {{token}}, {{token}}"
+        );
+    }
+
+    #[test]
+    fn redact_leaves_bytes_alone_when_no_secret_is_used() {
+        let r = resolve(&req("url = '{{base}}'\n"), &env()).unwrap();
+        assert_eq!(r.redact(b"s3cret http://api"), b"s3cret http://api");
+        assert_eq!(r.longest_secret(), 0);
     }
 
     #[test]

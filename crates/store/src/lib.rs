@@ -7,7 +7,7 @@
 //! One thread owns the connection. Callers send commands over a channel and await
 //! the reply, so no lock on the connection exists.
 
-use reqlite_engine::Parts;
+use reqlite_engine::{Parts, Resolved, Response, SendError};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -381,17 +381,62 @@ fn now_ms() -> i64 {
         .map_or(0, |d| to_i64(d.as_millis().try_into().unwrap_or(u64::MAX)))
 }
 
-/// The first [`BODY_CAP`] bytes of a body, the part history keeps.
-pub fn body_prefix(reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut reader.take(BODY_CAP as u64), &mut buf)?;
-    Ok(buf)
+impl Entry {
+    /// The history entry for one send. Secret values the request used are
+    /// replaced with `{{name}}` everywhere, including in what the server echoed.
+    pub fn from_send(
+        file: Option<String>,
+        env: Option<String>,
+        req: &Resolved,
+        result: Result<&Response, &SendError>,
+    ) -> std::io::Result<Entry> {
+        let outcome = match result {
+            Ok(resp) => {
+                let mut prefix = Vec::new();
+                let keep = (BODY_CAP + req.longest_secret()) as u64;
+                let reader = resp.body.reader()?;
+                std::io::Read::read_to_end(&mut std::io::Read::take(reader, keep), &mut prefix)?;
+                let mut body = req.redact(&prefix);
+                body.truncate(BODY_CAP);
+                Outcome::Response {
+                    status: resp.status,
+                    headers: resp
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), req.redact(v)))
+                        .collect(),
+                    body,
+                    body_len: resp.body.len(),
+                    elapsed_ms: u64::try_from(resp.elapsed.as_millis()).unwrap_or(u64::MAX),
+                }
+            }
+            Err(e) => Outcome::Failed {
+                error: String::from_utf8_lossy(&req.redact(error_chain(e).as_bytes())).into_owned(),
+            },
+        };
+        Ok(Entry {
+            file,
+            env,
+            request: req.redacted().into(),
+            outcome,
+        })
+    }
+}
+
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut text = err.to_string();
+    let mut cause = err.source();
+    while let Some(c) = cause {
+        text.push_str(": ");
+        text.push_str(&c.to_string());
+        cause = c.source();
+    }
+    text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::OptionalExtension;
 
     fn entry(url: &str, outcome: Outcome) -> Entry {
         Entry {
@@ -487,41 +532,90 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
-    #[tokio::test]
-    async fn stores_only_the_capped_body_and_raw_header_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("history.db");
-        let store = open(&path).unwrap().store;
-        let big = vec![b'x'; BODY_CAP * 3];
-        let body = body_prefix(big.as_slice()).unwrap();
-        let body_len = big.len() as u64;
-        let outcome = Outcome::Response {
-            status: 200,
-            headers: vec![("x-raw".into(), b"caf\xe9".to_vec())],
-            body,
-            body_len,
-            elapsed_ms: 1,
-        };
-        store.record(entry("http://a", outcome)).await.unwrap();
-        drop(store);
+    fn wire(body: &[u8]) -> Vec<u8> {
+        let mut r = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-Echo: Bearer s3cret\r\nX-Raw: caf",
+            body.len()
+        )
+        .into_bytes();
+        r.extend_from_slice(b"\xe9\r\nConnection: close\r\n\r\n");
+        r.extend_from_slice(body);
+        r
+    }
 
-        let conn = Connection::open(&path).unwrap();
-        let (stored, len, headers): (Vec<u8>, i64, Vec<u8>) = conn
-            .query_row(
-                "SELECT response_body, body_len, response_headers FROM history",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(stored.len(), BODY_CAP);
-        assert_eq!(len, (BODY_CAP * 3) as i64);
-        assert_eq!(headers, b"x-raw: caf\xe9\r\n");
-        let request: String = conn
-            .query_row("SELECT request FROM history", [], |r| r.get(0))
-            .optional()
-            .unwrap()
-            .unwrap();
-        assert!(request.contains("Bearer {{token}}"), "{request}");
+    /// Sends a request that uses the secret `token` to a server that replies with
+    /// `reply`, or to a closed port when `reply` is `None`.
+    async fn send_to(
+        reply: Option<Vec<u8>>,
+        url_suffix: &str,
+    ) -> (Resolved, Result<Response, SendError>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        match reply {
+            Some(reply) => drop(tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _n = sock.read(&mut buf).await.unwrap();
+                sock.write_all(&reply).await.unwrap();
+            })),
+            None => drop(listener),
+        }
+        let req = reqlite_format::parse(&format!(
+            "version = 1\nname = 't'\nurl = '{url}{url_suffix}'\n[headers]\nAuthorization = 'Bearer {{{{token}}}}'\n"
+        ))
+        .unwrap();
+        let env = reqlite_format::parse_env(
+            Path::new("dev.toml"),
+            "version = 1\nsecrets = ['token']\n",
+            Some("version = 1\n[vars]\ntoken = 's3cret'\n"),
+        )
+        .unwrap();
+        let resolved = reqlite_engine::resolve(&req, &env).unwrap();
+        let client = reqlite_engine::client().unwrap();
+        let result = reqlite_engine::send(&client, &resolved).await;
+        (resolved, result)
+    }
+
+    #[tokio::test]
+    async fn entries_never_hold_secret_values_even_when_the_server_echoes_them() {
+        let mut body = vec![b'x'; BODY_CAP - 3];
+        body.extend_from_slice(b"s3cret and more after the cap");
+        let (req, resp) = send_to(Some(wire(&body)), "/").await;
+        let resp = resp.unwrap();
+        let entry = Entry::from_send(None, None, &req, Ok(&resp)).unwrap();
+        let Outcome::Response {
+            headers,
+            body: kept,
+            body_len,
+            ..
+        } = &entry.outcome
+        else {
+            panic!("expected a response");
+        };
+        assert_eq!(*body_len, body.len() as u64);
+        assert_eq!(kept.len(), BODY_CAP);
+        assert!(
+            !kept.windows(3).any(|w| w == b"s3c"),
+            "secret prefix kept at the cap"
+        );
+        let echo = headers.iter().find(|(k, _)| k == "x-echo").unwrap();
+        assert_eq!(echo.1, b"Bearer {{token}}");
+        let raw = headers.iter().find(|(k, _)| k == "x-raw").unwrap();
+        assert_eq!(raw.1, b"caf\xe9");
+        assert_eq!(entry.request.headers[0].1, "Bearer {{token}}");
+    }
+
+    #[tokio::test]
+    async fn failed_sends_store_the_error_without_secrets() {
+        let (req, resp) = send_to(None, "/?k={{token}}").await;
+        let err = resp.unwrap_err();
+        let entry = Entry::from_send(None, None, &req, Err(&err)).unwrap();
+        let Outcome::Failed { error } = &entry.outcome else {
+            panic!("expected a failure");
+        };
+        assert!(!error.contains("s3cret"), "{error}");
+        assert!(error.contains("{{token}}"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
