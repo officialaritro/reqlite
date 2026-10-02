@@ -5,7 +5,7 @@ use crate::motion::Motion;
 use iced::task::Handle;
 use iced::widget::text_editor;
 use reqlite_gui::chain;
-use reqlite_gui::draft::Draft;
+use reqlite_gui::draft::{AuthDraft, BodyKind, Draft};
 use reqlite_gui::present::entries;
 use reqlite_viewer::Document;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,10 @@ pub struct Doc {
     pub headers: text_editor::Content,
     pub query: text_editor::Content,
     pub body: text_editor::Content,
+    pub body_kind: BodyKind,
+    /// The path a File body sends.
+    pub body_file: String,
+    pub auth: AuthDraft,
     pub section: Section,
     /// Derived from the fields and `saved`, refreshed after each change.
     pub dirty: bool,
@@ -88,7 +92,7 @@ pub struct Viewer {
 /// A request file as read from disk.
 pub enum Opened {
     Missing,
-    Loaded(reqlite_format::Request, String),
+    Loaded(Box<reqlite_format::Request>, String),
     Failed(String),
 }
 
@@ -98,7 +102,7 @@ pub fn open(path: &Path) -> Opened {
         Ok(text) => match reqlite_format::parse(&text) {
             Ok(req) => {
                 let canonical = reqlite_format::to_string(&req).unwrap_or(text);
-                Opened::Loaded(req, canonical)
+                Opened::Loaded(Box::new(req), canonical)
             }
             Err(e) => Opened::Failed(format!("cannot open {}: {}", path.display(), chain(&e))),
         },
@@ -124,6 +128,9 @@ impl Doc {
             headers: text_editor::Content::new(),
             query: text_editor::Content::new(),
             body: text_editor::Content::new(),
+            body_kind: BodyKind::default(),
+            body_file: String::new(),
+            auth: AuthDraft::default(),
             section: Section::Query,
             dirty: false,
             counts: Counts::default(),
@@ -167,6 +174,9 @@ impl Doc {
         self.headers = text_editor::Content::with_text(&d.headers);
         self.query = text_editor::Content::with_text(&d.query);
         self.body = text_editor::Content::with_text(&d.body);
+        self.body_kind = d.body_kind;
+        self.body_file.clone_from(&d.body_file);
+        self.auth = d.auth.clone();
         if !self.methods.contains(&self.method) {
             self.methods.push(self.method.clone());
         }
@@ -181,6 +191,9 @@ impl Doc {
             headers: self.headers.text(),
             query: self.query.text(),
             body: self.body.text(),
+            body_kind: self.body_kind,
+            body_file: self.body_file.clone(),
+            auth: self.auth.clone(),
         }
     }
 

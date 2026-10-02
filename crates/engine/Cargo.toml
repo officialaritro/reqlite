@@ -7,8 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 reqlite-format = { version = "0.0.1", path = "../format" }
-reqwest = { version = "0.13.5", default-features = false, features = ["query", "rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["multipart", "query", "rustls", "stream"] }
 tempfile = "3.27"
+tokio = { version = "1.53.1", features = ["fs"] }
 thiserror = "2.0.21"
 
 [dev-dependencies]

@@ -5,7 +5,8 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::VERSION;
+/// The environment file version this build reads.
+pub const ENV_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,7 +59,7 @@ pub enum EnvError {
         #[source]
         source: toml::de::Error,
     },
-    #[error("environment {path} has version {found}, this build reads version {VERSION}")]
+    #[error("environment {path} has version {found}, this build reads version {ENV_VERSION}")]
     UnsupportedVersion { path: PathBuf, found: u32 },
     #[error("invalid variable name {name:?} in {path}")]
     InvalidName { path: PathBuf, name: String },
@@ -154,7 +155,7 @@ fn parse_file<T: serde::de::DeserializeOwned>(path: &Path, text: &str) -> Result
 }
 
 fn check_version(path: &Path, found: u32) -> Result<(), EnvError> {
-    if found == VERSION {
+    if found == ENV_VERSION {
         Ok(())
     } else {
         Err(EnvError::UnsupportedVersion {

@@ -8,11 +8,14 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+mod body;
 mod env;
+pub use body::{Auth, Body, KeyIn, Part};
 pub use env::{EnvError, Environment, Var, is_var_name, load_env, local_path, parse_env};
 
-/// Current schema version written to and accepted from request files.
-pub const VERSION: u32 = 1;
+/// The newest request file version this build reads and writes. Files use the
+/// lowest version that holds them: see [`needed_version`].
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,7 +30,18 @@ pub struct Request {
     #[serde(default, skip_serializing_if = "Params::is_empty")]
     pub query: Params,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub body: Option<String>,
+    pub body: Option<Body>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<Auth>,
+}
+
+/// Version 1 holds a request whose body is plain text and that has no auth.
+/// Anything else needs version 2.
+pub fn needed_version(req: &Request) -> u32 {
+    match (&req.body, &req.auth) {
+        (None | Some(Body::Text(_)), None) => 1,
+        _ => 2,
+    }
 }
 
 /// An HTTP method token, stored upper case.
@@ -147,7 +161,7 @@ impl<'de> Deserialize<'de> for OneOrMany {
 pub enum ParseError {
     #[error("invalid request file")]
     Toml(#[from] toml::de::Error),
-    #[error("unsupported request file version {found}, this build reads version {VERSION}")]
+    #[error("unsupported request file version {found}, this build reads versions 1 to {VERSION}")]
     UnsupportedVersion { found: u32 },
     #[error("invalid request file: {0}")]
     Invalid(String),
@@ -155,8 +169,13 @@ pub enum ParseError {
 
 pub fn parse(text: &str) -> Result<Request, ParseError> {
     let req: Request = toml::from_str(text)?;
-    if req.version != VERSION {
+    if !(1..=VERSION).contains(&req.version) {
         return Err(ParseError::UnsupportedVersion { found: req.version });
+    }
+    if req.version < needed_version(&req) {
+        return Err(ParseError::Invalid(
+            "a [body] table or [auth] needs version = 2".to_string(),
+        ));
     }
     validate(&req)?;
     Ok(req)
@@ -177,6 +196,62 @@ pub fn validate(req: &Request) -> Result<(), ParseError> {
             return invalid(format!("header {name:?} has a control character"));
         }
     }
+    match &req.body {
+        Some(Body::Form(fields)) => {
+            if fields.pairs().any(|(name, _)| name.is_empty()) {
+                return invalid("a form field has an empty name".to_string());
+            }
+        }
+        Some(Body::Multipart(parts)) => {
+            for p in parts {
+                if p.name.is_empty() {
+                    return invalid("a multipart part has an empty name".to_string());
+                }
+                match (&p.text, &p.file) {
+                    (Some(_), None) => {
+                        if p.content_type.is_some() {
+                            return invalid(format!(
+                                "part {:?}: content_type is for file parts",
+                                p.name
+                            ));
+                        }
+                    }
+                    (None, Some(f)) if !f.trim().is_empty() => {}
+                    (None, Some(_)) => {
+                        return invalid(format!("part {:?} has an empty file path", p.name));
+                    }
+                    _ => {
+                        return invalid(format!(
+                            "part {:?} needs exactly one of text or file",
+                            p.name
+                        ));
+                    }
+                }
+            }
+        }
+        Some(Body::File { path }) if path.trim().is_empty() => {
+            return invalid("the body file path is empty".to_string());
+        }
+        _ => {}
+    }
+    if let Some(auth) = &req.auth {
+        if let Auth::ApiKey { name, .. } = auth {
+            if !is_token(name) {
+                return invalid(format!("invalid API key name {name:?}"));
+            }
+        }
+        if let Some(header) = auth.header() {
+            if req
+                .headers
+                .pairs()
+                .any(|(name, _)| name.eq_ignore_ascii_case(header))
+            {
+                return invalid(format!(
+                    "{header} is set both in [headers] and by [auth]; keep one"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -185,7 +260,14 @@ pub fn validate(req: &Request) -> Result<(), ParseError> {
 // SHORTCUT: comments and layout in a hand-edited file are lost on save. Switch to
 // toml_edit if users report it.
 pub fn to_string(req: &Request) -> Result<String, toml::ser::Error> {
-    toml::to_string(req)
+    let version = needed_version(req);
+    if req.version == version {
+        return toml::to_string(req);
+    }
+    toml::to_string(&Request {
+        version,
+        ..req.clone()
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -259,7 +341,7 @@ tag = ["a", "b"]
         assert_eq!(req.headers.get("Content-Type"), ["application/json"]);
         let pairs: Vec<_> = req.query.pairs().collect();
         assert_eq!(pairs, [("dry_run", "true"), ("tag", "a"), ("tag", "b")]);
-        assert_eq!(req.body.as_deref(), Some(r#"{"name":"ada"}"#));
+        assert_eq!(req.body, Some(Body::Text(r#"{"name":"ada"}"#.into())));
     }
 
     #[test]
@@ -269,8 +351,8 @@ tag = ["a", "b"]
 
     #[test]
     fn rejects_unknown_version() {
-        let err = parse(&MIN.replace("version = 1", "version = 2")).unwrap_err();
-        assert!(matches!(err, ParseError::UnsupportedVersion { found: 2 }));
+        let err = parse(&MIN.replace("version = 1", "version = 3")).unwrap_err();
+        assert!(matches!(err, ParseError::UnsupportedVersion { found: 3 }));
     }
 
     #[test]
@@ -360,5 +442,99 @@ tag = ["a", "b"]
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(result, Err(SaveError::Io { .. })), "{result:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), MIN);
+    }
+
+    const V2: &str = "version = 2\nname = \"x\"\nmethod = \"POST\"\nurl = \"http://a\"\n";
+
+    #[test]
+    fn each_body_type_reads_and_writes_back_the_same() {
+        let cases = [
+            "\n[body]\ntype = \"json\"\ntext = '{\"a\": 1}'\n",
+            "\n[body]\ntype = \"form\"\n\n[body.fields]\nname = \"ada\"\ntag = [\"a\", \"b\"]\n",
+            "\n[body]\ntype = \"multipart\"\n\n[[body.parts]]\nname = \"note\"\ntext = \"hi\"\n\n[[body.parts]]\nname = \"avatar\"\nfile = \"img/ada.png\"\ncontent_type = \"image/png\"\n",
+            "\n[body]\ntype = \"file\"\npath = \"payload.bin\"\n",
+            "\n[auth]\ntype = \"bearer\"\ntoken = \"{{token}}\"\n",
+            "\n[auth]\ntype = \"basic\"\nusername = \"ada\"\npassword = \"{{pw}}\"\n",
+            "\n[auth]\ntype = \"api_key\"\nname = \"key\"\nvalue = \"{{key}}\"\nin = \"query\"\n",
+        ];
+        for tail in cases {
+            let text = format!("{V2}{tail}");
+            let req = parse(&text).unwrap_or_else(|e| panic!("{tail}: {e}"));
+            assert_eq!(to_string(&req).unwrap(), text, "{tail}");
+        }
+    }
+
+    #[test]
+    fn a_v2_file_that_needs_nothing_new_is_written_as_v1() {
+        let req = parse(&format!("{V2}body = \"raw\"\n")).unwrap();
+        assert_eq!(req.body, Some(Body::Text("raw".into())));
+        let out = to_string(&req).unwrap();
+        assert!(out.starts_with("version = 1\n"), "{out}");
+        let typed_text =
+            parse(&format!("{V2}\n[body]\ntype = \"text\"\ntext = \"raw\"\n")).unwrap();
+        assert_eq!(to_string(&typed_text).unwrap(), out);
+    }
+
+    #[test]
+    fn new_tables_need_version_2() {
+        let v1 = V2.replace("version = 2", "version = 1");
+        for tail in [
+            "\n[body]\ntype = \"json\"\ntext = \"{}\"\n",
+            "\n[auth]\ntype = \"bearer\"\ntoken = \"t\"\n",
+        ] {
+            let err = parse(&format!("{v1}{tail}")).unwrap_err();
+            assert!(err.to_string().contains("needs version = 2"), "{err}");
+        }
+    }
+
+    #[test]
+    fn new_fields_are_checked_with_a_reason() {
+        let cases = [
+            (
+                "\n[body]\ntype = \"multipart\"\n\n[[body.parts]]\nname = \"a\"\ntext = \"x\"\nfile = \"f\"\n",
+                "exactly one of text or file",
+            ),
+            (
+                "\n[body]\ntype = \"multipart\"\n\n[[body.parts]]\nname = \"a\"\n",
+                "exactly one of text or file",
+            ),
+            (
+                "\n[body]\ntype = \"multipart\"\n\n[[body.parts]]\nname = \"\"\ntext = \"x\"\n",
+                "empty name",
+            ),
+            (
+                "\n[body]\ntype = \"multipart\"\n\n[[body.parts]]\nname = \"a\"\ntext = \"x\"\ncontent_type = \"text/plain\"\n",
+                "content_type is for file parts",
+            ),
+            ("\n[body]\ntype = \"file\"\npath = \" \"\n", "path is empty"),
+            (
+                "\n[body]\ntype = \"xml\"\ntext = \"<a/>\"\n",
+                "unknown variant",
+            ),
+            (
+                "\n[headers]\nauthorization = \"x\"\n\n[auth]\ntype = \"bearer\"\ntoken = \"t\"\n",
+                "set both in [headers] and by [auth]",
+            ),
+            (
+                "\n[auth]\ntype = \"api_key\"\nname = \"bad key\"\nvalue = \"v\"\n",
+                "invalid API key name",
+            ),
+        ];
+        for (tail, reason) in cases {
+            let err = parse(&format!("{V2}{tail}")).unwrap_err();
+            let mut msg = err.to_string();
+            if let Some(source) = std::error::Error::source(&err) {
+                msg = format!("{msg}: {source}");
+            }
+            assert!(msg.contains(reason), "{tail:?} gave {msg:?}");
+        }
+    }
+
+    #[test]
+    fn an_api_key_in_the_query_does_not_clash_with_a_header() {
+        let text = format!(
+            "{V2}\n[headers]\nkey = \"h\"\n\n[auth]\ntype = \"api_key\"\nname = \"key\"\nvalue = \"v\"\nin = \"query\"\n"
+        );
+        assert!(parse(&text).is_ok());
     }
 }

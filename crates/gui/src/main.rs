@@ -498,6 +498,12 @@ fn start_send(app: &mut App) -> Task<Msg> {
     if doc.running() {
         return Task::none();
     }
+    // Body files are relative to the request file, or to the current folder.
+    let dir = doc
+        .file
+        .as_deref()
+        .and_then(Path::parent)
+        .map_or_else(PathBuf::new, Path::to_path_buf);
     let req = match doc.draft().to_request() {
         Ok(r) => r,
         Err(e) => {
@@ -509,14 +515,15 @@ fn start_send(app: &mut App) -> Task<Msg> {
         None => Ok(reqlite_format::Environment::default()),
         Some(path) => reqlite_format::load_env(path).map_err(|e| chain(&e)),
     };
-    let resolved =
-        match env.and_then(|env| reqlite_engine::resolve(&req, &env).map_err(|e| e.to_string())) {
-            Ok(r) => r,
-            Err(e) => {
-                doc.send = Send::Finished(Err(e));
-                return Task::none();
-            }
-        };
+    let resolved = match env
+        .and_then(|env| reqlite_engine::resolve_in(&req, &env, &dir).map_err(|e| e.to_string()))
+    {
+        Ok(r) => r,
+        Err(e) => {
+            doc.send = Send::Finished(Err(e));
+            return Task::none();
+        }
+    };
     let id = doc.id;
     let file = doc.file.as_ref().map(|p| p.display().to_string());
     let env = env_path.as_ref().map(|p| p.display().to_string());

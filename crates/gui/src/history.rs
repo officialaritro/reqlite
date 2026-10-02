@@ -144,7 +144,9 @@ fn draft(r: &SentRequest) -> Draft {
         url: r.url.clone(),
         headers: lines(&r.headers),
         query: lines(&r.query),
+        // History keeps a text form of every body, so a restore is raw text.
         body: r.body.clone().unwrap_or_default(),
+        ..Draft::default()
     }
 }
 
