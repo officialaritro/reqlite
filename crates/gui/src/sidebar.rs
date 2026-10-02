@@ -306,7 +306,7 @@ pub fn view<'a>(app: &'a App, w: &'a Workspace) -> Element<'a, Msg> {
                 .color(style::FAINT),
         );
     }
-    let mut col = column![header, scrollable(list).height(Length::Fill)].spacing(8);
+    let mut col = column![header, scrollable(list).spacing(4).height(Length::Fill)].spacing(8);
     if let Some(path) = &app.sidebar.deleting {
         col = col.push(confirm_delete(path));
     }

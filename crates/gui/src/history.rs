@@ -240,7 +240,7 @@ pub fn view(app: &App) -> Element<'_, Msg> {
     } else if h.rows.is_empty() && !h.loading {
         list = list.push(text("No sends yet.").size(12).color(style::FAINT));
     }
-    container(column![header, scrollable(list).height(Length::Fill)].spacing(8))
+    container(column![header, scrollable(list).spacing(4).height(Length::Fill)].spacing(8))
         .padding(10)
         .width(crate::sidebar::WIDTH)
         .height(Length::Fill)
