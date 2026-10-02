@@ -17,6 +17,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = ".exe" if os.name == "nt" else ""
 CLI = os.path.join(ROOT, "target", "release", "reqlite" + EXE)
+GUI = os.path.join(ROOT, "target", "release", "reqlite-gui" + EXE)
 OPEN = os.path.join(ROOT, "target", "release", "examples", "open" + EXE)
 SCALE = float(os.environ.get("REQLITE_BUDGET_SCALE", "1"))
 MB = 1024 * 1024
@@ -128,6 +129,7 @@ def main() -> None:
     build()
     crate_boundaries()
     check("CLI binary size", os.path.getsize(CLI), 25 * MB, "bytes")
+    check("GUI binary size", os.path.getsize(GUI), 25 * MB, "bytes")
 
     runs = []
     for _ in range(5):

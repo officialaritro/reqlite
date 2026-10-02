@@ -36,3 +36,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: python3 scripts/budgets.py
+      - name: GUI idle memory and cold start
+        if: matrix.os == 'macos-latest'
+        run: python3 scripts/gui_idle.py target/release/reqlite-gui
+        env:
+          REQLITE_DATA_DIR: ${{ runner.temp }}/reqlite-data
