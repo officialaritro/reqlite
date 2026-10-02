@@ -962,6 +962,7 @@ dependencies = [
  "clap",
  "reqlite-engine",
  "reqlite-format",
+ "reqlite-import",
  "reqlite-store",
  "thiserror",
  "tokio",

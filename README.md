@@ -52,6 +52,16 @@ reqlite send users.toml --env envs/dev.toml
 
 An undefined placeholder stops the send and names the variable.
 
+### cURL import and export
+
+```sh
+reqlite import curl "curl 'https://api.example.com/users' -H 'accept: application/json'" -o users.toml
+pbpaste | reqlite import curl -o users.toml   # a command copied from the browser
+reqlite export curl users.toml
+```
+
+Import never drops an option silently. Anything it cannot map prints a warning, for example `-k`, a body read from `@file`, or credentials given with `-u`, which are not written to a file you might commit. A header that holds a literal token also gets a warning, so you can move the token to a secret. Import refuses to replace an existing file unless you pass `--force`.
+
 ### History
 
 Each send is saved to a local history file, `history.db` in your data directory (for example `~/Library/Application Support/reqlite` on macOS). Set `REQLITE_DATA_DIR` to put it somewhere else. History never leaves your machine and is never committed. Secret values are replaced with `{{name}}` before anything is saved, including in response bodies and headers that echo them. History keeps the first 256 KiB of each response body.
@@ -78,6 +88,7 @@ If the history file is damaged, Reqlite moves it aside as `history.db.corrupt-<t
 | `crates/format` | Request and environment file formats: schema, parser, writer |
 | `crates/engine` | Resolves placeholders, sends a request, returns the response. No UI code. |
 | `crates/store` | Local request history in SQLite |
+| `crates/import` | cURL import and export |
 | `crates/cli` | The `reqlite` command |
 
 Design rules:

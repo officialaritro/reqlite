@@ -27,6 +27,36 @@ enum Command {
         #[arg(long, short = 'n', default_value_t = 20)]
         limit: usize,
     },
+    /// Turn another tool's request into a Reqlite request file.
+    Import {
+        #[command(subcommand)]
+        from: ImportFrom,
+    },
+    /// Turn a request file into another tool's format, printed to stdout.
+    Export {
+        #[command(subcommand)]
+        to: ExportTo,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportFrom {
+    /// A curl command line. Reads stdin when COMMAND is not given.
+    Curl {
+        command: Option<String>,
+        /// Write the request file here instead of printing it.
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+        /// Replace OUT if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExportTo {
+    /// A curl command line. Placeholders stay as `{{name}}`.
+    Curl { file: PathBuf },
 }
 
 /// What failed decides the exit code.
@@ -52,6 +82,17 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Send { file, env } => send(&file, env.as_deref()),
         Command::History { limit } => history(limit),
+        Command::Import {
+            from:
+                ImportFrom::Curl {
+                    command,
+                    out,
+                    force,
+                },
+        } => import_curl(command, out.as_deref(), force),
+        Command::Export {
+            to: ExportTo::Curl { file },
+        } => export_curl(&file),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -128,19 +169,23 @@ struct InFile<E: Error + 'static> {
     source: E,
 }
 
-fn send(file: &Path, env_path: Option<&Path>) -> Result<(), Failure> {
+fn read_request(file: &Path) -> Result<reqlite_format::Request, Failure> {
     let text = std::fs::read_to_string(file).map_err(|source| {
         Failure::input(ReadError {
             path: file.to_path_buf(),
             source,
         })
     })?;
-    let req = reqlite_format::parse(&text).map_err(|source| {
+    reqlite_format::parse(&text).map_err(|source| {
         Failure::input(InFile {
             path: file.to_path_buf(),
             source,
         })
-    })?;
+    })
+}
+
+fn send(file: &Path, env_path: Option<&Path>) -> Result<(), Failure> {
+    let req = read_request(file)?;
     let env = match env_path {
         Some(path) => reqlite_format::load_env(path).map_err(Failure::input)?,
         None => reqlite_format::Environment::default(),
@@ -241,4 +286,45 @@ fn ago(ms: i64) -> String {
         3600..86400 => format!("{}h ago", s / 3600),
         _ => format!("{}d ago", s / 86400),
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0} already exists; pass --force to replace it")]
+struct Exists(String);
+
+fn import_curl(command: Option<String>, out: Option<&Path>, force: bool) -> Result<(), Failure> {
+    let command = match command {
+        Some(c) => c,
+        None => std::io::read_to_string(std::io::stdin()).map_err(|source| {
+            Failure::input(ReadError {
+                path: PathBuf::from("stdin"),
+                source,
+            })
+        })?,
+    };
+    let (req, warnings) = reqlite_import::curl::import(&command).map_err(Failure::input)?;
+    for w in &warnings {
+        eprintln!("warning: {w}");
+    }
+    match out {
+        Some(path) => {
+            if path.exists() && !force {
+                return Err(Failure::input(Exists(path.display().to_string())));
+            }
+            reqlite_format::save(path, &req).map_err(Failure::input)?;
+            eprintln!("wrote {}", path.display());
+            Ok(())
+        }
+        None => {
+            let text = reqlite_format::to_string(&req).map_err(Failure::input)?;
+            let mut out = std::io::stdout().lock();
+            out.write_all(text.as_bytes()).map_err(Failure::Output)
+        }
+    }
+}
+
+fn export_curl(file: &Path) -> Result<(), Failure> {
+    let req = read_request(file)?;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{}", reqlite_import::curl::export(&req)).map_err(Failure::Output)
 }
