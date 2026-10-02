@@ -1,0 +1,12 @@
+[package]
+name = "reqlite-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+reqlite-format = { version = "0.0.1", path = "../format" }
+
+[lints]
+workspace = true

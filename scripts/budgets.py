@@ -28,6 +28,12 @@ ALLOWED: dict[str, set[str]] = {
     "reqlite-import": {"reqlite-format"},
     "reqlite-viewer": set(),
     "reqlite-store": {"reqlite-format", "reqlite-engine"},
+    "reqlite-gui": {
+        "reqlite-format",
+        "reqlite-engine",
+        "reqlite-store",
+        "reqlite-viewer",
+    },
     "reqlite": {
         "reqlite-format",
         "reqlite-engine",

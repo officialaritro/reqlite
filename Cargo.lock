@@ -990,6 +990,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "reqlite-gui"
+version = "0.0.1"
+dependencies = [
+ "reqlite-format",
+]
+
+[[package]]
 name = "reqlite-import"
 version = "0.0.1"
 dependencies = [
