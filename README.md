@@ -75,14 +75,14 @@ If the history file is damaged, Reqlite moves it aside as `history.db.corrupt-<t
 
 | Crate | Job |
 |---|---|
-| `crates/format` | The request file format (schema and parser) |
+| `crates/format` | Request and environment file formats: schema, parser, writer |
 | `crates/engine` | Resolves placeholders, sends a request, returns the response. No UI code. |
 | `crates/store` | Local request history in SQLite |
 | `crates/cli` | The `reqlite` command |
 
 Design rules:
 
-1. Request files are the source of truth. A future SQLite database is only a rebuildable cache.
+1. Request files are the source of truth. History lives in a local SQLite file. It is your data, so no rebuild or reset ever deletes it.
 2. The engine is headless. The CLI and the future GUI are thin clients over it.
 3. No login and no server in v1.
 
