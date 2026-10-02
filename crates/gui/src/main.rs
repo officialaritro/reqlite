@@ -95,6 +95,8 @@ enum Msg {
     Close(DocId),
     /// The answer to "discard changes?".
     Discard(bool),
+    /// The environment for the next sends.
+    PickEnv(Env),
     Side(SideMsg),
     /// Cmd+W: close the shown tab.
     CloseActive,
@@ -103,6 +105,22 @@ enum Msg {
     /// Cmd+N: a new request in the sidebar, or a new untitled tab.
     New,
     FirstFrame,
+}
+
+/// A choice in the environment picker: a file, or no environment.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Env(Option<PathBuf>);
+
+impl std::fmt::Display for Env {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            None => f.write_str("No environment"),
+            Some(path) => {
+                let stem = path.file_stem().unwrap_or(path.as_os_str());
+                write!(f, "env {}", stem.to_string_lossy())
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -192,6 +210,20 @@ impl App {
             .push(Doc::new(id, file, opened, self.reduced_motion));
         self.active = self.docs.len() - 1;
         id
+    }
+
+    /// "No environment", the workspace's `envs/*.toml`, and the `--env` file
+    /// when it lives elsewhere.
+    fn env_choices(&self) -> Vec<Env> {
+        let mut choices = vec![Env(None)];
+        if let Some(w) = &self.workspace {
+            choices.extend(w.envs.iter().cloned().map(|p| Env(Some(p))));
+        }
+        let current = Env(self.env.clone());
+        if !choices.contains(&current) {
+            choices.push(current);
+        }
+        choices
     }
 
     fn by_id(&mut self, id: DocId) -> Option<&mut Doc> {
@@ -356,6 +388,7 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
             _ => app.closing = None,
         },
         Msg::Side(m) => return sidebar::update(app, m),
+        Msg::PickEnv(Env(path)) => app.env = path,
         Msg::New => match &app.workspace {
             Some(w) => {
                 let dir = app

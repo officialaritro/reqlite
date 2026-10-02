@@ -19,6 +19,8 @@ pub const NAME_INPUT: iced::widget::Id = iced::widget::Id::new("sidebar-name");
 pub struct Workspace {
     pub root: PathBuf,
     pub tree: Vec<Node>,
+    /// `envs/*.toml`, for the environment picker.
+    pub envs: Vec<PathBuf>,
 }
 
 #[derive(Default)]
@@ -64,6 +66,7 @@ impl Workspace {
         let mut w = Workspace {
             root,
             tree: Vec::new(),
+            envs: Vec::new(),
         };
         w.rescan();
         w
@@ -72,6 +75,7 @@ impl Workspace {
     pub fn rescan(&mut self) {
         // A root that cannot be read shows an empty tree; the error shows on use.
         self.tree = workspace::scan(&self.root).unwrap_or_default();
+        self.envs = workspace::environments(&self.root);
     }
 }
 

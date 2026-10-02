@@ -481,17 +481,21 @@ fn digits(n: usize) -> usize {
 }
 
 fn status_bar(app: &App) -> Element<'_, Msg> {
-    let env = match &app.env {
-        Some(path) => format!(
-            "env {}",
-            path.file_name().map_or_else(
-                || path.display().to_string(),
-                |f| f.to_string_lossy().into()
-            )
-        ),
-        None => "no environment".into(),
-    };
-    let mut bar = row![text(env).size(12).font(style::MONO).color(style::FAINT)];
+    let env = pick_list(
+        app.env_choices(),
+        Some(super::Env(app.env.clone())),
+        Msg::PickEnv,
+    )
+    .font(style::MONO)
+    .text_size(12)
+    .padding([3, 8])
+    .style(style::method_picker(if app.env.is_some() {
+        style::TEXT
+    } else {
+        style::FAINT
+    }))
+    .menu_style(style::method_menu);
+    let mut bar = row![env];
     if let Some(n) = &app.notice {
         bar = bar.push(text(n).size(12).color(style::WARNING));
     }

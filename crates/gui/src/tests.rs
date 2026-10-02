@@ -537,3 +537,39 @@ fn a_new_request_does_not_replace_a_file_made_meanwhile() {
         doc::Written::Saved(_)
     ));
 }
+
+#[test]
+fn the_environment_picker_lists_the_workspace_envs_and_switches_without_restart() {
+    let (dir, mut a) = workspace();
+    std::fs::create_dir(dir.path().join("envs")).unwrap();
+    for f in ["dev.toml", "dev.local.toml", "prod.toml"] {
+        std::fs::write(dir.path().join("envs").join(f), "version = 1\n").unwrap();
+    }
+    drop(update(&mut a, Msg::FsChanged));
+    let envs = dir.path().join("envs");
+    assert_eq!(
+        a.env_choices(),
+        [
+            Env(None),
+            Env(Some(envs.join("dev.toml"))),
+            Env(Some(envs.join("prod.toml")))
+        ]
+    );
+    assert_eq!(Env(Some(envs.join("prod.toml"))).to_string(), "env prod");
+
+    drop(update(
+        &mut a,
+        Msg::PickEnv(Env(Some(envs.join("prod.toml")))),
+    ));
+    assert_eq!(a.env.as_deref(), Some(envs.join("prod.toml").as_path()));
+    drop(update(&mut a, Msg::PickEnv(Env(None))));
+    assert!(a.env.is_none());
+}
+
+#[test]
+fn an_env_from_outside_the_workspace_stays_a_choice() {
+    let (_dir, mut a) = workspace();
+    let outside = PathBuf::from("/elsewhere/staging.toml");
+    a.env = Some(outside.clone());
+    assert_eq!(a.env_choices(), [Env(None), Env(Some(outside))]);
+}
