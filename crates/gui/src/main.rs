@@ -20,6 +20,7 @@ mod scrollbar;
 mod sidebar;
 mod style;
 mod view;
+mod watch;
 
 const LINE_HEIGHT: f32 = 18.0;
 const PAGE: i64 = 40;
@@ -79,7 +80,11 @@ enum Msg {
     /// A frame or pulse tick, while something moves.
     Tick(Instant),
     Save,
-    Saved(DocId, Result<String, String>),
+    Saved(DocId, Result<doc::Written, String>),
+    /// Something under the workspace changed on disk.
+    FsChanged,
+    /// The workspace cannot be watched. The app works, without live updates.
+    WatchFailed(String),
     Scroll(i64),
     ScrollTo(f64),
     Section(Section),
@@ -267,7 +272,7 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
             }
         }
         Msg::Saved(id, result) => match result {
-            Ok(text) => {
+            Ok(doc::Written::Saved(text)) => {
                 if let Some(doc) = app.by_id(id) {
                     doc.saved = Some(text);
                     doc.conflict = false;
@@ -277,8 +282,29 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
                 // A first save adds the file to the tree.
                 sidebar::rescan(app);
             }
+            Ok(doc::Written::Changed) => {
+                if let Some(doc) = app.by_id(id) {
+                    doc.conflict = true;
+                    let label = doc.label.clone();
+                    app.notice = Some(format!(
+                        "{label} changed on disk. Save again to overwrite it, or close the tab without saving to keep the disk version."
+                    ));
+                }
+            }
             Err(e) => app.notice = Some(e),
         },
+        Msg::FsChanged => {
+            sidebar::rescan(app);
+            let notices: Vec<String> = app.docs.iter_mut().filter_map(Doc::reload).collect();
+            if let Some(n) = notices.into_iter().next() {
+                app.notice = Some(n);
+            }
+        }
+        Msg::WatchFailed(e) => {
+            app.notice = Some(format!(
+                "changes on disk will not show until a restart: {e}"
+            ));
+        }
         Msg::FocusUrl => {
             return Task::batch([
                 widget::operation::focus(URL),
@@ -511,10 +537,8 @@ fn save(app: &mut App) -> Task<Msg> {
         }
     };
     let id = doc.id;
-    let work = blocking(move || {
-        reqlite_format::save(&path, &req).map_err(|e| chain(&e))?;
-        reqlite_format::to_string(&req).map_err(|e| e.to_string())
-    });
+    let (expected, force) = (doc.saved.clone(), doc.conflict);
+    let work = blocking(move || doc::write(&path, &req, expected.as_deref(), force));
     Task::perform(async move { work.await.and_then(|r| r) }, move |r| {
         Msg::Saved(id, r)
     })
@@ -589,6 +613,9 @@ fn subscription(app: &App) -> Subscription<Msg> {
         subs.push(window::frames().map(Msg::Tick));
     } else if app.doc().is_some_and(Doc::running) && !app.reduced_motion {
         subs.push(time::every(motion::PULSE).map(Msg::Tick));
+    }
+    if let Some(w) = &app.workspace {
+        subs.push(Subscription::run_with(w.root.clone(), watch::watch));
     }
     Subscription::batch(subs)
 }

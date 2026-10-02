@@ -226,3 +226,65 @@ impl Doc {
         format!("{}{state}", self.label)
     }
 }
+
+/// What a save found on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Written {
+    /// The file was written. It holds the canonical text.
+    Saved(String),
+    /// The file changed on disk since the tab read it. Nothing was written.
+    Changed,
+}
+
+/// Saves `req` to `path`, unless the file on disk is no longer `expected`
+/// (the canonical text the tab last read or wrote, `None` for a new file).
+/// `force` writes anyway. Called off the UI thread.
+pub fn write(
+    path: &Path,
+    req: &reqlite_format::Request,
+    expected: Option<&str>,
+    force: bool,
+) -> Result<Written, String> {
+    if !force {
+        let on_disk = match open(path) {
+            Opened::Missing => None,
+            Opened::Loaded(_, canonical) => Some(canonical),
+            // A file that cannot be read now differs from what the tab holds.
+            Opened::Failed(_) => return Ok(Written::Changed),
+        };
+        if on_disk.as_deref() != expected {
+            return Ok(Written::Changed);
+        }
+    }
+    reqlite_format::save(path, req).map_err(|e| chain(&e))?;
+    reqlite_format::to_string(req)
+        .map(Written::Saved)
+        .map_err(|e| e.to_string())
+}
+
+impl Doc {
+    /// After a change on disk: a tab with no unsaved changes shows the file
+    /// as it is now. A tab with changes keeps them; Save then finds the change.
+    /// Returns a notice when the file is gone or cannot be read.
+    pub fn reload(&mut self) -> Option<String> {
+        if self.dirty || self.open_error.is_some() {
+            return None;
+        }
+        let path = self.file.clone()?;
+        match open(&path) {
+            Opened::Loaded(req, canonical) => {
+                if self.saved.as_deref() != Some(canonical.as_str()) {
+                    self.load(&req, &canonical);
+                }
+                None
+            }
+            // Never saved yet, so nothing on disk to follow.
+            Opened::Missing if self.saved.is_none() => None,
+            Opened::Missing => Some(format!(
+                "{} was deleted on disk. Save writes it again.",
+                self.label
+            )),
+            Opened::Failed(e) => Some(format!("{e}. The tab keeps the last version it read.")),
+        }
+    }
+}

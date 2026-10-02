@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 iced = { version = "0.14.0", features = ["advanced", "tokio"] }
+notify = "8.2.0"
 reqlite-engine = { version = "0.0.1", path = "../engine" }
 reqlite-format = { version = "0.0.1", path = "../format" }
 reqlite-store = { version = "0.0.1", path = "../store" }

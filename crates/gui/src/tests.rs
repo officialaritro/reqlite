@@ -466,3 +466,74 @@ fn delete_asks_first_closes_the_tab_and_keeps_full_folders() {
     );
     assert!(a.notice.as_deref().unwrap().contains("not empty"));
 }
+
+const OTHER: &str = "version = 1\nname = \"t\"\nmethod = \"POST\"\nurl = \"http://elsewhere/\"\n";
+
+#[test]
+fn a_clean_tab_follows_its_file_on_disk() {
+    let (dir, mut a) = workspace();
+    let get = dir.path().join("get.toml");
+    side(&mut a, SideMsg::Open(get.clone()));
+    std::fs::write(&get, OTHER).unwrap();
+    drop(update(&mut a, Msg::FsChanged));
+    let d = a.doc().unwrap();
+    assert_eq!(
+        (d.method.as_str(), d.url.as_str()),
+        ("POST", "http://elsewhere/")
+    );
+    assert!(!d.unsaved());
+}
+
+#[test]
+fn a_tab_with_changes_keeps_them_and_save_stops_at_a_disk_change() {
+    let (dir, mut a) = workspace();
+    let get = dir.path().join("get.toml");
+    side(&mut a, SideMsg::Open(get.clone()));
+    drop(update(&mut a, Msg::Url("http://mine/".into())));
+    std::fs::write(&get, OTHER).unwrap();
+    drop(update(&mut a, Msg::FsChanged));
+    assert_eq!(a.doc().unwrap().url, "http://mine/", "typing is kept");
+
+    let doc = a.doc().unwrap();
+    let req = doc.draft().to_request().unwrap();
+    let first = doc::write(&get, &req, doc.saved.as_deref(), doc.conflict).unwrap();
+    assert_eq!(first, doc::Written::Changed);
+    assert_eq!(
+        std::fs::read_to_string(&get).unwrap(),
+        OTHER,
+        "nothing written"
+    );
+    let id = doc.id;
+    drop(update(&mut a, Msg::Saved(id, Ok(first))));
+    assert!(a.notice.as_deref().unwrap().contains("changed on disk"));
+
+    let doc = a.doc().unwrap();
+    let second = doc::write(&get, &req, doc.saved.as_deref(), doc.conflict).unwrap();
+    assert!(
+        matches!(second, doc::Written::Saved(_)),
+        "a second Save overwrites"
+    );
+    assert!(
+        std::fs::read_to_string(&get)
+            .unwrap()
+            .contains("http://mine/")
+    );
+}
+
+#[test]
+fn a_new_request_does_not_replace_a_file_made_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("new.toml");
+    let req = reqlite_format::parse(FILE).unwrap();
+    std::fs::write(&path, OTHER).unwrap();
+    assert_eq!(
+        doc::write(&path, &req, None, false).unwrap(),
+        doc::Written::Changed
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), OTHER);
+    std::fs::remove_file(&path).unwrap();
+    assert!(matches!(
+        doc::write(&path, &req, None, false).unwrap(),
+        doc::Written::Saved(_)
+    ));
+}
