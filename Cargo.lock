@@ -1015,6 +1015,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "reqlite-viewer"
+version = "0.0.1"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
