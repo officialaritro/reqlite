@@ -9,8 +9,8 @@ The app must open its default 1000x800 window. After 5 s of idle the script read
   drawables  dirty IOSurface memory, the window's frame buffers (`vmmap --summary`)
 
 Budgets:
-  footprint              under 60 MB, on a 2x display only (it scales with the display)
-  footprint - drawables  under 35 MB, on any display (memory Reqlite controls)
+  footprint              under 70 MB, on a 2x display only (it scales with the display)
+  footprint - drawables  under 45 MB, on any display (memory Reqlite controls)
   idle CPU               under 0.05 s of CPU time over the next 5 s, on a Mac with
                          a real GPU only. More means a redraw loop or an animation
                          that never stops.
@@ -161,12 +161,12 @@ def main() -> None:
             failures.append(name)
 
     if scale == 2:
-        check("idle footprint", footprint, 60 * MB)
+        check("idle footprint", footprint, 70 * MB)
     else:
         print(
             f"skip idle footprint: {footprint / MB:.1f} MB; its budget is defined on a 2x display only"
         )
-    check("idle footprint minus drawables", own, 35 * MB)
+    check("idle footprint minus drawables", own, 45 * MB)
 
     model = gpu()
     real_gpu = model != "none" and "paravirtual" not in model.lower()
