@@ -2,23 +2,25 @@
 //!
 //! ```text
 //!  title row (macOS)    file name, unsaved dot
+//!  sidebar | tab strip  the workspace tree beside one tab per open request
 //!  request bar          method · URL · Send · Save
-//!  split                request tabs | response      (stacked below SPLIT_WIDTH)
+//!  split                request sections | response   (stacked below SPLIT_WIDTH)
 //!  status bar           environment · notice · shortcuts
 //! ```
 
-use super::{App, LINE_HEIGHT, Msg, Send, Summary, Tab, URL, Viewer};
+use super::{App, Doc, LINE_HEIGHT, Msg, Section, Send, Summary, URL, Viewer};
 use crate::scrollbar::scrollbar;
 use crate::style;
 use iced::widget::{
-    Space, button, column, container, mouse_area, pick_list, responsive, rich_text, row, span,
-    text, text_editor, text_input,
+    Space, button, column, container, mouse_area, pick_list, responsive, rich_text, row,
+    scrollable, span, text, text_editor, text_input,
 };
 use iced::{Alignment, Color, Element, Length, Padding, mouse};
 use reqlite_gui::present::{Token, human_size, json_tokens};
 
-/// Below this width the response moves under the request.
-const SPLIT_WIDTH: f32 = 900.0;
+/// Below this width of the area right of the sidebar, the response moves under
+/// the request.
+const SPLIT_WIDTH: f32 = 680.0;
 /// macOS draws the traffic lights over the content, left of this inset.
 const TRAFFIC_LIGHTS: f32 = 78.0;
 /// The macOS title bar height, so the name lines up with the traffic lights.
@@ -30,48 +32,99 @@ const MOD: &str = "⌘";
 const MOD: &str = "Ctrl+";
 
 pub fn view(app: &App) -> Element<'_, Msg> {
-    let mut page = column![].spacing(10).padding(Padding {
+    let mut outer = column![].spacing(10).padding(Padding {
         top: if super::TITLE_ROW { 0.0 } else { 12.0 },
         ..Padding::new(12.0)
     });
     if super::TITLE_ROW {
-        page = page.push(title_row(app));
+        outer = outer.push(title_row(app.doc()));
     }
-    page = page.push(request_bar(app));
-    if let Some(e) = &app.open_error {
+    let main = column![main(app), status_bar(app)].spacing(10);
+    let left: Option<Element<'_, Msg>> = match (app.left_panel(), &app.workspace) {
+        (Some(super::Panel::Files), Some(w)) => Some(crate::sidebar::view(app, w)),
+        (Some(super::Panel::History), _) => Some(crate::history::view(app)),
+        _ => None,
+    };
+    match left {
+        Some(left) => {
+            let side = column![panel_switch(app), left].spacing(6);
+            outer.push(row![side, main].spacing(10)).into()
+        }
+        None => outer.push(main).into(),
+    }
+}
+
+/// Files and History, above the left panel.
+fn panel_switch(app: &App) -> Element<'_, Msg> {
+    let choice = |p: super::Panel, name: &'static str| {
+        let active = app.panel == p;
+        button(text(name).size(12))
+            .padding([3, 10])
+            .on_press(Msg::Panel(p))
+            .style(move |t, s| style::tab(t, s, active))
+    };
+    let mut r = row![].spacing(4);
+    if app.workspace.is_some() {
+        r = r.push(choice(super::Panel::Files, "Files"));
+    }
+    r.push(choice(super::Panel::History, "History"))
+        .push(Space::new().width(Length::Fill))
+        .width(crate::sidebar::WIDTH)
+        .into()
+}
+
+/// Everything right of the sidebar, above the status bar.
+fn main(app: &App) -> Element<'_, Msg> {
+    let mut page = column![].spacing(10);
+    if !app.docs.is_empty() {
+        page = page.push(tab_strip(app));
+    }
+    if let Some(name) = app
+        .closing
+        .and_then(|id| app.docs.iter().find(|d| d.id == id))
+        .map(|d| d.label.as_str())
+    {
+        page = page.push(discard_prompt(name));
+    }
+    let Some(doc) = app.doc() else {
+        return page
+            .push(container(empty(app.workspace.is_some())).height(Length::Fill))
+            .into();
+    };
+    page = page.push(request_bar(doc));
+    if let Some(e) = &doc.open_error {
         page = page.push(banner(e));
     }
     page.push(responsive(move |size| {
         if size.width >= SPLIT_WIDTH {
             row![
-                request_pane(app).width(Length::FillPortion(2)),
-                response_pane(app).width(Length::FillPortion(3)),
+                request_pane(doc).width(Length::FillPortion(2)),
+                response_pane(doc).width(Length::FillPortion(3)),
             ]
             .spacing(10)
             .into()
         } else {
-            column![request_pane(app).height(260), response_pane(app)]
+            column![request_pane(doc).height(260), response_pane(doc)]
                 .spacing(10)
                 .into()
         }
     }))
-    .push(status_bar(app))
     .into()
 }
 
-fn title_row(app: &App) -> Element<'_, Msg> {
+fn title_row(doc: Option<&Doc>) -> Element<'_, Msg> {
     let mut name = row![
-        text(&app.label)
+        text(doc.map_or("Reqlite", |d| d.label.as_str()))
             .size(13)
             .font(style::MEDIUM)
             .color(style::MUTED)
     ]
     .spacing(8)
     .align_y(Alignment::Center);
-    if app.dirty && app.file.is_some() {
+    if doc.is_some_and(Doc::unsaved) {
         name = name.push(text("●").size(9).color(style::ACCENT));
     }
-    if app.open_error.is_some() {
+    if doc.is_some_and(|d| d.open_error.is_some()) {
         name = name.push(text("cannot save").size(12).color(style::DANGER));
     }
     container(name)
@@ -81,38 +134,112 @@ fn title_row(app: &App) -> Element<'_, Msg> {
         .into()
 }
 
-fn request_bar(app: &App) -> Element<'_, Msg> {
-    let running = matches!(app.send, Send::Running(_));
-    let action = if running {
+/// One tab per open request. The shown one is raised. A dot marks unsaved
+/// changes, and × closes the tab.
+fn tab_strip(app: &App) -> Element<'_, Msg> {
+    let tabs = row(app.docs.iter().enumerate().map(|(i, d)| {
+        let active = i == app.active;
+        let mut caption = row![text(&d.label).size(12)]
+            .spacing(6)
+            .align_y(Alignment::Center);
+        if d.unsaved() {
+            caption = caption.push(text("●").size(8).color(style::ACCENT));
+        }
+        let close = button(text("×").size(13))
+            .padding([0, 4])
+            .on_press(Msg::Close(d.id))
+            .style(style::close);
+        button(row![caption, close].spacing(8).align_y(Alignment::Center))
+            .padding([4, 10])
+            .on_press(Msg::Select(i))
+            .style(move |theme, status| style::tab(theme, status, active))
+            .into()
+    }))
+    .spacing(4);
+    scrollable(tabs)
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new().width(0).scroller_width(0),
+        ))
+        .into()
+}
+
+fn discard_prompt(name: &str) -> Element<'_, Msg> {
+    container(
+        row![
+            text(format!("{name} has unsaved changes."))
+                .size(12)
+                .color(style::WARNING),
+            Space::new().width(Length::Fill),
+            button(text("Discard").size(12))
+                .padding([4, 10])
+                .on_press(Msg::Discard(true))
+                .style(style::stop),
+            button(text("Keep").size(12))
+                .padding([4, 10])
+                .on_press(Msg::Discard(false))
+                .style(style::neutral),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .padding([6, 12])
+    .width(Length::Fill)
+    .style(style::warning_banner)
+    .into()
+}
+
+/// No tab is open.
+fn empty(workspace: bool) -> Element<'static, Msg> {
+    let hint = if workspace {
+        format!("Choose a request in the sidebar, or press {MOD}N for a new one.")
+    } else {
+        format!("Press {MOD}N for a new request.")
+    };
+    container(
+        column![
+            text("No request is open.").size(13).color(style::MUTED),
+            text(hint).size(12).color(style::FAINT),
+        ]
+        .spacing(6)
+        .align_x(Alignment::Center),
+    )
+    .center(Length::Fill)
+    .into()
+}
+
+fn request_bar(doc: &Doc) -> Element<'_, Msg> {
+    let action = if doc.running() {
         button(label("Cancel", "Esc")).on_press(Msg::Cancel)
     } else {
         button(label("Send", &format!("{MOD}↵"))).on_press(Msg::Send)
     };
-    let action = action.style(style::action(app.motion.running.interpolate(
+    let action = action.style(style::action(doc.motion.running.interpolate(
         0.0,
         1.0,
-        app.motion.now,
+        doc.motion.now,
     )));
     let save = button(text("Save").size(13))
         .padding([8, 14])
-        .on_press_maybe((app.dirty && app.file.is_some()).then_some(Msg::Save))
+        .on_press_maybe(doc.unsaved().then_some(Msg::Save))
         .style(style::neutral);
     row![
-        pick_list(&app.methods[..], Some(&app.method), Msg::Method)
+        pick_list(&doc.methods[..], Some(&doc.method), Msg::Method)
             .font(style::MONO)
             .text_size(13)
             .padding([8, 12])
             .width(110)
-            .style(style::method_picker(style::method_color(&app.method)))
+            .style(style::method_picker(style::method_color(&doc.method)))
             .menu_style(style::method_menu),
-        text_input("https://", &app.url)
-            .id(URL)
-            .on_input(Msg::Url)
-            .on_submit(Msg::Send)
-            .font(style::MONO)
-            .size(13)
-            .padding([8, 12])
-            .style(style::input),
+        crate::guard::guard(
+            text_input("https://", &doc.url)
+                .id(URL)
+                .on_input(Msg::Url)
+                .on_submit(Msg::Send)
+                .font(style::MONO)
+                .size(13)
+                .padding([8, 12])
+                .style(style::input),
+        ),
         action.padding([8, 14]),
         save,
     ]
@@ -145,9 +272,9 @@ fn banner(message: &str) -> Element<'_, Msg> {
     .into()
 }
 
-fn request_pane(app: &App) -> container::Container<'_, Msg> {
-    let tab = |t: Tab, name: &'static str, badge: String| {
-        let active = app.tab == t;
+fn request_pane(doc: &Doc) -> container::Container<'_, Msg> {
+    let tab = |s: Section, name: &'static str, badge: String| {
+        let active = doc.section == s;
         let mut caption = row![text(name).size(13)]
             .spacing(6)
             .align_y(Alignment::Center);
@@ -160,17 +287,17 @@ fn request_pane(app: &App) -> container::Container<'_, Msg> {
         }
         button(caption)
             .padding([5, 10])
-            .on_press(Msg::Tab(t))
+            .on_press(Msg::Section(s))
             .style(move |theme, status| style::tab(theme, status, active))
     };
     let count = |n: usize| if n == 0 { String::new() } else { n.to_string() };
-    let tabs = row![
-        tab(Tab::Query, "Query", count(app.counts.query)),
-        tab(Tab::Headers, "Headers", count(app.counts.headers)),
+    let sections = row![
+        tab(Section::Query, "Query", count(doc.counts.query)),
+        tab(Section::Headers, "Headers", count(doc.counts.headers)),
         tab(
-            Tab::Body,
+            Section::Body,
             "Body",
-            if app.counts.body {
+            if doc.counts.body {
                 "●".into()
             } else {
                 String::new()
@@ -178,10 +305,10 @@ fn request_pane(app: &App) -> container::Container<'_, Msg> {
         ),
     ]
     .spacing(4);
-    let (content, placeholder, on): (_, _, fn(_) -> Msg) = match app.tab {
-        Tab::Query => (&app.query, "name: value, one per line", Msg::Query),
-        Tab::Headers => (&app.headers, "Name: value, one per line", Msg::Headers),
-        Tab::Body => (&app.body, "Request body", Msg::Body),
+    let (content, placeholder, on): (_, _, fn(_) -> Msg) = match doc.section {
+        Section::Query => (&doc.query, "name: value, one per line", Msg::Query),
+        Section::Headers => (&doc.headers, "Name: value, one per line", Msg::Headers),
+        Section::Body => (&doc.body, "Request body", Msg::Body),
     };
     let editor = text_editor(content)
         .placeholder(placeholder)
@@ -192,15 +319,15 @@ fn request_pane(app: &App) -> container::Container<'_, Msg> {
         .padding(10)
         .height(Length::Fill)
         .style(style::editor);
-    panel(column![tabs, editor].spacing(8))
+    panel(column![sections, editor].spacing(8))
 }
 
-fn response_pane(app: &App) -> container::Container<'_, Msg> {
-    let mut header = row![status(app), Space::new().width(Length::Fill)]
+fn response_pane(doc: &Doc) -> container::Container<'_, Msg> {
+    let mut header = row![status(doc), Space::new().width(Length::Fill)]
         .spacing(10)
         .align_y(Alignment::Center)
         .height(28);
-    if let Some(v) = app.shown() {
+    if let Some(v) = doc.shown() {
         header = header.push(
             text(format!(
                 "line {} of {}",
@@ -211,10 +338,10 @@ fn response_pane(app: &App) -> container::Container<'_, Msg> {
             .color(style::FAINT),
         );
     }
-    let body: Element<'_, Msg> = match (&app.send, app.shown()) {
+    let body: Element<'_, Msg> = match (&doc.send, doc.shown()) {
         (Send::Finished(Err(e)), _) => message(e, style::DANGER),
-        (_, Some(v)) => viewer(v, app.motion.reveal.interpolate(0.0, 1.0, app.motion.now)),
-        (Send::Running(_), None) => message("Sending…", pulse(app)),
+        (_, Some(v)) => viewer(v, doc.motion.reveal.interpolate(0.0, 1.0, doc.motion.now)),
+        (Send::Running(_), None) => message("Sending…", pulse(doc)),
         (Send::Cancelled, None) => message("Cancelled.", style::MUTED),
         _ => hint(),
     };
@@ -222,24 +349,24 @@ fn response_pane(app: &App) -> container::Container<'_, Msg> {
 }
 
 /// "Sending…" breathes once every 1.2 s, unless motion is reduced.
-fn pulse(app: &App) -> Color {
-    if app.motion.reduced {
+fn pulse(doc: &Doc) -> Color {
+    if doc.motion.reduced {
         return style::MUTED;
     }
-    let t = app
+    let t = doc
         .motion
         .now
-        .saturating_duration_since(app.motion.since)
+        .saturating_duration_since(doc.motion.since)
         .as_secs_f32();
     let wave = 0.5 + 0.5 * (t * std::f32::consts::TAU / 1.2).cos();
     style::MUTED.scale_alpha(0.45 + 0.55 * wave)
 }
 
 /// The status pill and timing for the latest send.
-fn status(app: &App) -> Element<'_, Msg> {
-    match &app.send {
+fn status(doc: &Doc) -> Element<'_, Msg> {
+    match &doc.send {
         Send::Idle => text("Response").size(13).color(style::MUTED).into(),
-        Send::Running(_) => text("Sending…").size(13).color(pulse(app)).into(),
+        Send::Running(_) => text("Sending…").size(13).color(pulse(doc)).into(),
         Send::Cancelled => text("Cancelled").size(13).color(style::MUTED).into(),
         Send::Finished(Err(_)) => pill("Error", style::DANGER),
         Send::Finished(Ok(s)) => row![
@@ -381,28 +508,30 @@ fn digits(n: usize) -> usize {
 }
 
 fn status_bar(app: &App) -> Element<'_, Msg> {
-    let env = match &app.env {
-        Some(path) => format!(
-            "env {}",
-            path.file_name().map_or_else(
-                || path.display().to_string(),
-                |f| f.to_string_lossy().into()
-            )
-        ),
-        None => "no environment".into(),
+    let env = pick_list(
+        app.env_choices(),
+        Some(super::Env(app.env.clone())),
+        Msg::PickEnv,
+    )
+    .font(style::MONO)
+    .text_size(12)
+    .padding([3, 8])
+    .style(style::method_picker(if app.env.is_some() {
+        style::TEXT
+    } else {
+        style::FAINT
+    }))
+    .menu_style(style::method_menu);
+    // A notice takes the place of the shortcut hints, so the bar stays one line.
+    let right = match &app.notice {
+        Some(n) => text(n).size(12).color(style::WARNING),
+        None => text(format!(
+            "{MOD}↵ send · {MOD}S save · {MOD}L URL · {MOD}1–3 sections · {MOD}N new · {MOD}Y history · Ctrl+Tab next tab · Esc cancel"
+        ))
+        .size(12)
+        .color(style::FAINT),
     };
-    let mut bar = row![text(env).size(12).font(style::MONO).color(style::FAINT)];
-    if let Some(n) = &app.notice {
-        bar = bar.push(text(n).size(12).color(style::WARNING));
-    }
-    bar.push(Space::new().width(Length::Fill))
-        .push(
-            text(format!(
-                "{MOD}↵ send · {MOD}S save · {MOD}L URL · {MOD}1–3 tabs · Esc cancel"
-            ))
-            .size(12)
-            .color(style::FAINT),
-        )
+    row![env, Space::new().width(Length::Fill), right]
         .spacing(16)
         .align_y(Alignment::Center)
         .into()

@@ -2,26 +2,36 @@
 
 A lean, local-first API client written in Rust. No account, no cloud, no telemetry.
 
-**Status:** early alpha. The CLI works. The desktop app opens, edits, saves and sends one request file.
+**Status:** early alpha. The CLI works. The desktop app opens a folder of request files, edits, saves and sends them in tabs, and reopens past sends from history.
 
 ## Try it
 
 ```sh
 cargo run -p reqlite -- send examples/hello.toml        # the CLI
-cargo run --release -p reqlite-gui -- examples/hello.toml   # the desktop app
+cargo run --release -p reqlite-gui -- examples            # the desktop app on a folder
 ```
 
 ### The desktop app
 
 ```sh
-reqlite-gui users.toml --env envs/dev.toml
+reqlite-gui api/                      # a folder of request files: the workspace
+reqlite-gui api/users.toml            # one file; its folder is the workspace
+reqlite-gui api/ --env api/envs/dev.toml
 ```
 
 ![reqlite-gui showing a 50 MB JSON response, 5,467,582 lines](docs/images/reqlite-gui.png)
 
-`reqlite-gui` opens one request file per window. If the file does not exist yet, the first save creates it.
+`reqlite-gui` opens a folder as a workspace. The sidebar shows its request files (`*.toml`) as a tree. `envs/` and `*.local.toml` secret files are not shown. Each request you open gets a tab. Started with no path, the app opens one untitled tab and no sidebar.
 
-The request is on the left and the response is on the right. Below 900 px of width, the response moves under the request. The request has three tabs, Query, Headers and Body, and each tab shows how many entries it holds. The response shows the status, the time, the size and the body with line numbers. JSON bodies are coloured.
+The sidebar can make a new request or folder, and rename or delete an entry: right-click it for its actions. A new request is written to disk by its first Save, once it has a URL. Delete asks first, and a folder is deleted only when it is empty.
+
+The app watches the workspace. When a file changes on disk, the tree updates, and a tab with no unsaved changes shows the new version. A tab with unsaved changes keeps them. If you then save, the app tells you the file changed and writes only after a second Save.
+
+The status bar picks the environment: "No environment", or any `envs/*.toml` in the workspace. The choice applies to the next send. `--env` sets the first choice.
+
+The History panel lists recent sends, newest first, from every request or only the open one. Choosing an entry opens it in a new tab with what was sent and the stored response. That tab has no file, so a Save never writes the values that were resolved for the send over a request file. Secrets stay as `{{name}}`, as stored. History keeps the first 256 KB of each response.
+
+In each tab, the request is on the left and the response is on the right. When the area right of the sidebar is narrower than 680 px, the response moves under the request. The request has three sections, Query, Headers and Body, and each shows how many entries it holds. The response shows the status, the time, the size and the body with line numbers. JSON bodies are coloured.
 
 | Action | How |
 |---|---|
@@ -29,10 +39,15 @@ The request is on the left and the response is on the right. Below 900 px of wid
 | Cancel a send | Escape, or the Cancel button |
 | Save | Cmd+S or Ctrl+S, or the Save button. Enabled only when the form differs from the file. |
 | Go to the URL | Cmd+L or Ctrl+L |
-| Switch tabs | Cmd+1, 2, 3 or Ctrl+1, 2, 3 for Query, Headers, Body |
+| Switch sections | Cmd+1, 2, 3 or Ctrl+1, 2, 3 for Query, Headers, Body |
+| New request | Cmd+N or Ctrl+N, or + Request in the sidebar |
+| Next tab | Ctrl+Tab |
+| Close a tab | Cmd+W or Ctrl+W, or × on the tab. A tab with unsaved changes asks first. |
+| Show or hide the left panel | Cmd+B or Ctrl+B |
+| History | Cmd+Y or Ctrl+Y, or History above the sidebar |
 | Scroll the response | Mouse wheel, the scrollbar, Page Up, Page Down, Home, End |
 
-Headers and query parameters are written one per line as `name: value`, and a name may repeat. The title shows `*` while there are unsaved changes; on macOS, a dot next to the file name shows it too. If a file cannot be read, the window shows the error and never saves over that file. Each send is saved to history, the same way as `reqlite send`.
+Headers and query parameters are written one per line as `name: value`, and a name may repeat. The title shows `*` while there are unsaved changes, and a dot on the tab shows it too. If a file cannot be read, its tab shows the error and never saves over that file. Each send is saved to history, the same way as `reqlite send`.
 
 The window is see-through over a blurred desktop where the OS can blur it: on macOS, and on KDE under Wayland. Elsewhere it is opaque. Two environment variables change the look:
 
@@ -157,14 +172,14 @@ Design rules:
 
 | Metric | Budget | Now (macOS, M4) | Checked in CI |
 |---|---|---|---|
-| GUI idle footprint, 1000×800 window on a 2× display | under 60 MB | 58 MB | locally (`scripts/gui_idle.py`); CI runners have no 2× display |
-| GUI idle footprint minus window frame buffers, any display | under 35 MB | 33 MB | yes, macOS |
+| GUI idle footprint, 1000×800 window on a 2× display | under 70 MB | 58 MB | locally (`scripts/gui_idle.py`); CI runners have no 2× display |
+| GUI idle footprint minus window frame buffers, any display | under 45 MB | 33 MB | yes, macOS |
 | GUI idle CPU, over 5 s | under 0.05 s | 0.00 s | locally; CI prints it, because CI runners have no real GPU |
 | Binary | under 25 MB | CLI 3.7 MB, GUI 8.2 MB | yes |
 | Cold start | under 300 ms | CLI 3 ms, GUI first frame 97 ms | CLI yes; GUI locally, because CI runners have no real GPU |
 | Peak RAM while opening a 50 MB JSON response | under 50 MB | viewer 1.8 to 2.5 MB, CLI send 9.3 MB | yes |
 
-The GUI rows use the physical footprint, which Activity Monitor shows as "Memory". The window's frame buffers grow with the window size and the display scale, so the first GUI row fixes both. The second row counts only the memory Reqlite controls. See [issue #1](https://github.com/officialaritro/reqlite/issues/1) for the measurements behind these numbers. `scripts/gui_idle.py target/release/reqlite-gui` checks both, plus idle CPU and the GUI cold start, on macOS. CI runs it on macOS. CI runners are virtual machines with a 1× display and no real GPU, so there it checks only the memory Reqlite controls and prints the other two numbers.
+The GUI rows use the physical footprint, which Activity Monitor shows as "Memory". The window's frame buffers grow with the window size and the display scale, so the first GUI row fixes both. The second row counts only the memory Reqlite controls. See [issue #1](https://github.com/officialaritro/reqlite/issues/1) for the measurements behind these numbers. The budgets were 60 MB and 35 MB until Phase A ([#11](https://github.com/officialaritro/reqlite/issues/11)): an empty iced window already uses 55 MB, which left about 5 MB for every v1 feature. `scripts/gui_idle.py target/release/reqlite-gui` checks both, plus idle CPU and the GUI cold start, on macOS. CI runs it on macOS. CI runners are virtual machines with a 1× display and no real GPU, so there it checks only the memory Reqlite controls and prints the other two numbers.
 
 `scripts/budgets.py` runs the other checks on Linux and macOS in CI and fails the build on a miss. It also checks that each crate depends only on the crates below it. To run it yourself:
 

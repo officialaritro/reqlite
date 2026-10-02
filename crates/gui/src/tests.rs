@@ -1,9 +1,11 @@
-//! Behaviour the window must keep: shortcuts, Save, Send and Cancel.
+//! Behaviour the window must keep: shortcuts, Save, Send, Cancel and tabs.
 
 use super::*;
+use crate::motion::Motion;
 use iced::keyboard::key::{Code, Physical};
 use iced::mouse;
 use iced_test::simulator;
+use std::time::Duration;
 
 fn ch(c: &str) -> Key {
     Key::Character(c.into())
@@ -35,11 +37,15 @@ fn app(text: Option<&str>) -> App {
         std::fs::write(&file, text).unwrap();
     }
     let args = Args {
-        file: Some(file),
+        path: Some(file),
         env: None,
     };
-    let opened = open(args.file.as_deref());
-    boot(&args, &opened, Instant::now()).0
+    boot(&args, &start(args.path.as_deref()), Instant::now()).0
+}
+
+/// The shown tab.
+fn active(a: &mut App) -> &mut Doc {
+    a.doc_mut().unwrap()
 }
 
 const FILE: &str = "version = 1\nname = \"t\"\nmethod = \"GET\"\nurl = \"http://h/\"\n";
@@ -49,13 +55,16 @@ fn cmd_shortcuts_pick_their_action_and_plain_keys_do_nothing() {
     let cmd = Modifiers::COMMAND;
     assert!(matches!(
         shortcut(&ch("1"), cmd),
-        Some(Msg::Tab(Tab::Query))
+        Some(Msg::Section(Section::Query))
     ));
     assert!(matches!(
         shortcut(&ch("2"), cmd),
-        Some(Msg::Tab(Tab::Headers))
+        Some(Msg::Section(Section::Headers))
     ));
-    assert!(matches!(shortcut(&ch("3"), cmd), Some(Msg::Tab(Tab::Body))));
+    assert!(matches!(
+        shortcut(&ch("3"), cmd),
+        Some(Msg::Section(Section::Body))
+    ));
     assert!(matches!(shortcut(&ch("l"), cmd), Some(Msg::FocusUrl)));
     assert!(matches!(shortcut(&ch("s"), cmd), Some(Msg::Save)));
     assert!(matches!(
@@ -100,7 +109,7 @@ fn send_turns_into_cancel_while_a_send_runs() {
     assert!(matches!(ui.into_messages().next(), Some(Msg::Send)));
 
     let (_task, handle) = Task::<Msg>::none().abortable();
-    a.send = Send::Running(handle);
+    active(&mut a).send = Send::Running(handle);
     let mut ui = simulator(view::view(&a));
     assert!(ui.find("Send").is_err());
     ui.click("Cancel").unwrap();
@@ -110,7 +119,7 @@ fn send_turns_into_cancel_while_a_send_runs() {
 #[test]
 fn a_file_that_cannot_be_read_shows_why_and_never_saves() {
     let mut a = app(Some("version = 1\nnot toml at all"));
-    assert!(a.file.is_none());
+    assert!(active(&mut a).file.is_none());
     drop(update(&mut a, Msg::Url("http://other/".into())));
     assert!(title(&a).contains("(cannot save)"), "{}", title(&a));
     let mut ui = simulator(view::view(&a));
@@ -120,16 +129,20 @@ fn a_file_that_cannot_be_read_shows_why_and_never_saves() {
 
 #[test]
 fn tabs_show_how_many_entries_they_hold() {
-    let a = app(Some(
+    let mut a = app(Some(
         "version = 1\nname = \"t\"\nmethod = \"POST\"\nurl = \"http://h/\"\nbody = \"{}\"\n\n[headers]\nA = \"1\"\nB = [\"2\", \"3\"]\n",
     ));
-    assert_eq!(a.tab, Tab::Headers, "opens on the first tab with content");
+    assert_eq!(
+        active(&mut a).section,
+        Section::Headers,
+        "opens on the first section with content"
+    );
     let mut ui = simulator(view::view(&a));
     assert!(ui.find("3").is_ok(), "three header entries");
     ui.click("Body").unwrap();
     assert!(matches!(
         ui.into_messages().next(),
-        Some(Msg::Tab(Tab::Body))
+        Some(Msg::Section(Section::Body))
     ));
 }
 
@@ -138,16 +151,18 @@ fn scrolled(top: usize) -> (App, f32) {
     let mut a = app(Some(FILE));
     let body = "line\n".repeat(1000);
     let doc = Document::build(body.as_bytes()).unwrap();
-    a.viewer = Some(Viewer {
+    active(&mut a).viewer = Some(Viewer {
         doc: Arc::new(doc),
         top,
     });
-    a.send = Send::Finished(Ok(Summary {
+    active(&mut a).send = Send::Finished(Ok(Summary {
         status: 200,
         elapsed: Duration::ZERO,
         bytes: 5000,
     }));
-    // Window edge, page padding 12, panel padding 10, half the 12 px bar.
+    // The side-by-side layout, without the sidebar: the scrollbar sits at the
+    // window edge, past page padding 12, panel padding 10 and half the 12 px bar.
+    a.sidebar.hidden = true;
     (a, 1024.0 - 12.0 - 10.0 - 6.0)
 }
 
@@ -218,4 +233,515 @@ fn reduced_motion_shows_every_change_at_once() {
     m.running.go_mut(true, t0);
     assert!(!m.animating(t0));
     assert_eq!(m.reveal.interpolate(0.0, 1.0, t0), 1.0);
+}
+
+/// A second tab for `text`, opened next to the first. It becomes the shown tab.
+fn add_tab(a: &mut App, text: &str) -> DocId {
+    let file = std::env::temp_dir().join(format!(
+        "reqlite-gui-test-{}/tab-{}.toml",
+        std::process::id(),
+        a.next_id
+    ));
+    std::fs::write(&file, text).unwrap();
+    let opened = doc::open(&file);
+    let id = a.open_tab(Some(file), &opened);
+    drop(update(a, Msg::Select(0)));
+    id
+}
+
+#[test]
+fn each_tab_keeps_its_own_form() {
+    let mut a = app(Some(FILE));
+    add_tab(&mut a, &FILE.replace("http://h/", "http://two/"));
+    drop(update(&mut a, Msg::Url("http://edited/".into())));
+    drop(update(&mut a, Msg::Select(1)));
+    assert_eq!(active(&mut a).url, "http://two/");
+    drop(update(&mut a, Msg::NextTab));
+    assert_eq!(active(&mut a).url, "http://edited/");
+    assert!(active(&mut a).unsaved());
+}
+
+#[test]
+fn a_result_goes_to_the_tab_that_sent_it() {
+    let mut a = app(Some(FILE));
+    let first = a.docs[0].id;
+    add_tab(&mut a, FILE);
+    drop(update(&mut a, Msg::Select(1)));
+    let done = Finished {
+        result: Err("connection refused".into()),
+        opened: None,
+        warning: None,
+    };
+    drop(update(&mut a, Msg::Sent(first, Box::new(done))));
+    assert!(matches!(a.docs[0].send, Send::Finished(Err(_))));
+    assert!(matches!(a.docs[1].send, Send::Idle));
+}
+
+#[test]
+fn closing_a_tab_with_unsaved_changes_asks_first() {
+    let mut a = app(Some(FILE));
+    let id = a.docs[0].id;
+    let clean = add_tab(&mut a, FILE);
+    drop(update(&mut a, Msg::Url("http://edited/".into())));
+
+    drop(update(&mut a, Msg::Close(id)));
+    assert_eq!(a.docs.len(), 2, "the first close only asks");
+    let mut ui = simulator(view::view(&a));
+    ui.click("Keep").unwrap();
+    assert!(matches!(
+        ui.into_messages().next(),
+        Some(Msg::Discard(false))
+    ));
+    drop(update(&mut a, Msg::Discard(false)));
+    assert_eq!(a.docs.len(), 2);
+
+    drop(update(&mut a, Msg::Close(id)));
+    drop(update(&mut a, Msg::Discard(true)));
+    assert_eq!(a.docs.len(), 1);
+    assert_eq!(a.docs[0].id, clean);
+
+    drop(update(&mut a, Msg::Close(clean)));
+    assert!(a.docs.is_empty(), "a clean tab closes at once");
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("No request is open.").is_ok());
+}
+
+/// A window on a workspace folder holding `get.toml` and `users/list.toml`.
+fn workspace() -> (tempfile::TempDir, App) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("users")).unwrap();
+    std::fs::write(dir.path().join("get.toml"), FILE).unwrap();
+    std::fs::write(dir.path().join("users/list.toml"), FILE).unwrap();
+    let args = Args {
+        path: Some(dir.path().to_path_buf()),
+        env: None,
+    };
+    let a = boot(&args, &start(args.path.as_deref()), Instant::now()).0;
+    (dir, a)
+}
+
+fn side(a: &mut App, m: SideMsg) {
+    drop(update(a, Msg::Side(m)));
+}
+
+fn name(a: &mut App, action: sidebar::Action, text: &str) {
+    side(a, SideMsg::Start(action));
+    side(a, SideMsg::Text(text.into()));
+    side(a, SideMsg::Commit);
+}
+
+#[test]
+fn a_folder_opens_as_a_workspace_with_no_tab() {
+    let (_dir, mut a) = workspace();
+    assert!(a.docs.is_empty());
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("get").is_ok());
+    assert!(ui.find("users").is_ok());
+    ui.click("list").unwrap();
+    let opened: Vec<_> = ui.into_messages().collect();
+    for m in opened {
+        drop(update(&mut a, m));
+    }
+    assert_eq!(a.docs.len(), 1);
+    assert!(
+        a.docs[0]
+            .file
+            .as_ref()
+            .unwrap()
+            .ends_with("users/list.toml")
+    );
+}
+
+#[test]
+fn opening_a_file_twice_shows_its_tab_again() {
+    let (dir, mut a) = workspace();
+    let get = dir.path().join("get.toml");
+    side(&mut a, SideMsg::Open(get.clone()));
+    side(&mut a, SideMsg::Open(dir.path().join("users/list.toml")));
+    side(&mut a, SideMsg::Open(get));
+    assert_eq!(a.docs.len(), 2);
+    assert_eq!(a.active, 0);
+}
+
+#[test]
+fn a_new_request_is_written_by_its_first_save() {
+    let (dir, mut a) = workspace();
+    let root = dir.path().to_path_buf();
+    name(
+        &mut a,
+        sidebar::Action::NewRequest { dir: root.clone() },
+        "Get user",
+    );
+    let path = root.join("Get user.toml");
+    assert!(!path.exists(), "nothing is written before Save");
+    assert_eq!(a.doc().unwrap().file.as_deref(), Some(path.as_path()));
+    assert!(a.doc().unwrap().unsaved());
+
+    name(&mut a, sidebar::Action::NewRequest { dir: root }, "get");
+    assert!(
+        a.sidebar
+            .edit
+            .as_ref()
+            .unwrap()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("already exists")
+    );
+}
+
+#[test]
+fn a_new_folder_shows_in_the_tree() {
+    let (dir, mut a) = workspace();
+    name(
+        &mut a,
+        sidebar::Action::NewFolder {
+            dir: dir.path().join("users"),
+        },
+        "admin",
+    );
+    assert!(dir.path().join("users/admin").is_dir());
+    assert!(a.sidebar.edit.is_none());
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("admin").is_ok());
+}
+
+#[test]
+fn a_bad_name_is_refused_and_nothing_changes() {
+    let (dir, mut a) = workspace();
+    name(
+        &mut a,
+        sidebar::Action::NewFolder {
+            dir: dir.path().into(),
+        },
+        "../out",
+    );
+    assert!(a.sidebar.edit.as_ref().unwrap().error.is_some());
+    assert!(!dir.path().parent().unwrap().join("out").exists());
+}
+
+#[test]
+fn renaming_moves_the_file_and_its_open_tab_follows() {
+    let (dir, mut a) = workspace();
+    let users = dir.path().join("users");
+    side(&mut a, SideMsg::Open(users.join("list.toml")));
+    name(
+        &mut a,
+        sidebar::Action::Rename {
+            path: users.clone(),
+        },
+        "people",
+    );
+    let moved = dir.path().join("people/list.toml");
+    assert!(moved.is_file() && !users.exists());
+    assert_eq!(a.docs[0].file.as_deref(), Some(moved.as_path()));
+
+    name(&mut a, sidebar::Action::Rename { path: moved }, "all");
+    let renamed = dir.path().join("people/all.toml");
+    assert!(renamed.is_file());
+    assert_eq!(a.docs[0].file.as_deref(), Some(renamed.as_path()));
+    assert_eq!(a.docs[0].label, "all.toml");
+}
+
+#[test]
+fn delete_asks_first_closes_the_tab_and_keeps_full_folders() {
+    let (dir, mut a) = workspace();
+    let get = dir.path().join("get.toml");
+    side(&mut a, SideMsg::Open(get.clone()));
+    side(&mut a, SideMsg::Delete(get.clone()));
+    side(&mut a, SideMsg::ConfirmDelete(false));
+    assert!(get.exists(), "Keep keeps the file");
+
+    side(&mut a, SideMsg::Delete(get.clone()));
+    side(&mut a, SideMsg::ConfirmDelete(true));
+    assert!(!get.exists());
+    assert!(a.docs.is_empty(), "its tab closes");
+
+    let users = dir.path().join("users");
+    side(&mut a, SideMsg::Delete(users.clone()));
+    side(&mut a, SideMsg::ConfirmDelete(true));
+    assert!(
+        users.join("list.toml").exists(),
+        "a folder with requests stays"
+    );
+    assert!(a.notice.as_deref().unwrap().contains("not empty"));
+}
+
+const OTHER: &str = "version = 1\nname = \"t\"\nmethod = \"POST\"\nurl = \"http://elsewhere/\"\n";
+
+#[test]
+fn a_clean_tab_follows_its_file_on_disk() {
+    let (dir, mut a) = workspace();
+    let get = dir.path().join("get.toml");
+    side(&mut a, SideMsg::Open(get.clone()));
+    std::fs::write(&get, OTHER).unwrap();
+    drop(update(&mut a, Msg::FsChanged));
+    let d = a.doc().unwrap();
+    assert_eq!(
+        (d.method.as_str(), d.url.as_str()),
+        ("POST", "http://elsewhere/")
+    );
+    assert!(!d.unsaved());
+}
+
+#[test]
+fn a_tab_with_changes_keeps_them_and_save_stops_at_a_disk_change() {
+    let (dir, mut a) = workspace();
+    let get = dir.path().join("get.toml");
+    side(&mut a, SideMsg::Open(get.clone()));
+    drop(update(&mut a, Msg::Url("http://mine/".into())));
+    std::fs::write(&get, OTHER).unwrap();
+    drop(update(&mut a, Msg::FsChanged));
+    assert_eq!(a.doc().unwrap().url, "http://mine/", "typing is kept");
+
+    let doc = a.doc().unwrap();
+    let req = doc.draft().to_request().unwrap();
+    let first = doc::write(&get, &req, doc.saved.as_deref(), doc.conflict).unwrap();
+    assert_eq!(first, doc::Written::Changed);
+    assert_eq!(
+        std::fs::read_to_string(&get).unwrap(),
+        OTHER,
+        "nothing written"
+    );
+    let id = doc.id;
+    drop(update(&mut a, Msg::Saved(id, Ok(first))));
+    assert!(a.notice.as_deref().unwrap().contains("changed on disk"));
+
+    let doc = a.doc().unwrap();
+    let second = doc::write(&get, &req, doc.saved.as_deref(), doc.conflict).unwrap();
+    assert!(
+        matches!(second, doc::Written::Saved(_)),
+        "a second Save overwrites"
+    );
+    assert!(
+        std::fs::read_to_string(&get)
+            .unwrap()
+            .contains("http://mine/")
+    );
+}
+
+#[test]
+fn a_new_request_does_not_replace_a_file_made_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("new.toml");
+    let req = reqlite_format::parse(FILE).unwrap();
+    std::fs::write(&path, OTHER).unwrap();
+    assert_eq!(
+        doc::write(&path, &req, None, false).unwrap(),
+        doc::Written::Changed
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), OTHER);
+    std::fs::remove_file(&path).unwrap();
+    assert!(matches!(
+        doc::write(&path, &req, None, false).unwrap(),
+        doc::Written::Saved(_)
+    ));
+}
+
+#[test]
+fn the_environment_picker_lists_the_workspace_envs_and_switches_without_restart() {
+    let (dir, mut a) = workspace();
+    std::fs::create_dir(dir.path().join("envs")).unwrap();
+    for f in ["dev.toml", "dev.local.toml", "prod.toml"] {
+        std::fs::write(dir.path().join("envs").join(f), "version = 1\n").unwrap();
+    }
+    drop(update(&mut a, Msg::FsChanged));
+    let envs = dir.path().join("envs");
+    assert_eq!(
+        a.env_choices(),
+        [
+            Env(None),
+            Env(Some(envs.join("dev.toml"))),
+            Env(Some(envs.join("prod.toml")))
+        ]
+    );
+    assert_eq!(Env(Some(envs.join("prod.toml"))).to_string(), "env prod");
+
+    drop(update(
+        &mut a,
+        Msg::PickEnv(Env(Some(envs.join("prod.toml")))),
+    ));
+    assert_eq!(a.env.as_deref(), Some(envs.join("prod.toml").as_path()));
+    drop(update(&mut a, Msg::PickEnv(Env(None))));
+    assert!(a.env.is_none());
+}
+
+#[test]
+fn an_env_from_outside_the_workspace_stays_a_choice() {
+    let (_dir, mut a) = workspace();
+    let outside = PathBuf::from("/elsewhere/staging.toml");
+    a.env = Some(outside.clone());
+    assert_eq!(a.env_choices(), [Env(None), Env(Some(outside))]);
+}
+
+fn sent(url: &str, outcome: reqlite_store::Outcome) -> reqlite_store::Entry {
+    reqlite_store::Entry {
+        file: Some("users/list.toml".into()),
+        env: None,
+        request: reqlite_store::SentRequest {
+            method: "POST".into(),
+            url: url.into(),
+            headers: vec![("Authorization".into(), "Bearer {{token}}".into())],
+            query: vec![("tag".into(), "a".into()), ("tag".into(), "b".into())],
+            body: Some("{\"name\": \"ada\"}".into()),
+        },
+        outcome,
+    }
+}
+
+fn hist(a: &mut App, m: history::HistMsg) {
+    drop(update(a, Msg::History(m)));
+}
+
+#[test]
+fn a_history_entry_opens_in_a_new_tab_that_cannot_overwrite_a_file() {
+    let (_dir, mut a) = workspace();
+    let entry = sent(
+        "http://api/users?x=1",
+        reqlite_store::Outcome::Response {
+            status: 201,
+            headers: vec![],
+            body: b"{\"id\": 7}".to_vec(),
+            body_len: 9,
+            elapsed_ms: 40,
+        },
+    );
+    hist(&mut a, history::HistMsg::Fetched(Ok(Some(entry))));
+    assert_eq!(a.docs.len(), 1);
+    let d = active(&mut a);
+    assert_eq!(d.label, "POST /users");
+    assert_eq!(
+        (d.method.as_str(), d.url.as_str()),
+        ("POST", "http://api/users?x=1")
+    );
+    assert_eq!(d.headers.text(), "Authorization: Bearer {{token}}\n");
+    assert_eq!(d.query.text(), "tag: a\ntag: b\n");
+    assert_eq!(d.body.text(), "{\"name\": \"ada\"}");
+    assert!(d.file.is_none(), "no file, so Save cannot write over one");
+    assert!(matches!(
+        d.send,
+        Send::Finished(Ok(Summary { status: 201, .. }))
+    ));
+    assert_eq!(
+        d.viewer.as_ref().unwrap().doc.lines(0, 5).unwrap(),
+        ["{", "  \"id\": 7", "}"]
+    );
+    assert!(a.notice.is_none());
+}
+
+#[test]
+fn a_restored_failure_and_a_cut_body_say_so() {
+    let (_dir, mut a) = workspace();
+    let failed = sent(
+        "http://down/",
+        reqlite_store::Outcome::Failed {
+            error: "cannot connect".into(),
+        },
+    );
+    hist(&mut a, history::HistMsg::Fetched(Ok(Some(failed))));
+    assert!(matches!(&active(&mut a).send, Send::Finished(Err(e)) if e == "cannot connect"));
+
+    let cut = sent(
+        "http://big/",
+        reqlite_store::Outcome::Response {
+            status: 200,
+            headers: vec![],
+            body: vec![b'x'; 1024],
+            body_len: 50 * 1024 * 1024,
+            elapsed_ms: 80,
+        },
+    );
+    hist(&mut a, history::HistMsg::Fetched(Ok(Some(cut))));
+    assert!(a.notice.as_deref().unwrap().contains("first 1.0 KB"));
+}
+
+#[test]
+fn history_can_show_only_the_shown_request() {
+    let (dir, mut a) = workspace();
+    let list = dir.path().join("users/list.toml");
+    side(&mut a, SideMsg::Open(list.clone()));
+    let row = |id, file: Option<&Path>| reqlite_store::Summary {
+        id,
+        at_ms: 0,
+        file: file.map(|p| p.display().to_string()),
+        method: "GET".into(),
+        url: format!("http://h/{id}"),
+        status: Some(200),
+        error: None,
+        elapsed_ms: Some(5),
+    };
+    drop(update(&mut a, Msg::Panel(Panel::History)));
+    hist(
+        &mut a,
+        history::HistMsg::Listed(Ok(vec![row(2, None), row(1, Some(&list))])),
+    );
+    let count = |a: &App| {
+        let mut ui = simulator(view::view(a));
+        ["/1", "/2"].iter().filter(|u| ui.find(**u).is_ok()).count()
+    };
+    assert_eq!(count(&a), 2);
+    hist(&mut a, history::HistMsg::ThisRequest(true));
+    assert_eq!(count(&a), 1);
+}
+
+#[test]
+fn the_left_panel_switches_between_files_and_history_and_hides() {
+    let (_dir, mut a) = workspace();
+    assert_eq!(a.left_panel(), Some(Panel::Files));
+    drop(update(&mut a, Msg::Panel(Panel::History)));
+    assert_eq!(a.left_panel(), Some(Panel::History));
+    drop(update(&mut a, Msg::Panel(Panel::History)));
+    assert_eq!(a.left_panel(), None, "choosing the shown panel hides it");
+
+    let mut lone = app(Some(FILE));
+    lone.workspace = None;
+    assert_eq!(lone.left_panel(), None, "no workspace, no file tree");
+    drop(update(&mut lone, Msg::Panel(Panel::History)));
+    assert_eq!(lone.left_panel(), Some(Panel::History));
+}
+
+/// Presses `c` with Cmd held in the focused URL field, the way macOS sends it:
+/// the modifier first, then the key with its text.
+fn cmd_key_in_url(c: &str) -> Vec<Msg> {
+    let a = app(Some(FILE));
+    let mut ui = simulator(view::view(&a));
+    ui.click(URL).unwrap();
+    let key = ch(c);
+    ui.simulate([
+        iced::Event::Keyboard(keyboard::Event::ModifiersChanged(Modifiers::COMMAND)),
+        iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: Physical::Code(Code::KeyS),
+            location: keyboard::Location::Standard,
+            modifiers: Modifiers::COMMAND,
+            text: Some(c.into()),
+            repeat: false,
+        }),
+    ]);
+    ui.into_messages().collect()
+}
+
+#[test]
+fn a_shortcut_never_types_into_the_url() {
+    for c in ["s", "w", "l", "n", "1"] {
+        let typed = cmd_key_in_url(c)
+            .into_iter()
+            .any(|m| matches!(m, Msg::Url(u) if u.ends_with(c)));
+        assert!(!typed, "Cmd+{c} typed into the URL");
+    }
+}
+
+#[test]
+fn copy_and_paste_keys_still_reach_the_url() {
+    // Cmd+A selects all: no edit, but the key is not swallowed either, so
+    // nothing is typed. Plain letters still type.
+    let a = app(Some(FILE));
+    let mut ui = simulator(view::view(&a));
+    ui.click(URL).unwrap();
+    ui.typewrite("x");
+    assert!(
+        ui.into_messages()
+            .any(|m| matches!(m, Msg::Url(u) if u.ends_with('x')))
+    );
 }

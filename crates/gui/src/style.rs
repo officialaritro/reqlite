@@ -320,3 +320,31 @@ pub fn danger_banner(_: &Theme) -> container::Style {
     }
     .border(hairline(DANGER.scale_alpha(0.3)))
 }
+
+/// The × on a tab: bare until hovered.
+pub fn close(_: &Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: hovered.then(|| white(0.08).into()),
+        text_color: if hovered { TEXT } else { FAINT },
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+pub fn warning_banner(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(WARNING.scale_alpha(0.08).into()),
+        ..container::Style::default()
+    }
+    .border(hairline(WARNING.scale_alpha(0.3)))
+}
+
+/// Discard: the danger colour, as Cancel uses.
+pub fn stop(_: &Theme, status: button::Status) -> button::Style {
+    accent_with(DANGER_STRONG, status)
+}
