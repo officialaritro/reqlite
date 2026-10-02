@@ -12,8 +12,8 @@ Budgets:
   footprint              under 60 MB, on a 2x display only (it scales with the display)
   footprint - drawables  under 35 MB, on any display (memory Reqlite controls)
   first frame            under 300 ms, on a Mac with a real GPU only. A virtual
-                         machine (a CI runner) has a paravirtual GPU, so the time
-                         is printed but not checked there. The app prints
+                         machine (a CI runner) lists no GPU or a paravirtual one,
+                         so the time is printed but not checked there. The app prints
                          `first-frame <ms>` and exits when
                          REQLITE_GUI_EXIT_ON_FIRST_FRAME is set.
 Set REQLITE_BUDGET_SCALE=0.01 to shrink both budgets and watch the check fail.
@@ -147,7 +147,7 @@ def main() -> None:
     start = starts[2]
     runs_ms = ", ".join(f"{t:.0f}" for t in starts)
     model = gpu()
-    if "paravirtual" in model.lower():
+    if model == "none" or "paravirtual" in model.lower():
         print(
             f"skip first frame: {start:.0f} ms ({runs_ms}); GPU is {model}, the budget assumes a real GPU"
         )
