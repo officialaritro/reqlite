@@ -34,6 +34,10 @@ pub const WARNING: Color = Color::from_rgb8(0xff, 0xb9, 0x00);
 pub const SUCCESS: Color = Color::from_rgb8(0x00, 0xd4, 0x92);
 pub const BLUE: Color = Color::from_rgb8(0x4c, 0x9f, 0xff);
 pub const PURPLE: Color = Color::from_rgb8(0xbb, 0x8a, 0xef);
+pub const JSON_KEY: Color = Color::from_rgb8(0x9c, 0xa4, 0xff);
+pub const JSON_STRING: Color = Color::from_rgb8(0x7e, 0xe2, 0xb8);
+pub const JSON_NUMBER: Color = Color::from_rgb8(0xff, 0xb8, 0x6b);
+pub const JSON_LITERAL: Color = PURPLE;
 
 /// How much of the window background stays over the blurred desktop.
 pub const GLASS_ALPHA: f32 = 0.80;

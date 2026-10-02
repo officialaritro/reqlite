@@ -8,13 +8,14 @@
 //! ```
 
 use super::{App, LINE_HEIGHT, Msg, Send, Summary, Tab, URL, Viewer};
+use crate::scrollbar::scrollbar;
 use crate::style;
 use iced::widget::{
-    Space, button, column, container, mouse_area, pick_list, responsive, row, text, text_editor,
-    text_input, vertical_slider,
+    Space, button, column, container, mouse_area, pick_list, responsive, rich_text, row, span,
+    text, text_editor, text_input,
 };
 use iced::{Alignment, Color, Element, Length, Padding, mouse};
-use reqlite_gui::present::human_size;
+use reqlite_gui::present::{Token, human_size, json_tokens};
 
 /// Below this width the response moves under the request.
 const SPLIT_WIDTH: f32 = 900.0;
@@ -281,6 +282,7 @@ fn hint() -> Element<'static, Msg> {
     .into()
 }
 
+/// The visible lines only, with a line-number gutter. JSON gets colours.
 fn viewer(v: &Viewer) -> Element<'_, Msg> {
     let doc = v.doc.clone();
     let top = v.top;
@@ -289,34 +291,74 @@ fn viewer(v: &Viewer) -> Element<'_, Msg> {
         let lines = doc
             .lines(top, count)
             .unwrap_or_else(|e| vec![format!("cannot read the response: {e}")]);
-        let col = column(lines.into_iter().map(|l| {
-            text(l)
+        // Geist Mono's advance is 0.6 em.
+        let gutter = digits(doc.line_count()) as f32 * 13.0 * 0.6 + 12.0;
+        let numbers = column((top + 1..=top + lines.len()).map(|n| {
+            text(n.to_string())
                 .font(style::MONO)
                 .size(13)
                 .line_height(iced::Pixels(LINE_HEIGHT))
-                .wrapping(text::Wrapping::None)
+                .color(style::white(0.22))
+                .width(gutter)
+                .align_x(Alignment::End)
                 .into()
         }));
-        container(col)
+        let pretty = doc.is_pretty();
+        let body = column(lines.into_iter().map(|l| line(l, pretty)));
+        container(row![numbers, body].spacing(14))
             .clip(true)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
     });
-    let max = v.doc.line_count().saturating_sub(1) as f64;
-    row![
-        mouse_area(lines).on_scroll(|delta| Msg::Scroll(match delta {
-            mouse::ScrollDelta::Lines { y, .. } => (-y * 3.0).round() as i64,
-            mouse::ScrollDelta::Pixels { y, .. } => (-y / LINE_HEIGHT).round() as i64,
-        })),
-        // The slider's value grows upwards, so it shows the distance from the end.
-        vertical_slider(0.0..=max.max(1.0), max - v.top as f64, move |x| {
-            Msg::ScrollTo(max - x)
-        })
-        .step(1.0),
+    let area = row![
+        lines,
+        scrollbar(v.doc.line_count(), v.top, LINE_HEIGHT, |top| {
+            Msg::ScrollTo(top as f64)
+        }),
     ]
-    .height(Length::Fill)
-    .into()
+    .height(Length::Fill);
+    mouse_area(area)
+        .on_scroll(|delta| {
+            Msg::Scroll(match delta {
+                mouse::ScrollDelta::Lines { y, .. } => (-y * 3.0).round() as i64,
+                mouse::ScrollDelta::Pixels { y, .. } => (-y / LINE_HEIGHT).round() as i64,
+            })
+        })
+        .into()
+}
+
+fn line(l: String, json: bool) -> Element<'static, Msg> {
+    if !json {
+        return text(l)
+            .font(style::MONO)
+            .size(13)
+            .line_height(iced::Pixels(LINE_HEIGHT))
+            .wrapping(text::Wrapping::None)
+            .into();
+    }
+    let spans: Vec<text::Span<'static, (), iced::Font>> = json_tokens(&l)
+        .into_iter()
+        .map(|(piece, token)| {
+            span(piece.to_string()).color(match token {
+                Token::Key => style::JSON_KEY,
+                Token::String => style::JSON_STRING,
+                Token::Number => style::JSON_NUMBER,
+                Token::Literal => style::JSON_LITERAL,
+                Token::Punct => style::MUTED,
+            })
+        })
+        .collect();
+    rich_text(spans)
+        .font(style::MONO)
+        .size(13)
+        .line_height(iced::Pixels(LINE_HEIGHT))
+        .wrapping(text::Wrapping::None)
+        .into()
+}
+
+fn digits(n: usize) -> usize {
+    n.max(1).ilog10() as usize + 1
 }
 
 fn status_bar(app: &App) -> Element<'_, Msg> {

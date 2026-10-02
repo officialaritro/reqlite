@@ -2,6 +2,7 @@
 
 use super::*;
 use iced::keyboard::key::{Code, Physical};
+use iced::mouse;
 use iced_test::simulator;
 
 fn ch(c: &str) -> Key {
@@ -130,4 +131,64 @@ fn tabs_show_how_many_entries_they_hold() {
         ui.into_messages().next(),
         Some(Msg::Tab(Tab::Body))
     ));
+}
+
+/// A window showing a 1000-line response, and the scrollbar's x position.
+fn scrolled(top: usize) -> (App, f32) {
+    let mut a = app(Some(FILE));
+    let body = "line\n".repeat(1000);
+    let doc = Document::build(body.as_bytes()).unwrap();
+    a.viewer = Some(Viewer {
+        doc: Arc::new(doc),
+        top,
+    });
+    a.send = Send::Finished(Ok(Summary {
+        status: 200,
+        elapsed: Duration::ZERO,
+        bytes: 5000,
+    }));
+    // Window edge, page padding 12, panel padding 10, half the 12 px bar.
+    (a, 1024.0 - 12.0 - 10.0 - 6.0)
+}
+
+fn scroll_targets(ui: iced_test::Simulator<'_, Msg>) -> Vec<f64> {
+    ui.into_messages()
+        .filter_map(|m| match m {
+            Msg::ScrollTo(t) => Some(t),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_click_low_on_the_scrollbar_jumps_near_the_end() {
+    let (a, x) = scrolled(0);
+    let mut ui = simulator(view::view(&a));
+    ui.point_at((x, 700.0));
+    ui.simulate(iced_test::simulator::click());
+    let targets = scroll_targets(ui);
+    assert_eq!(targets.len(), 1, "{targets:?}");
+    assert!(targets[0] > 800.0, "{targets:?}");
+}
+
+#[test]
+fn dragging_the_scrollbar_follows_the_cursor_until_release() {
+    let (a, x) = scrolled(0);
+    let mut ui = simulator(view::view(&a));
+    let event = |e| [iced::Event::Mouse(e)];
+    let moved = |y| {
+        event(mouse::Event::CursorMoved {
+            position: iced::Point::new(x, y),
+        })
+    };
+    ui.point_at((x, 300.0));
+    ui.simulate(event(mouse::Event::ButtonPressed(mouse::Button::Left)));
+    ui.point_at((x, 500.0));
+    ui.simulate(moved(500.0));
+    ui.simulate(event(mouse::Event::ButtonReleased(mouse::Button::Left)));
+    ui.point_at((x, 700.0));
+    ui.simulate(moved(700.0));
+    let targets = scroll_targets(ui);
+    assert_eq!(targets.len(), 2, "press, then one drag step: {targets:?}");
+    assert!(targets[1] > targets[0], "{targets:?}");
 }
