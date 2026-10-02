@@ -962,6 +962,7 @@ dependencies = [
  "clap",
  "reqlite-engine",
  "reqlite-format",
+ "reqlite-store",
  "thiserror",
  "tokio",
 ]
@@ -993,6 +994,7 @@ version = "0.0.1"
 dependencies = [
  "dirs",
  "reqlite-engine",
+ "reqlite-format",
  "rusqlite",
  "serde",
  "serde_json",

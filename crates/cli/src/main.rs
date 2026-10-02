@@ -22,6 +22,11 @@ enum Command {
         #[arg(long, short)]
         env: Option<PathBuf>,
     },
+    /// List recent sends, newest first. Set REQLITE_DATA_DIR to move the history file.
+    History {
+        #[arg(long, short = 'n', default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 /// What failed decides the exit code.
@@ -32,6 +37,8 @@ enum Failure {
     Send(reqlite_engine::SendError),
     /// Writing the response out failed. Exit 1.
     Output(std::io::Error),
+    /// History could not be read. Exit 1.
+    Store(reqlite_store::StoreError),
 }
 
 impl Failure {
@@ -44,6 +51,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Send { file, env } => send(&file, env.as_deref()),
+        Command::History { limit } => history(limit),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -52,6 +60,7 @@ fn main() -> ExitCode {
                 Failure::Input(e) => (3, e.as_ref()),
                 Failure::Send(e) => (1, e),
                 Failure::Output(e) => (1, e),
+                Failure::Store(e) => (1, e),
             };
             report(err);
             ExitCode::from(code)
@@ -60,13 +69,47 @@ fn main() -> ExitCode {
 }
 
 fn report(err: &dyn Error) {
-    let mut line = format!("error: {err}");
+    eprintln!("error: {}", chain(err));
+}
+
+fn chain(err: &dyn Error) -> String {
+    let mut line = err.to_string();
     let mut cause = err.source();
     while let Some(c) = cause {
         line.push_str(&format!(": {c}"));
         cause = c.source();
     }
-    eprintln!("{line}");
+    line
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime, Failure> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(Failure::Output)
+}
+
+/// History is a convenience. When it cannot open, say so and keep sending.
+fn open_history() -> Option<reqlite_store::Store> {
+    let Some(path) = reqlite_store::default_path() else {
+        eprintln!("warning: history is off: no data directory found; set REQLITE_DATA_DIR");
+        return None;
+    };
+    match reqlite_store::open(&path) {
+        Ok(opened) => {
+            if let Some(aside) = opened.moved_aside {
+                eprintln!(
+                    "warning: the history file was damaged; it was moved to {} and a new one started",
+                    aside.display()
+                );
+            }
+            Some(opened.store)
+        }
+        Err(e) => {
+            eprintln!("warning: history is off: {}", chain(&e));
+            None
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -85,7 +128,7 @@ struct InFile<E: Error + 'static> {
     source: E,
 }
 
-fn send(file: &Path, env: Option<&Path>) -> Result<(), Failure> {
+fn send(file: &Path, env_path: Option<&Path>) -> Result<(), Failure> {
     let text = std::fs::read_to_string(file).map_err(|source| {
         Failure::input(ReadError {
             path: file.to_path_buf(),
@@ -98,7 +141,7 @@ fn send(file: &Path, env: Option<&Path>) -> Result<(), Failure> {
             source,
         })
     })?;
-    let env = match env {
+    let env = match env_path {
         Some(path) => reqlite_format::load_env(path).map_err(Failure::input)?,
         None => reqlite_format::Environment::default(),
     };
@@ -109,14 +152,25 @@ fn send(file: &Path, env: Option<&Path>) -> Result<(), Failure> {
         })
     })?;
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(Failure::Output)?;
+    let rt = runtime()?;
+    let history = open_history();
     let resp = rt.block_on(async {
         let client = reqlite_engine::client().map_err(reqlite_engine::SendError::from)?;
         reqlite_engine::send(&client, &req).await
     });
+
+    if let Some(store) = &history {
+        let entry = reqlite_store::Entry::from_send(
+            Some(file.display().to_string()),
+            env_path.map(|p| p.display().to_string()),
+            &req,
+            resp.as_ref(),
+        )
+        .map_err(Failure::Output)?;
+        if let Err(e) = rt.block_on(store.record(entry)) {
+            eprintln!("warning: this send was not saved to history: {}", chain(&e));
+        }
+    }
     let resp = resp.map_err(Failure::Send)?;
 
     eprintln!(
@@ -132,4 +186,59 @@ fn send(file: &Path, env: Option<&Path>) -> Result<(), Failure> {
     let mut body = resp.body.reader().map_err(Failure::Output)?;
     std::io::copy(&mut body, &mut out).map_err(Failure::Output)?;
     out.flush().map_err(Failure::Output)
+}
+
+fn history(limit: usize) -> Result<(), Failure> {
+    let path = reqlite_store::default_path().ok_or_else(|| {
+        Failure::Output(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no data directory found; set REQLITE_DATA_DIR",
+        ))
+    })?;
+    let opened = reqlite_store::open(&path).map_err(Failure::Store)?;
+    if let Some(aside) = &opened.moved_aside {
+        eprintln!(
+            "warning: the history file was damaged; it was moved to {} and a new one started",
+            aside.display()
+        );
+    }
+    let rows = runtime()?
+        .block_on(opened.store.recent(limit))
+        .map_err(Failure::Store)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    let mut out = std::io::stdout().lock();
+    for r in rows {
+        let result = match (r.status, &r.error) {
+            (Some(status), _) => status.to_string(),
+            (None, Some(_)) => "failed".to_string(),
+            (None, None) => "-".to_string(),
+        };
+        let took = r
+            .elapsed_ms
+            .map(|ms| format!(" {ms} ms"))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "{:>5}  {:>8}  {:<6}  {:<6} {}{took}",
+            r.id,
+            ago(now - r.at_ms),
+            result,
+            r.method,
+            r.url
+        )
+        .map_err(Failure::Output)?;
+    }
+    Ok(())
+}
+
+fn ago(ms: i64) -> String {
+    let s = ms.max(0) / 1000;
+    match s {
+        0..60 => format!("{s}s ago"),
+        60..3600 => format!("{}m ago", s / 60),
+        3600..86400 => format!("{}h ago", s / 3600),
+        _ => format!("{}d ago", s / 86400),
+    }
 }

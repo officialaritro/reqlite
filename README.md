@@ -52,6 +52,16 @@ reqlite send users.toml --env envs/dev.toml
 
 An undefined placeholder stops the send and names the variable.
 
+### History
+
+Each send is saved to a local history file, `history.db` in your data directory (for example `~/Library/Application Support/reqlite` on macOS). Set `REQLITE_DATA_DIR` to put it somewhere else. History never leaves your machine and is never committed. Secret values are replaced with `{{name}}` before anything is saved, including in response bodies and headers that echo them. History keeps the first 256 KiB of each response body.
+
+```sh
+reqlite history -n 10
+```
+
+If the history file is damaged, Reqlite moves it aside as `history.db.corrupt-<time>`, starts a new one, and says so. A history problem never stops a send.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -66,7 +76,8 @@ An undefined placeholder stops the send and names the variable.
 | Crate | Job |
 |---|---|
 | `crates/format` | The request file format (schema and parser) |
-| `crates/engine` | Sends a request, returns the response. No UI code. |
+| `crates/engine` | Resolves placeholders, sends a request, returns the response. No UI code. |
+| `crates/store` | Local request history in SQLite |
 | `crates/cli` | The `reqlite` command |
 
 Design rules:
