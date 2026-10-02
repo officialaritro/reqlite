@@ -84,14 +84,15 @@ fn title_row(app: &App) -> Element<'_, Msg> {
 fn request_bar(app: &App) -> Element<'_, Msg> {
     let running = matches!(app.send, Send::Running(_));
     let action = if running {
-        button(label("Cancel", "Esc"))
-            .on_press(Msg::Cancel)
-            .style(style::stop)
+        button(label("Cancel", "Esc")).on_press(Msg::Cancel)
     } else {
-        button(label("Send", &format!("{MOD}↵")))
-            .on_press(Msg::Send)
-            .style(style::accent)
+        button(label("Send", &format!("{MOD}↵"))).on_press(Msg::Send)
     };
+    let action = action.style(style::action(app.motion.running.interpolate(
+        0.0,
+        1.0,
+        app.motion.now,
+    )));
     let save = button(text("Save").size(13))
         .padding([8, 14])
         .on_press_maybe((app.dirty && app.file.is_some()).then_some(Msg::Save))
@@ -195,7 +196,7 @@ fn request_pane(app: &App) -> container::Container<'_, Msg> {
 }
 
 fn response_pane(app: &App) -> container::Container<'_, Msg> {
-    let mut header = row![status(&app.send), Space::new().width(Length::Fill)]
+    let mut header = row![status(app), Space::new().width(Length::Fill)]
         .spacing(10)
         .align_y(Alignment::Center)
         .height(28);
@@ -212,19 +213,33 @@ fn response_pane(app: &App) -> container::Container<'_, Msg> {
     }
     let body: Element<'_, Msg> = match (&app.send, app.shown()) {
         (Send::Finished(Err(e)), _) => message(e, style::DANGER),
-        (_, Some(v)) => viewer(v),
-        (Send::Running(_), None) => message("Sending…", style::MUTED),
+        (_, Some(v)) => viewer(v, app.motion.reveal.interpolate(0.0, 1.0, app.motion.now)),
+        (Send::Running(_), None) => message("Sending…", pulse(app)),
         (Send::Cancelled, None) => message("Cancelled.", style::MUTED),
         _ => hint(),
     };
     panel(column![header, divider(), body].spacing(8))
 }
 
+/// "Sending…" breathes once every 1.2 s, unless motion is reduced.
+fn pulse(app: &App) -> Color {
+    if app.motion.reduced {
+        return style::MUTED;
+    }
+    let t = app
+        .motion
+        .now
+        .saturating_duration_since(app.motion.since)
+        .as_secs_f32();
+    let wave = 0.5 + 0.5 * (t * std::f32::consts::TAU / 1.2).cos();
+    style::MUTED.scale_alpha(0.45 + 0.55 * wave)
+}
+
 /// The status pill and timing for the latest send.
-fn status(send: &Send) -> Element<'_, Msg> {
-    match send {
+fn status(app: &App) -> Element<'_, Msg> {
+    match &app.send {
         Send::Idle => text("Response").size(13).color(style::MUTED).into(),
-        Send::Running(_) => text("Sending…").size(13).color(style::MUTED).into(),
+        Send::Running(_) => text("Sending…").size(13).color(pulse(app)).into(),
         Send::Cancelled => text("Cancelled").size(13).color(style::MUTED).into(),
         Send::Finished(Err(_)) => pill("Error", style::DANGER),
         Send::Finished(Ok(s)) => row![
@@ -283,7 +298,8 @@ fn hint() -> Element<'static, Msg> {
 }
 
 /// The visible lines only, with a line-number gutter. JSON gets colours.
-fn viewer(v: &Viewer) -> Element<'_, Msg> {
+/// `fade` runs from 0 to 1 as a new response comes in.
+fn viewer(v: &Viewer, fade: f32) -> Element<'_, Msg> {
     let doc = v.doc.clone();
     let top = v.top;
     let lines = responsive(move |size| {
@@ -298,14 +314,15 @@ fn viewer(v: &Viewer) -> Element<'_, Msg> {
                 .font(style::MONO)
                 .size(13)
                 .line_height(iced::Pixels(LINE_HEIGHT))
-                .color(style::white(0.22))
+                .color(style::white(0.22 * fade))
                 .width(gutter)
                 .align_x(Alignment::End)
                 .into()
         }));
         let pretty = doc.is_pretty();
-        let body = column(lines.into_iter().map(|l| line(l, pretty)));
+        let body = column(lines.into_iter().map(|l| line(l, pretty, fade)));
         container(row![numbers, body].spacing(14))
+            .padding(Padding::ZERO.top(4.0 * (1.0 - fade)))
             .clip(true)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -328,9 +345,10 @@ fn viewer(v: &Viewer) -> Element<'_, Msg> {
         .into()
 }
 
-fn line(l: String, json: bool) -> Element<'static, Msg> {
+fn line(l: String, json: bool, fade: f32) -> Element<'static, Msg> {
     if !json {
         return text(l)
+            .color(style::TEXT.scale_alpha(fade))
             .font(style::MONO)
             .size(13)
             .line_height(iced::Pixels(LINE_HEIGHT))
@@ -340,13 +358,14 @@ fn line(l: String, json: bool) -> Element<'static, Msg> {
     let spans: Vec<text::Span<'static, (), iced::Font>> = json_tokens(&l)
         .into_iter()
         .map(|(piece, token)| {
-            span(piece.to_string()).color(match token {
+            let color = match token {
                 Token::Key => style::JSON_KEY,
                 Token::String => style::JSON_STRING,
                 Token::Number => style::JSON_NUMBER,
                 Token::Literal => style::JSON_LITERAL,
                 Token::Punct => style::MUTED,
-            })
+            };
+            span(piece.to_string()).color(color.scale_alpha(fade))
         })
         .collect();
     rich_text(spans)

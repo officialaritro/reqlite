@@ -163,14 +163,10 @@ fn accent_with(base: Color, status: button::Status) -> button::Style {
     }
 }
 
-/// Send.
-pub fn accent(_: &Theme, status: button::Status) -> button::Style {
-    accent_with(ACCENT_STRONG, status)
-}
-
-/// Cancel, while a send runs.
-pub fn stop(_: &Theme, status: button::Status) -> button::Style {
-    accent_with(DANGER_STRONG, status)
+/// Send and Cancel share one button. `m` moves its colour from Send's accent
+/// (0) to Cancel's red (1).
+pub fn action(m: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| accent_with(mix(ACCENT_STRONG, DANGER_STRONG, m), status)
 }
 
 fn field_border(focused: bool, hovered: bool) -> Border {

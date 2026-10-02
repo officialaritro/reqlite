@@ -1,10 +1,11 @@
 //! `reqlite-gui FILE [--env ENV]`: open, edit, save and send one request file.
 
 use clap::Parser;
+use iced::animation::{Animation, Easing};
 use iced::keyboard::{self, Key, key::Named};
 use iced::task::Handle;
 use iced::widget::{self, text_editor};
-use iced::{Subscription, Task, event, keyboard::Modifiers, window};
+use iced::{Subscription, Task, event, keyboard::Modifiers, time, window};
 use reqlite_gui::chain;
 use reqlite_gui::draft::Draft;
 use reqlite_gui::present::{entries, glass_supported};
@@ -71,6 +72,59 @@ struct App {
     label: String,
     started: Instant,
     exit_after_first_frame: bool,
+    motion: Motion,
+}
+
+/// The few animations, and the clock they read. Frames are drawn only while
+/// one of them runs, so an idle window costs no CPU.
+struct Motion {
+    now: Instant,
+    /// The response fading in.
+    reveal: Animation<bool>,
+    /// Send turning into Cancel and back.
+    running: Animation<bool>,
+    /// When the current send started, for the pulse.
+    since: Instant,
+    /// `REQLITE_REDUCE_MOTION=1`: every change shows at once.
+    reduced: bool,
+}
+
+/// The "sending" pulse redraws at most this often.
+const PULSE: Duration = Duration::from_millis(33);
+
+impl Motion {
+    fn new(reduced: bool) -> Motion {
+        let now = Instant::now();
+        Motion {
+            now,
+            reveal: Animation::new(true),
+            running: Animation::new(false)
+                .duration(if reduced {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(200)
+                })
+                .easing(Easing::EaseOut),
+            since: now,
+            reduced,
+        }
+    }
+
+    /// Fades a new response in from nothing: 0.5 s, rising 4 px (Zeron's fade-in).
+    fn reveal(&mut self, now: Instant) {
+        let fade = Animation::new(false).easing(Easing::EaseOutExpo);
+        self.reveal = fade
+            .duration(if self.reduced {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(500)
+            })
+            .go(true, now);
+    }
+
+    fn animating(&self, at: Instant) -> bool {
+        self.reveal.is_animating(at) || self.running.is_animating(at)
+    }
 }
 
 enum Send {
@@ -117,6 +171,8 @@ enum Msg {
     Send,
     Cancel,
     Sent(Box<Finished>),
+    /// A frame or pulse tick, while something moves.
+    Tick(Instant),
     Save,
     Saved(Result<String, String>),
     Scroll(i64),
@@ -200,6 +256,7 @@ fn boot(args: &Args, opened: &Opened, started: Instant) -> (App, Task<Msg>) {
             .map_or("Untitled".to_string(), |f| f.to_string_lossy().into_owned()),
         started,
         exit_after_first_frame: std::env::var_os("REQLITE_GUI_EXIT_ON_FIRST_FRAME").is_some(),
+        motion: Motion::new(std::env::var_os("REQLITE_REDUCE_MOTION").is_some_and(|v| v != "0")),
     };
     match opened {
         Opened::Missing => {}
@@ -253,7 +310,15 @@ async fn blocking<T: std::marker::Send + 'static>(
 }
 
 fn update(app: &mut App, msg: Msg) -> Task<Msg> {
+    // A tick only moves the clock: no form refresh at 30 or 120 Hz.
+    if let Msg::Tick(at) = msg {
+        app.motion.now = at;
+        return Task::none();
+    }
+    let now = Instant::now();
+    app.motion.now = now;
     match msg {
+        Msg::Tick(_) => {}
         Msg::Method(m) => app.method = m,
         Msg::Url(u) => app.url = u,
         Msg::Headers(a) => app.headers.perform(a),
@@ -264,6 +329,7 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
             if let Send::Running(handle) = &app.send {
                 handle.abort();
                 app.send = Send::Cancelled;
+                app.motion.running.go_mut(false, now);
             }
         }
         Msg::Sent(done) => {
@@ -276,8 +342,10 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
                 app.history = opened;
             }
             app.notice = warning;
+            app.motion.running.go_mut(false, now);
             match result {
                 Ok(loaded) => {
+                    app.motion.reveal(now);
                     app.viewer = Some(Viewer {
                         doc: loaded.doc,
                         top: 0,
@@ -380,6 +448,9 @@ fn start_send(app: &mut App) -> Task<Msg> {
     })
     .abortable();
     app.send = Send::Running(handle);
+    let now = Instant::now();
+    app.motion.since = now;
+    app.motion.running.go_mut(true, now);
     task
 }
 
@@ -541,10 +612,15 @@ fn keys(event: iced::Event, status: event::Status, _: window::Id) -> Option<Msg>
 
 fn subscription(app: &App) -> Subscription<Msg> {
     let mut subs = vec![event::listen_with(keys)];
-    // Only the cold start check listens to frames. A frame subscription makes
-    // iced redraw back to back, which costs a third drawable (issue #1).
+    // A frame subscription makes iced redraw back to back, which costs a third
+    // drawable (issue #1). So it runs only for the cold start check and while
+    // an animation moves.
     if app.exit_after_first_frame {
         subs.push(window::frames().map(|_| Msg::FirstFrame));
+    } else if app.motion.animating(Instant::now()) {
+        subs.push(window::frames().map(Msg::Tick));
+    } else if matches!(app.send, Send::Running(_)) && !app.motion.reduced {
+        subs.push(time::every(PULSE).map(Msg::Tick));
     }
     Subscription::batch(subs)
 }

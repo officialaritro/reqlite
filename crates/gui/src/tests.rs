@@ -192,3 +192,30 @@ fn dragging_the_scrollbar_follows_the_cursor_until_release() {
     assert_eq!(targets.len(), 2, "press, then one drag step: {targets:?}");
     assert!(targets[1] > targets[0], "{targets:?}");
 }
+
+#[test]
+fn animations_end_so_the_window_stops_drawing_frames() {
+    let ms = Duration::from_millis;
+    let mut m = Motion::new(false);
+    let t0 = m.now;
+    assert!(!m.animating(t0), "a new window is still");
+
+    m.reveal(t0);
+    assert!(m.animating(t0 + ms(250)));
+    assert!(!m.animating(t0 + ms(501)));
+
+    let t1 = t0 + ms(600);
+    m.running.go_mut(true, t1);
+    assert!(m.animating(t1 + ms(100)));
+    assert!(!m.animating(t1 + ms(201)));
+}
+
+#[test]
+fn reduced_motion_shows_every_change_at_once() {
+    let mut m = Motion::new(true);
+    let t0 = m.now;
+    m.reveal(t0);
+    m.running.go_mut(true, t0);
+    assert!(!m.animating(t0));
+    assert_eq!(m.reveal.interpolate(0.0, 1.0, t0), 1.0);
+}
