@@ -25,15 +25,15 @@ pub fn client() -> Result<reqwest::Client, reqwest::Error> {
 }
 
 pub async fn send(client: &reqwest::Client, req: &Request) -> Result<Response, SendError> {
-    let method =
-        reqwest::Method::from_bytes(req.method.to_ascii_uppercase().as_bytes()).map_err(|e| {
-            SendError::Method {
-                method: req.method.clone(),
-                reason: e.to_string(),
-            }
-        })?;
-    let mut builder = client.request(method, &req.url).query(&req.query);
-    for (k, v) in &req.headers {
+    let method = reqwest::Method::from_bytes(req.method.as_str().as_bytes()).map_err(|e| {
+        SendError::Method {
+            method: req.method.as_str().to_string(),
+            reason: e.to_string(),
+        }
+    })?;
+    let query: Vec<(&str, &str)> = req.query.pairs().collect();
+    let mut builder = client.request(method, &req.url).query(&query);
+    for (k, v) in req.headers.pairs() {
         builder = builder.header(k, v);
     }
     if let Some(body) = &req.body {
@@ -106,26 +106,20 @@ mod tests {
         let (url, srv) =
             serve_once("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
         let mut req = request(&url);
-        req.method = "post".into();
-        req.query.insert("dry_run".into(), "true".into());
-        req.headers.insert("X-Test".into(), "yes".into());
+        req.method = "post".to_string().try_into().unwrap();
+        req.query.append("dry_run", "true");
+        req.query.append("tag", "a");
+        req.query.append("tag", "b");
+        req.headers.append("X-Test", "yes");
         req.body = Some("hello".into());
         send(&client().unwrap(), &req).await.unwrap();
 
         let raw = srv.await.unwrap();
         assert!(
-            raw.starts_with("POST /users?dry_run=true HTTP/1.1"),
+            raw.starts_with("POST /users?dry_run=true&tag=a&tag=b HTTP/1.1"),
             "{raw}"
         );
         assert!(raw.to_ascii_lowercase().contains("x-test: yes"), "{raw}");
         assert!(raw.ends_with("hello"), "{raw}");
-    }
-
-    #[tokio::test]
-    async fn rejects_bad_method() {
-        let mut req = request("http://127.0.0.1:1");
-        req.method = "NOT A METHOD".into();
-        let err = send(&client().unwrap(), &req).await.unwrap_err();
-        assert!(matches!(err, SendError::Method { .. }));
     }
 }
