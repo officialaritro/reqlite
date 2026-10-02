@@ -13,8 +13,8 @@ pub struct Response {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
-    #[error("invalid HTTP method {0:?}")]
-    Method(String),
+    #[error("invalid HTTP method {method:?}: {reason}")]
+    Method { method: String, reason: String },
     #[error("{0}")]
     Http(#[from] reqwest::Error),
 }
@@ -25,8 +25,13 @@ pub fn client() -> Result<reqwest::Client, reqwest::Error> {
 }
 
 pub async fn send(client: &reqwest::Client, req: &Request) -> Result<Response, SendError> {
-    let method = reqwest::Method::from_bytes(req.method.to_ascii_uppercase().as_bytes())
-        .map_err(|_| SendError::Method(req.method.clone()))?;
+    let method =
+        reqwest::Method::from_bytes(req.method.to_ascii_uppercase().as_bytes()).map_err(|e| {
+            SendError::Method {
+                method: req.method.clone(),
+                reason: e.to_string(),
+            }
+        })?;
     let mut builder = client.request(method, &req.url).query(&req.query);
     for (k, v) in &req.headers {
         builder = builder.header(k, v);
@@ -121,6 +126,6 @@ mod tests {
         let mut req = request("http://127.0.0.1:1");
         req.method = "NOT A METHOD".into();
         let err = send(&client().unwrap(), &req).await.unwrap_err();
-        assert!(matches!(err, SendError::Method(_)));
+        assert!(matches!(err, SendError::Method { .. }));
     }
 }

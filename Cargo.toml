@@ -14,3 +14,19 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+let_underscore_must_use = "deny"
+map_err_ignore = "deny"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+let_underscore_lock = "deny"
+significant_drop_in_scrutinee = "warn"
