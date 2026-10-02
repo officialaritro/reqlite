@@ -24,7 +24,7 @@ One script, [measure_all.py](measure_all.py), measured the three release binarie
 
 | Budget | iced | Slint | Tauri |
 |---|---|---|---|
-| Idle RAM under 50 MB | miss (57) | miss (95) | miss (72 footprint, 157 RSS) |
+| Idle RAM under 50 MB (the original budget) | miss (57) | miss (95) | miss (72 footprint, 157 RSS) |
 | Binary under 25 MB | pass | pass | pass |
 | Cold start under 300 ms | pass | pass | miss |
 | 50 MB JSON without freezing | pass | pass | pass |
@@ -44,7 +44,12 @@ On "without freezing", the worst frame gap after the first frame stayed under 30
 2. A 1 MB paste blocks for about 0.6 s. If that matters in use, back the editor with `ropey`, per `docs/research/ropes.md` B2.
 3. No "frame presented" callback. The `window::frames()` subscription has to be switched off when idle, or iced redraws forever.
 
+## Idle memory after issue #1
+
+[Issue #1](https://github.com/officialaritro/reqlite/issues/1) found that an empty iced window (`iced/examples/hello.rs`) already uses 55 MB at 1000×800 on a 2× display. About 25 MB is the window's 2 drawables, and about 30 MB is the toolkit's fixed cost. So the budget now has two parts: total idle footprint under 60 MB at 1000×800 on a 2× display, and footprint minus drawables under 35 MB. The iced spike meets both, at 57 MB and 32 MB.
+
+The spike sometimes kept a third drawable. It subscribed to every frame until its first frame, so it redrew back to back at startup. With that subscription limited to the first-frame hook, 6 of 6 runs at 800×600 kept 2 drawables (14.9 MB, 44 MB footprint). Before the change, 4 of 6 runs kept 3 (22.4 MB, 52 MB). The production GUI must redraw only when its state changes.
+
 ## Next
 
-1. Bring the iced idle footprint under 50 MB: frame buffer count, default window size, font database. Measure each change with `measure_all.py`.
-2. Add the GUI idle RAM and cold start checks to `scripts/budgets.py` once the production GUI crate exists.
+1. Build the production GUI crate on iced, and add `scripts/gui_idle.py` and a cold start check to CI on macOS.

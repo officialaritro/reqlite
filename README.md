@@ -109,17 +109,21 @@ Design rules:
 
 | Metric | Budget | Now (macOS, M4) | Checked in CI |
 |---|---|---|---|
-| Idle RAM (GUI) | under 50 MB | no GUI yet | not yet |
+| GUI idle footprint, 1000×800 window on a 2× display | under 60 MB | iced spike 57 MB | locally (`scripts/gui_idle.py`) |
+| GUI idle footprint minus window frame buffers, any display | under 35 MB | iced spike 32 MB | locally (`scripts/gui_idle.py`) |
 | Binary | under 25 MB | CLI 3.6 MB | yes |
 | Cold start | under 300 ms | CLI 3 ms | yes (CLI) |
 | Peak RAM while opening a 50 MB JSON response | under 50 MB | viewer 1.5 to 2.4 MB, CLI send 8.7 MB | yes |
 
-`scripts/budgets.py` runs these checks on Linux and macOS in CI and fails the build on a miss. It also checks that each crate depends only on the crates below it. To run it yourself:
+The GUI rows use the physical footprint, which Activity Monitor shows as "Memory". The window's frame buffers grow with the window size and the display scale, so the first GUI row fixes both. The second row counts only the memory Reqlite controls. See [issue #1](https://github.com/officialaritro/reqlite/issues/1) for the measurements behind these numbers. `scripts/gui_idle.py EXECUTABLE` checks both on macOS. It joins CI with the production GUI.
+
+`scripts/budgets.py` runs the other checks on Linux and macOS in CI and fails the build on a miss. It also checks that each crate depends only on the crates below it. To run it yourself:
 
 ```sh
-cargo build --release --workspace --examples
 python3 scripts/budgets.py
 ```
+
+The script builds the release binaries and examples first, so it never measures a stale build.
 
 ## License
 

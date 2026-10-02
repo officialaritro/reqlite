@@ -381,7 +381,7 @@ fn view(app: &App) -> Element<'_, Msg> {
 
 fn subscription(app: &App) -> Subscription<Msg> {
     let mut subs = vec![];
-    if !app.first_frame_seen || app.awaiting_ready || app.bench.is_some() {
+    if (app.exit == Exit::FirstFrame && !app.first_frame_seen) || app.awaiting_ready || app.bench.is_some() {
         subs.push(window::frames().map(|_| Msg::Frame));
     }
     if app.loading_since.is_some() {
@@ -399,6 +399,11 @@ fn main() -> iced::Result {
     iced::application(boot, update, view)
         .title("Reqlite iced spike")
         .subscription(subscription)
-        .window_size((1000.0, 800.0))
+        .window_size(
+            std::env::var("REQLITE_SPIKE_WINDOW")
+                .ok()
+                .and_then(|v| v.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
+                .unwrap_or((1000.0, 800.0)),
+        )
         .run()
 }
