@@ -7,13 +7,16 @@ use iced::widget::{
     button, column, container, mouse_area, responsive, row, text, text_editor, text_input,
     vertical_slider,
 };
-use iced::{Element, Font, Length, Subscription, Task, event, mouse, window};
+use iced::{Element, Length, Subscription, Task, event, mouse, window};
 use reqlite_gui::chain;
 use reqlite_gui::draft::Draft;
+use reqlite_gui::present::glass_supported;
 use reqlite_viewer::Document;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+mod style;
 
 const LINE_HEIGHT: f32 = 18.0;
 const PAGE: i64 = 40;
@@ -425,19 +428,22 @@ fn title(app: &App) -> String {
 fn view(app: &App) -> Element<'_, Msg> {
     let running = matches!(app.send, Send::Running(_));
     let action = if running {
-        button("Cancel").on_press(Msg::Cancel)
+        button("Cancel").on_press(Msg::Cancel).style(style::stop)
     } else {
-        button("Send").on_press(Msg::Send)
+        button("Send").on_press(Msg::Send).style(style::accent)
     };
-    let save =
-        button("Save").on_press_maybe((app.dirty && app.file.is_some()).then_some(Msg::Save));
+    let save = button("Save")
+        .on_press_maybe((app.dirty && app.file.is_some()).then_some(Msg::Save))
+        .style(style::neutral);
     let top = row![
         text_input("GET", &app.method)
             .on_input(Msg::Method)
+            .style(style::input)
             .width(90),
         text_input("https://", &app.url)
             .on_input(Msg::Url)
-            .on_submit(Msg::Send),
+            .on_submit(Msg::Send)
+            .style(style::input),
         action,
         save,
     ]
@@ -445,12 +451,13 @@ fn view(app: &App) -> Element<'_, Msg> {
 
     let editor = |label: &'static str, content: &'static str, value, on: fn(_) -> Msg, height| {
         column![
-            text(label).size(12),
+            text(label).size(12).color(style::MUTED),
             text_editor(value)
                 .placeholder(content)
                 .key_binding(editor_keys)
                 .on_action(on)
-                .font(Font::MONOSPACE)
+                .font(style::MONO)
+                .style(style::editor)
                 .height(height),
         ]
         .spacing(4)
@@ -469,9 +476,9 @@ fn view(app: &App) -> Element<'_, Msg> {
         Send::Finished(Ok(s)) => s.clone(),
         Send::Finished(Err(e)) => format!("error: {e}"),
     };
-    let mut page = column![top, fields, body, text(status).font(Font::MONOSPACE)].spacing(8);
+    let mut page = column![top, fields, body, text(status).font(style::MONO)].spacing(8);
     if let Some(e) = &app.open_error {
-        page = page.push(text(e).size(12).font(Font::MONOSPACE).style(text::danger));
+        page = page.push(text(e).size(12).font(style::MONO).color(style::DANGER));
     }
     if let Some(notice) = &app.notice {
         page = page.push(text(notice).size(12));
@@ -494,7 +501,7 @@ fn viewer(v: Option<&Viewer>) -> Element<'_, Msg> {
             .unwrap_or_else(|e| vec![format!("cannot read the response: {e}")]);
         let col = column(lines.into_iter().map(|l| {
             text(l)
-                .font(Font::MONOSPACE)
+                .font(style::MONO)
                 .size(13)
                 .line_height(iced::Pixels(LINE_HEIGHT))
                 .wrapping(text::Wrapping::None)
@@ -569,13 +576,35 @@ fn subscription(app: &App) -> Subscription<Msg> {
     Subscription::batch(subs)
 }
 
+/// Glass where the OS blurs a transparent window. `REQLITE_GLASS=0` turns it off.
+fn glass() -> bool {
+    std::env::var_os("REQLITE_GLASS").is_none_or(|v| v != "0")
+        && glass_supported(
+            std::env::consts::OS,
+            std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        )
+}
+
 fn main() -> iced::Result {
     let started = Instant::now();
     let args = Args::parse();
     let opened = open(args.file.as_deref());
-    iced::application(move || boot(&args, &opened, started), update, view)
+    let glass = glass();
+    let mut app = iced::application(move || boot(&args, &opened, started), update, view)
         .title(title)
         .subscription(subscription)
-        .window_size((1000.0, 800.0))
-        .run()
+        .theme(style::theme())
+        .style(move |_, _| style::window(glass))
+        .default_font(style::SANS)
+        .window(window::Settings {
+            size: iced::Size::new(1000.0, 800.0),
+            transparent: glass,
+            blur: glass,
+            ..window::Settings::default()
+        });
+    for face in style::FONTS {
+        app = app.font(face);
+    }
+    app.run()
 }
