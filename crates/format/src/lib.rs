@@ -5,6 +5,8 @@ use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// Current schema version written to and accepted from request files.
 pub const VERSION: u32 = 1;
@@ -172,6 +174,49 @@ fn validate(req: &Request) -> Result<(), String> {
     Ok(())
 }
 
+/// Canonical text for a request. The same request always gives the same bytes,
+/// so a save that changes nothing makes no Git diff.
+// SHORTCUT: comments and layout in a hand-edited file are lost on save. Switch to
+// toml_edit if users report it.
+pub fn to_string(req: &Request) -> Result<String, toml::ser::Error> {
+    toml::to_string(req)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SaveError {
+    #[error("cannot serialize request: {0}")]
+    Serialize(#[from] toml::ser::Error),
+    #[error("cannot save {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Writes `req` to `path` through a temp file in the same directory, so a crash
+/// leaves either the old file or the new one, never a partial file.
+pub fn save(path: &Path, req: &Request) -> Result<(), SaveError> {
+    let text = to_string(req)?;
+    let io = |source| SaveError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(io)?;
+    tmp.write_all(text.as_bytes()).map_err(io)?;
+    tmp.as_file().sync_all().map_err(io)?;
+    tmp.persist(path).map_err(|e| io(e.error))?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(io)?;
+    Ok(())
+}
+
 /// RFC 9110 `token`: the shape of method and header names.
 fn is_token(s: &str) -> bool {
     !s.is_empty()
@@ -242,5 +287,68 @@ tag = ["a", "b"]
             let err = parse(&text).unwrap_err().to_string();
             assert!(err.contains(reason), "{text:?} gave {err:?}");
         }
+    }
+
+    const CANONICAL: &str = r#"version = 1
+name = "Search"
+method = "GET"
+url = "http://a/search"
+body = """
+{"q": 1}
+"""
+
+[headers]
+Accept = "application/json"
+
+[query]
+tag = ["a", "b"]
+"#;
+
+    #[test]
+    fn writes_canonical_text_whatever_the_input_layout() {
+        let shuffled = "[query]\ntag = ['a', 'b']\n\n[headers]\nAccept = 'application/json'\n";
+        let top = "url = 'http://a/search'\nversion = 1\nbody = \"\"\"\n{\"q\": 1}\n\"\"\"\nname = 'Search'\n";
+        let req = parse(&format!("{top}{shuffled}")).unwrap();
+        assert_eq!(to_string(&req).unwrap(), CANONICAL);
+    }
+
+    #[test]
+    fn examples_round_trip_byte_for_byte() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let req = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let once = to_string(&req).unwrap();
+            assert_eq!(parse(&once).unwrap(), req, "{path:?}");
+            assert_eq!(to_string(&parse(&once).unwrap()).unwrap(), once, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn save_writes_a_file_that_parses_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.toml");
+        let req = parse(CANONICAL).unwrap();
+        save(&path, &req).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CANONICAL);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "temp file left behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_save_keeps_the_old_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.toml");
+        std::fs::write(&path, MIN).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = save(&path, &parse(CANONICAL).unwrap());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(result, Err(SaveError::Io { .. })), "{result:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), MIN);
     }
 }
