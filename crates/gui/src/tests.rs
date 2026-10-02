@@ -745,3 +745,70 @@ fn copy_and_paste_keys_still_reach_the_url() {
             .any(|m| matches!(m, Msg::Url(u) if u.ends_with('x')))
     );
 }
+
+const JSON_FILE: &str = "version = 2\nname = \"t\"\nmethod = \"POST\"\nurl = \"http://h/\"\n\n[body]\ntype = \"json\"\ntext = '{\"a\": 1}'\n\n[auth]\ntype = \"bearer\"\ntoken = \"{{token}}\"\n";
+
+#[test]
+fn a_version_2_file_opens_clean_and_shows_its_body_type_and_auth() {
+    let mut a = app(Some(JSON_FILE));
+    let d = active(&mut a);
+    assert!(!d.unsaved(), "opening changes nothing");
+    assert_eq!(
+        d.section,
+        Section::Body,
+        "opens on the first section with content"
+    );
+    assert_eq!(d.body_kind, BodyKind::Json);
+    assert!(d.counts.auth);
+    let mut ui = simulator(view::view(&a));
+    assert!(
+        ui.find("Adds Content-Type: application/json unless Headers sets one.")
+            .is_ok()
+    );
+    drop(ui);
+    drop(update(&mut a, Msg::Section(Section::Auth)));
+    let mut ui = simulator(view::view(&a));
+    assert!(
+        ui.find("Use a {{secret}} so the value stays out of the file.")
+            .is_ok()
+    );
+    assert!(ui.find("{{token}}").is_ok(), "the token field holds it");
+}
+
+#[test]
+fn picking_a_body_type_and_auth_changes_what_is_saved() {
+    let mut a = app(Some(FILE));
+    drop(update(&mut a, Msg::Method("POST".into())));
+    drop(update(&mut a, Msg::BodyKind(BodyKind::File)));
+    drop(update(&mut a, Msg::BodyFile("data/p.bin".into())));
+    drop(update(&mut a, Msg::AuthKind(AuthKind::ApiKey)));
+    drop(update(
+        &mut a,
+        Msg::Auth(AuthField::KeyName, "X-Key".into()),
+    ));
+    drop(update(
+        &mut a,
+        Msg::Auth(AuthField::KeyValue, "{{key}}".into()),
+    ));
+    drop(update(&mut a, Msg::KeyIn(reqlite_format::KeyIn::Query)));
+    let req = active(&mut a).draft().to_request().unwrap();
+    assert_eq!(
+        req.body,
+        Some(reqlite_format::Body::File {
+            path: "data/p.bin".into()
+        })
+    );
+    assert_eq!(
+        req.auth,
+        Some(reqlite_format::Auth::ApiKey {
+            name: "X-Key".into(),
+            value: "{{key}}".into(),
+            location: reqlite_format::KeyIn::Query
+        })
+    );
+    assert!(active(&mut a).unsaved());
+    assert!(matches!(
+        shortcut(&ch("4"), Modifiers::COMMAND),
+        Some(Msg::Section(Section::Auth))
+    ));
+}

@@ -7,6 +7,7 @@ use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{self, text_editor};
 use iced::{Subscription, Task, event, keyboard::Modifiers, time, window};
 use reqlite_gui::chain;
+use reqlite_gui::draft::{AuthKind, BodyKind};
 use reqlite_gui::present::glass_supported;
 use reqlite_viewer::Document;
 use sidebar::{SideMsg, Sidebar, Workspace};
@@ -93,6 +94,11 @@ enum Msg {
     Scroll(i64),
     ScrollTo(f64),
     Section(Section),
+    BodyKind(BodyKind),
+    BodyFile(String),
+    AuthKind(AuthKind),
+    Auth(AuthField, String),
+    KeyIn(reqlite_format::KeyIn),
     FocusUrl,
     Select(usize),
     NextTab,
@@ -119,6 +125,16 @@ enum Msg {
 enum Panel {
     Files,
     History,
+}
+
+/// The text fields of the Auth section.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AuthField {
+    Token,
+    Username,
+    Password,
+    KeyName,
+    KeyValue,
 }
 
 /// A choice in the environment picker: a file, or no environment.
@@ -482,6 +498,20 @@ fn edit(doc: &mut Doc, msg: Msg, now: Instant) {
         Msg::Scroll(lines) => doc.scroll(|top| top + lines),
         Msg::ScrollTo(v) => doc.scroll(|_| v.round() as i64),
         Msg::Section(s) => doc.section = s,
+        Msg::BodyKind(k) => doc.body_kind = k,
+        Msg::BodyFile(p) => doc.body_file = p,
+        Msg::AuthKind(k) => doc.auth.kind = k,
+        Msg::KeyIn(k) => doc.auth.key_in = k,
+        Msg::Auth(field, v) => {
+            let a = &mut doc.auth;
+            *match field {
+                AuthField::Token => &mut a.token,
+                AuthField::Username => &mut a.username,
+                AuthField::Password => &mut a.password,
+                AuthField::KeyName => &mut a.key_name,
+                AuthField::KeyValue => &mut a.key_value,
+            } = v;
+        }
         _ => {}
     }
 }
@@ -649,6 +679,7 @@ fn shortcut(key: &Key, modifiers: Modifiers) -> Option<Msg> {
         Key::Character("1") => Some(Msg::Section(Section::Query)),
         Key::Character("2") => Some(Msg::Section(Section::Headers)),
         Key::Character("3") => Some(Msg::Section(Section::Body)),
+        Key::Character("4") => Some(Msg::Section(Section::Auth)),
         Key::Character("n") => Some(Msg::New),
         Key::Character("w") => Some(Msg::CloseActive),
         Key::Character("b") => Some(Msg::Side(SideMsg::ToggleHidden)),

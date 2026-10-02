@@ -74,6 +74,7 @@ pub enum Section {
     Query,
     Headers,
     Body,
+    Auth,
 }
 
 /// What each section holds, shown on its tab.
@@ -82,6 +83,7 @@ pub struct Counts {
     pub query: usize,
     pub headers: usize,
     pub body: bool,
+    pub auth: bool,
 }
 
 pub struct Viewer {
@@ -203,7 +205,11 @@ impl Doc {
         self.counts = Counts {
             query: entries(&d.query),
             headers: entries(&d.headers),
-            body: !d.body.is_empty(),
+            body: match d.body_kind {
+                BodyKind::File => !d.body_file.trim().is_empty(),
+                _ => !d.body.is_empty(),
+            },
+            auth: d.auth.kind != reqlite_gui::draft::AuthKind::None,
         };
     }
 

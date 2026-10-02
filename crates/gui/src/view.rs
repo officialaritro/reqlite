@@ -291,35 +291,176 @@ fn request_pane(doc: &Doc) -> container::Container<'_, Msg> {
             .style(move |theme, status| style::tab(theme, status, active))
     };
     let count = |n: usize| if n == 0 { String::new() } else { n.to_string() };
+    let dot = |on: bool| if on { "●".to_string() } else { String::new() };
     let sections = row![
         tab(Section::Query, "Query", count(doc.counts.query)),
         tab(Section::Headers, "Headers", count(doc.counts.headers)),
-        tab(
-            Section::Body,
-            "Body",
-            if doc.counts.body {
-                "●".into()
-            } else {
-                String::new()
-            }
-        ),
+        tab(Section::Body, "Body", dot(doc.counts.body)),
+        tab(Section::Auth, "Auth", dot(doc.counts.auth)),
     ]
     .spacing(4);
-    let (content, placeholder, on): (_, _, fn(_) -> Msg) = match doc.section {
-        Section::Query => (&doc.query, "name: value, one per line", Msg::Query),
-        Section::Headers => (&doc.headers, "Name: value, one per line", Msg::Headers),
-        Section::Body => (&doc.body, "Request body", Msg::Body),
+    let editor = |content, placeholder, on: fn(text_editor::Action) -> Msg| {
+        text_editor(content)
+            .placeholder(placeholder)
+            .key_binding(super::editor_keys)
+            .on_action(on)
+            .font(style::MONO)
+            .size(13)
+            .padding(10)
+            .height(Length::Fill)
+            .style(style::editor)
     };
-    let editor = text_editor(content)
-        .placeholder(placeholder)
-        .key_binding(super::editor_keys)
-        .on_action(on)
-        .font(style::MONO)
-        .size(13)
-        .padding(10)
-        .height(Length::Fill)
-        .style(style::editor);
-    panel(column![sections, editor].spacing(8))
+    let content: Element<'_, Msg> = match doc.section {
+        Section::Query => editor(&doc.query, "name: value, one per line", Msg::Query).into(),
+        Section::Headers => editor(&doc.headers, "Name: value, one per line", Msg::Headers).into(),
+        Section::Body => body_editor(doc, editor),
+        Section::Auth => auth_editor(doc),
+    };
+    panel(column![sections, content].spacing(8))
+}
+
+/// A small picker in the request pane, styled like the method picker.
+fn picker<'a, T: ToString + PartialEq + Clone + 'a>(
+    options: &'a [T],
+    selected: T,
+    on: impl Fn(T) -> Msg + 'a,
+) -> Element<'a, Msg> {
+    pick_list(options, Some(selected), on)
+        .text_size(12)
+        .padding([4, 10])
+        .style(style::method_picker(style::TEXT))
+        .menu_style(style::method_menu)
+        .into()
+}
+
+fn field<'a>(
+    placeholder: &'a str,
+    value: &'a str,
+    on: impl Fn(String) -> Msg + 'a,
+) -> Element<'a, Msg> {
+    crate::guard::guard(
+        text_input(placeholder, value)
+            .on_input(on)
+            .font(style::MONO)
+            .size(13)
+            .padding([8, 10])
+            .style(style::input),
+    )
+    .into()
+}
+
+fn note(t: &str) -> Element<'_, Msg> {
+    text(t).size(12).color(style::FAINT).into()
+}
+
+fn body_editor<'a, E: Into<Element<'a, Msg>>>(
+    doc: &'a Doc,
+    editor: impl Fn(&'a text_editor::Content, &'static str, fn(text_editor::Action) -> Msg) -> E,
+) -> Element<'a, Msg> {
+    use reqlite_gui::draft::BodyKind as K;
+    let kind = picker(&K::ALL, doc.body_kind, Msg::BodyKind);
+    let below: Element<'_, Msg> = match doc.body_kind {
+        K::Text => editor(&doc.body, "Request body, sent as it is", Msg::Body).into(),
+        K::Json => editor(&doc.body, "{\"name\": \"value\"}", Msg::Body).into(),
+        K::Form => editor(&doc.body, "name: value, one per line", Msg::Body).into(),
+        K::Multipart => editor(
+            &doc.body,
+            "name: value\nfile: @path/to/file\nimage: @a.png;type=image/png",
+            Msg::Body,
+        )
+        .into(),
+        K::File => column![
+            field(
+                "path/to/file, from the request file's folder",
+                &doc.body_file,
+                Msg::BodyFile
+            ),
+            note("The file is read when the request is sent. Set Content-Type in Headers."),
+        ]
+        .spacing(6)
+        .into(),
+    };
+    let hint = match doc.body_kind {
+        K::Text => "",
+        K::Json => "Adds Content-Type: application/json unless Headers sets one.",
+        K::Form => "Sent URL-encoded, with its Content-Type.",
+        K::Multipart => "@ marks a file part, read when the request is sent.",
+        K::File => "",
+    };
+    column![
+        row![kind, note(hint)]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        below
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn auth_editor(doc: &Doc) -> Element<'_, Msg> {
+    use super::AuthField as F;
+    use reqlite_format::KeyIn;
+    use reqlite_gui::draft::AuthKind as K;
+    let a = &doc.auth;
+    let on = |f: F| move |v| Msg::Auth(f, v);
+    let fields: Element<'_, Msg> = match a.kind {
+        K::None => note("Add an Authorization header in Headers, or pick an auth type."),
+        K::Bearer => column![field(
+            "Token, for example {{token}}",
+            &a.token,
+            on(F::Token)
+        )]
+        .into(),
+        K::Basic => column![
+            field("Username", &a.username, on(F::Username)),
+            field(
+                "Password, for example {{password}}",
+                &a.password,
+                on(F::Password)
+            ),
+        ]
+        .spacing(6)
+        .into(),
+        K::ApiKey => {
+            let place = |k: KeyIn, name: &'static str| {
+                let active = a.key_in == k;
+                button(text(name).size(12))
+                    .padding([3, 10])
+                    .on_press(Msg::KeyIn(k))
+                    .style(move |t, s| style::tab(t, s, active))
+            };
+            column![
+                row![
+                    note("Send it in"),
+                    place(KeyIn::Header, "Header"),
+                    place(KeyIn::Query, "Query")
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                field("Name, for example X-API-Key", &a.key_name, on(F::KeyName)),
+                field(
+                    "Value, for example {{api_key}}",
+                    &a.key_value,
+                    on(F::KeyValue)
+                ),
+            ]
+            .spacing(6)
+            .into()
+        }
+    };
+    let hint = match a.kind {
+        K::None => "",
+        _ => "Use a {{secret}} so the value stays out of the file.",
+    };
+    column![
+        row![picker(&K::ALL, a.kind, Msg::AuthKind), note(hint)]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        fields
+    ]
+    .spacing(8)
+    .height(Length::Fill)
+    .into()
 }
 
 fn response_pane(doc: &Doc) -> container::Container<'_, Msg> {
@@ -526,7 +667,7 @@ fn status_bar(app: &App) -> Element<'_, Msg> {
     let right = match &app.notice {
         Some(n) => text(n).size(12).color(style::WARNING),
         None => text(format!(
-            "{MOD}↵ send · {MOD}S save · {MOD}L URL · {MOD}1–3 sections · {MOD}N new · {MOD}Y history · Ctrl+Tab next tab · Esc cancel"
+            "{MOD}↵ send · {MOD}S save · {MOD}L URL · {MOD}1–4 sections · {MOD}N new · {MOD}Y history · Ctrl+Tab next tab · Esc cancel"
         ))
         .size(12)
         .color(style::FAINT),
