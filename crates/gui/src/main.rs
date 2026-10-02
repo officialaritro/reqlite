@@ -1,22 +1,30 @@
 //! `reqlite-gui FILE [--env ENV]`: open, edit, save and send one request file.
 
 use clap::Parser;
+use iced::animation::{Animation, Easing};
 use iced::keyboard::{self, Key, key::Named};
 use iced::task::Handle;
-use iced::widget::{
-    button, column, container, mouse_area, responsive, row, text, text_editor, text_input,
-    vertical_slider,
-};
-use iced::{Element, Font, Length, Subscription, Task, event, mouse, window};
+use iced::widget::{self, text_editor};
+use iced::{Subscription, Task, event, keyboard::Modifiers, time, window};
 use reqlite_gui::chain;
 use reqlite_gui::draft::Draft;
+use reqlite_gui::present::{entries, glass_supported};
 use reqlite_viewer::Document;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+mod scrollbar;
+mod style;
+mod view;
 
 const LINE_HEIGHT: f32 = 18.0;
 const PAGE: i64 = 40;
+const URL: widget::Id = widget::Id::new("url");
+/// The window draws its own title row where the OS lets content go under the
+/// title bar.
+const TITLE_ROW: bool = cfg!(target_os = "macos");
+const METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 
 /// A desktop client for one Reqlite request file.
 #[derive(Parser, Clone)]
@@ -37,12 +45,17 @@ struct App {
     saved: Option<String>,
     name: String,
     method: String,
+    /// The picker's choices: the common methods, plus the file's own if it
+    /// uses another one.
+    methods: Vec<String>,
     url: String,
     headers: text_editor::Content,
     query: text_editor::Content,
     body: text_editor::Content,
+    tab: Tab,
     /// Derived from the fields and `saved`, refreshed after each change.
     dirty: bool,
+    counts: Counts,
     env: Option<PathBuf>,
     client: Option<reqwest::Client>,
     /// Opened by the first send. Opening it at startup would deliver a message
@@ -59,13 +72,88 @@ struct App {
     label: String,
     started: Instant,
     exit_after_first_frame: bool,
+    motion: Motion,
+}
+
+/// The few animations, and the clock they read. Frames are drawn only while
+/// one of them runs, so an idle window costs no CPU.
+struct Motion {
+    now: Instant,
+    /// The response fading in.
+    reveal: Animation<bool>,
+    /// Send turning into Cancel and back.
+    running: Animation<bool>,
+    /// When the current send started, for the pulse.
+    since: Instant,
+    /// `REQLITE_REDUCE_MOTION=1`: every change shows at once.
+    reduced: bool,
+}
+
+/// The "sending" pulse redraws at most this often.
+const PULSE: Duration = Duration::from_millis(33);
+
+impl Motion {
+    fn new(reduced: bool) -> Motion {
+        let now = Instant::now();
+        Motion {
+            now,
+            reveal: Animation::new(true),
+            running: Animation::new(false)
+                .duration(if reduced {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(200)
+                })
+                .easing(Easing::EaseOut),
+            since: now,
+            reduced,
+        }
+    }
+
+    /// Fades a new response in from nothing: 0.5 s, rising 4 px (Zeron's fade-in).
+    fn reveal(&mut self, now: Instant) {
+        let fade = Animation::new(false).easing(Easing::EaseOutExpo);
+        self.reveal = fade
+            .duration(if self.reduced {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(500)
+            })
+            .go(true, now);
+    }
+
+    fn animating(&self, at: Instant) -> bool {
+        self.reveal.is_animating(at) || self.running.is_animating(at)
+    }
 }
 
 enum Send {
     Idle,
     Running(Handle),
     Cancelled,
-    Finished(Result<String, String>),
+    Finished(Result<Summary, String>),
+}
+
+#[derive(Clone, Copy)]
+struct Summary {
+    status: u16,
+    elapsed: Duration,
+    bytes: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tab {
+    Query,
+    Headers,
+    Body,
+}
+
+/// What each tab holds, shown on the tab.
+#[derive(Default)]
+struct Counts {
+    query: usize,
+    headers: usize,
+    body: bool,
 }
 
 struct Viewer {
@@ -83,10 +171,14 @@ enum Msg {
     Send,
     Cancel,
     Sent(Box<Finished>),
+    /// A frame or pulse tick, while something moves.
+    Tick(Instant),
     Save,
     Saved(Result<String, String>),
     Scroll(i64),
     ScrollTo(f64),
+    Tab(Tab),
+    FocusUrl,
     FirstFrame,
 }
 
@@ -100,7 +192,7 @@ enum Opened {
 #[derive(Clone)]
 struct Loaded {
     doc: Arc<Document>,
-    summary: String,
+    summary: Summary,
 }
 
 #[derive(Clone)]
@@ -141,11 +233,14 @@ fn boot(args: &Args, opened: &Opened, started: Instant) -> (App, Task<Msg>) {
         saved: None,
         name,
         method: "GET".into(),
+        methods: METHODS.map(String::from).to_vec(),
         url: String::new(),
         headers: text_editor::Content::new(),
         query: text_editor::Content::new(),
         body: text_editor::Content::new(),
+        tab: Tab::Query,
         dirty: false,
+        counts: Counts::default(),
         env: args.env.clone(),
         client: None,
         history: None,
@@ -161,12 +256,16 @@ fn boot(args: &Args, opened: &Opened, started: Instant) -> (App, Task<Msg>) {
             .map_or("Untitled".to_string(), |f| f.to_string_lossy().into_owned()),
         started,
         exit_after_first_frame: std::env::var_os("REQLITE_GUI_EXIT_ON_FIRST_FRAME").is_some(),
+        motion: Motion::new(std::env::var_os("REQLITE_REDUCE_MOTION").is_some_and(|v| v != "0")),
     };
     match opened {
         Opened::Missing => {}
         Opened::Loaded(req, canonical) => {
             load(&mut app, &Draft::from_request(req));
             app.saved = Some(canonical.clone());
+            if !app.methods.contains(&app.method) {
+                app.methods.push(app.method.clone());
+            }
         }
         Opened::Failed(e) => {
             app.file = None;
@@ -181,6 +280,14 @@ fn boot(args: &Args, opened: &Opened, started: Instant) -> (App, Task<Msg>) {
         Err(e) => app.notice = Some(format!("cannot start the HTTP client: {}", chain(&e))),
     }
     refresh_dirty(&mut app);
+    // Open on the first tab that has something in it.
+    if app.counts.query == 0 {
+        if app.counts.headers > 0 {
+            app.tab = Tab::Headers;
+        } else if app.counts.body {
+            app.tab = Tab::Body;
+        }
+    }
     (app, Task::none())
 }
 
@@ -203,7 +310,15 @@ async fn blocking<T: std::marker::Send + 'static>(
 }
 
 fn update(app: &mut App, msg: Msg) -> Task<Msg> {
+    // A tick only moves the clock: no form refresh at 30 or 120 Hz.
+    if let Msg::Tick(at) = msg {
+        app.motion.now = at;
+        return Task::none();
+    }
+    let now = Instant::now();
+    app.motion.now = now;
     match msg {
+        Msg::Tick(_) => {}
         Msg::Method(m) => app.method = m,
         Msg::Url(u) => app.url = u,
         Msg::Headers(a) => app.headers.perform(a),
@@ -214,6 +329,7 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
             if let Send::Running(handle) = &app.send {
                 handle.abort();
                 app.send = Send::Cancelled;
+                app.motion.running.go_mut(false, now);
             }
         }
         Msg::Sent(done) => {
@@ -226,8 +342,10 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
                 app.history = opened;
             }
             app.notice = warning;
+            app.motion.running.go_mut(false, now);
             match result {
                 Ok(loaded) => {
+                    app.motion.reveal(now);
                     app.viewer = Some(Viewer {
                         doc: loaded.doc,
                         top: 0,
@@ -245,6 +363,13 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
         Msg::Saved(Err(e)) => app.notice = Some(e),
         Msg::Scroll(lines) => scroll(app, |top| top + lines),
         Msg::ScrollTo(v) => scroll(app, |_| v.round() as i64),
+        Msg::Tab(t) => app.tab = t,
+        Msg::FocusUrl => {
+            return Task::batch([
+                widget::operation::focus(URL),
+                widget::operation::select_all(URL),
+            ]);
+        }
         Msg::FirstFrame => {
             println!(
                 "first-frame {:.1}",
@@ -278,7 +403,13 @@ fn load(app: &mut App, d: &Draft) {
 }
 
 fn refresh_dirty(app: &mut App) {
-    app.dirty = draft(app).differs_from(app.saved.as_deref());
+    let d = draft(app);
+    app.dirty = d.differs_from(app.saved.as_deref());
+    app.counts = Counts {
+        query: entries(&d.query),
+        headers: entries(&d.headers),
+        body: !d.body.is_empty(),
+    };
 }
 
 fn start_send(app: &mut App) -> Task<Msg> {
@@ -317,6 +448,9 @@ fn start_send(app: &mut App) -> Task<Msg> {
     })
     .abortable();
     app.send = Send::Running(handle);
+    let now = Instant::now();
+    app.motion.since = now;
+    app.motion.running.go_mut(true, now);
     task
 }
 
@@ -365,12 +499,11 @@ async fn show(
     result: Result<reqlite_engine::Response, reqlite_engine::SendError>,
 ) -> Result<Loaded, String> {
     let resp = result.map_err(|e| chain(&e))?;
-    let summary = format!(
-        "{} · {} ms · {} bytes",
-        resp.status,
-        resp.elapsed.as_millis(),
-        resp.body.len()
-    );
+    let summary = Summary {
+        status: resp.status,
+        elapsed: resp.elapsed,
+        bytes: resp.body.len(),
+    };
     let doc = blocking(move || {
         let reader = resp.body.reader()?;
         Document::build(reader)
@@ -422,120 +555,37 @@ fn title(app: &App) -> String {
     format!("{}{state} - Reqlite", app.label)
 }
 
-fn view(app: &App) -> Element<'_, Msg> {
-    let running = matches!(app.send, Send::Running(_));
-    let action = if running {
-        button("Cancel").on_press(Msg::Cancel)
-    } else {
-        button("Send").on_press(Msg::Send)
-    };
-    let save =
-        button("Save").on_press_maybe((app.dirty && app.file.is_some()).then_some(Msg::Save));
-    let top = row![
-        text_input("GET", &app.method)
-            .on_input(Msg::Method)
-            .width(90),
-        text_input("https://", &app.url)
-            .on_input(Msg::Url)
-            .on_submit(Msg::Send),
-        action,
-        save,
-    ]
-    .spacing(8);
-
-    let editor = |label: &'static str, content: &'static str, value, on: fn(_) -> Msg, height| {
-        column![
-            text(label).size(12),
-            text_editor(value)
-                .placeholder(content)
-                .key_binding(editor_keys)
-                .on_action(on)
-                .font(Font::MONOSPACE)
-                .height(height),
-        ]
-        .spacing(4)
-    };
-    let fields = row![
-        editor("Headers", "Name: value", &app.headers, Msg::Headers, 110),
-        editor("Query", "name: value", &app.query, Msg::Query, 110),
-    ]
-    .spacing(8);
-    let body = editor("Body", "", &app.body, Msg::Body, 140);
-
-    let status = match &app.send {
-        Send::Idle => String::new(),
-        Send::Running(_) => "sending...".into(),
-        Send::Cancelled => "cancelled".into(),
-        Send::Finished(Ok(s)) => s.clone(),
-        Send::Finished(Err(e)) => format!("error: {e}"),
-    };
-    let mut page = column![top, fields, body, text(status).font(Font::MONOSPACE)].spacing(8);
-    if let Some(e) = &app.open_error {
-        page = page.push(text(e).size(12).font(Font::MONOSPACE).style(text::danger));
+impl App {
+    /// The response to show: hidden after a failed send, so an old body never
+    /// sits under a new error.
+    fn shown(&self) -> Option<&Viewer> {
+        match self.send {
+            Send::Finished(Err(_)) => None,
+            _ => self.viewer.as_ref(),
+        }
     }
-    if let Some(notice) = &app.notice {
-        page = page.push(text(notice).size(12));
-    }
-    page.push(viewer(app.viewer.as_ref())).padding(12).into()
 }
 
-fn viewer(v: Option<&Viewer>) -> Element<'_, Msg> {
-    let Some(v) = v else {
-        return container(text("No response yet").size(12))
-            .height(Length::Fill)
-            .into();
-    };
-    let doc = v.doc.clone();
-    let top = v.top;
-    let lines = responsive(move |size| {
-        let count = (size.height / LINE_HEIGHT).floor() as usize;
-        let lines = doc
-            .lines(top, count)
-            .unwrap_or_else(|e| vec![format!("cannot read the response: {e}")]);
-        let col = column(lines.into_iter().map(|l| {
-            text(l)
-                .font(Font::MONOSPACE)
-                .size(13)
-                .line_height(iced::Pixels(LINE_HEIGHT))
-                .wrapping(text::Wrapping::None)
-                .into()
-        }));
-        container(col)
-            .clip(true)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    });
-    let max = v.doc.line_count().saturating_sub(1) as f64;
-    column![
-        text(format!("line {} of {}", v.top + 1, v.doc.line_count())).size(12),
-        row![
-            mouse_area(lines).on_scroll(|delta| Msg::Scroll(match delta {
-                mouse::ScrollDelta::Lines { y, .. } => (-y * 3.0).round() as i64,
-                mouse::ScrollDelta::Pixels { y, .. } => (-y / LINE_HEIGHT).round() as i64,
-            })),
-            // The slider's value grows upwards, so it shows the distance from the end.
-            vertical_slider(0.0..=max.max(1.0), max - v.top as f64, move |x| {
-                Msg::ScrollTo(max - x)
-            })
-            .step(1.0),
-        ]
-        .height(Length::Fill),
-    ]
-    .spacing(4)
-    .height(Length::Fill)
-    .into()
+/// The app's Cmd (Ctrl) shortcuts. They work wherever the focus is.
+fn shortcut(key: &Key, modifiers: Modifiers) -> Option<Msg> {
+    if !modifiers.command() {
+        return None;
+    }
+    match key.as_ref() {
+        Key::Character("s") => Some(Msg::Save),
+        Key::Named(Named::Enter) => Some(Msg::Send),
+        Key::Character("l") => Some(Msg::FocusUrl),
+        Key::Character("1") => Some(Msg::Tab(Tab::Query)),
+        Key::Character("2") => Some(Msg::Tab(Tab::Headers)),
+        Key::Character("3") => Some(Msg::Tab(Tab::Body)),
+        _ => None,
+    }
 }
 
 /// The editors' default bindings, minus the app's own shortcuts. Without this,
 /// Cmd+S also types an "s" and Cmd+Enter a new line into the focused editor.
 fn editor_keys(press: text_editor::KeyPress) -> Option<text_editor::Binding<Msg>> {
-    let app_shortcut = press.modifiers.command()
-        && matches!(
-            press.key.as_ref(),
-            Key::Character("s") | Key::Named(Named::Enter)
-        );
-    if app_shortcut {
+    if shortcut(&press.key, press.modifiers).is_some() {
         None
     } else {
         text_editor::Binding::from_key_press(press)
@@ -546,9 +596,10 @@ fn keys(event: iced::Event, status: event::Status, _: window::Id) -> Option<Msg>
     let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else {
         return None;
     };
+    if let Some(msg) = shortcut(&key, modifiers) {
+        return Some(msg);
+    }
     match key.as_ref() {
-        Key::Character("s") if modifiers.command() => Some(Msg::Save),
-        Key::Named(Named::Enter) if modifiers.command() => Some(Msg::Send),
         Key::Named(Named::Escape) => Some(Msg::Cancel),
         _ if status == event::Status::Captured => None,
         Key::Named(Named::PageDown) => Some(Msg::Scroll(PAGE)),
@@ -561,21 +612,58 @@ fn keys(event: iced::Event, status: event::Status, _: window::Id) -> Option<Msg>
 
 fn subscription(app: &App) -> Subscription<Msg> {
     let mut subs = vec![event::listen_with(keys)];
-    // Only the cold start check listens to frames. A frame subscription makes
-    // iced redraw back to back, which costs a third drawable (issue #1).
+    // A frame subscription makes iced redraw back to back, which costs a third
+    // drawable (issue #1). So it runs only for the cold start check and while
+    // an animation moves.
     if app.exit_after_first_frame {
         subs.push(window::frames().map(|_| Msg::FirstFrame));
+    } else if app.motion.animating(Instant::now()) {
+        subs.push(window::frames().map(Msg::Tick));
+    } else if matches!(app.send, Send::Running(_)) && !app.motion.reduced {
+        subs.push(time::every(PULSE).map(Msg::Tick));
     }
     Subscription::batch(subs)
+}
+
+/// Glass where the OS blurs a transparent window. `REQLITE_GLASS=0` turns it off.
+fn glass() -> bool {
+    std::env::var_os("REQLITE_GLASS").is_none_or(|v| v != "0")
+        && glass_supported(
+            std::env::consts::OS,
+            std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        )
 }
 
 fn main() -> iced::Result {
     let started = Instant::now();
     let args = Args::parse();
     let opened = open(args.file.as_deref());
-    iced::application(move || boot(&args, &opened, started), update, view)
+    let glass = glass();
+    let mut app = iced::application(move || boot(&args, &opened, started), update, view::view)
         .title(title)
         .subscription(subscription)
-        .window_size((1000.0, 800.0))
-        .run()
+        .theme(style::theme())
+        .style(move |_, _| style::window(glass))
+        .default_font(style::SANS)
+        .window(window::Settings {
+            size: iced::Size::new(1000.0, 800.0),
+            min_size: Some(iced::Size::new(560.0, 420.0)),
+            transparent: glass,
+            blur: glass,
+            #[cfg(target_os = "macos")]
+            platform_specific: window::settings::PlatformSpecific {
+                title_hidden: true,
+                titlebar_transparent: true,
+                fullsize_content_view: true,
+            },
+            ..window::Settings::default()
+        });
+    for face in style::FONTS {
+        app = app.font(face);
+    }
+    app.run()
 }
+
+#[cfg(test)]
+mod tests;

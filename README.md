@@ -21,14 +21,25 @@ reqlite-gui users.toml --env envs/dev.toml
 
 `reqlite-gui` opens one request file per window. If the file does not exist yet, the first save creates it.
 
+The request is on the left and the response is on the right. Below 900 px of width, the response moves under the request. The request has three tabs, Query, Headers and Body, and each tab shows how many entries it holds. The response shows the status, the time, the size and the body with line numbers. JSON bodies are coloured.
+
 | Action | How |
 |---|---|
 | Send | Cmd+Enter or Ctrl+Enter, the Send button, or Enter in the URL field |
 | Cancel a send | Escape, or the Cancel button |
 | Save | Cmd+S or Ctrl+S, or the Save button. Enabled only when the form differs from the file. |
-| Scroll the response | Mouse wheel, the slider, Page Up, Page Down, Home, End |
+| Go to the URL | Cmd+L or Ctrl+L |
+| Switch tabs | Cmd+1, 2, 3 or Ctrl+1, 2, 3 for Query, Headers, Body |
+| Scroll the response | Mouse wheel, the scrollbar, Page Up, Page Down, Home, End |
 
-Headers and query parameters are written one per line as `name: value`, and a name may repeat. The title shows `*` while there are unsaved changes. If a file cannot be read, the window shows the error and never saves over that file. Each send is saved to history, the same way as `reqlite send`.
+Headers and query parameters are written one per line as `name: value`, and a name may repeat. The title shows `*` while there are unsaved changes; on macOS, a dot next to the file name shows it too. If a file cannot be read, the window shows the error and never saves over that file. Each send is saved to history, the same way as `reqlite send`.
+
+The window is see-through over a blurred desktop where the OS can blur it: on macOS, and on KDE under Wayland. Elsewhere it is opaque. Two environment variables change the look:
+
+| Variable | Effect |
+|---|---|
+| `REQLITE_GLASS=0` | An opaque window everywhere |
+| `REQLITE_REDUCE_MOTION=1` | No animations: every change shows at once |
 
 A request is one TOML file:
 
@@ -146,13 +157,14 @@ Design rules:
 
 | Metric | Budget | Now (macOS, M4) | Checked in CI |
 |---|---|---|---|
-| GUI idle footprint, 1000×800 window on a 2× display | under 60 MB | 57 MB | locally (`scripts/gui_idle.py`); CI runners have no 2× display |
-| GUI idle footprint minus window frame buffers, any display | under 35 MB | 32 MB | yes, macOS |
-| Binary | under 25 MB | CLI 3.7 MB, GUI 7.3 MB | yes |
-| Cold start | under 300 ms | CLI 6 ms, GUI first frame 102 ms | CLI yes; GUI locally, because CI runners have no real GPU |
-| Peak RAM while opening a 50 MB JSON response | under 50 MB | viewer 1.6 to 2.3 MB, CLI send 7.3 MB | yes |
+| GUI idle footprint, 1000×800 window on a 2× display | under 60 MB | 58 MB | locally (`scripts/gui_idle.py`); CI runners have no 2× display |
+| GUI idle footprint minus window frame buffers, any display | under 35 MB | 33 MB | yes, macOS |
+| GUI idle CPU, over 5 s | under 0.05 s | 0.00 s | locally; CI prints it, because CI runners have no real GPU |
+| Binary | under 25 MB | CLI 3.7 MB, GUI 8.2 MB | yes |
+| Cold start | under 300 ms | CLI 3 ms, GUI first frame 97 ms | CLI yes; GUI locally, because CI runners have no real GPU |
+| Peak RAM while opening a 50 MB JSON response | under 50 MB | viewer 1.8 to 2.5 MB, CLI send 9.3 MB | yes |
 
-The GUI rows use the physical footprint, which Activity Monitor shows as "Memory". The window's frame buffers grow with the window size and the display scale, so the first GUI row fixes both. The second row counts only the memory Reqlite controls. See [issue #1](https://github.com/officialaritro/reqlite/issues/1) for the measurements behind these numbers. `scripts/gui_idle.py target/release/reqlite-gui` checks both, plus the GUI cold start, on macOS. CI runs it on macOS. CI runners are virtual machines with a 1× display and no real GPU, so there it checks only the memory Reqlite controls and prints the other two numbers.
+The GUI rows use the physical footprint, which Activity Monitor shows as "Memory". The window's frame buffers grow with the window size and the display scale, so the first GUI row fixes both. The second row counts only the memory Reqlite controls. See [issue #1](https://github.com/officialaritro/reqlite/issues/1) for the measurements behind these numbers. `scripts/gui_idle.py target/release/reqlite-gui` checks both, plus idle CPU and the GUI cold start, on macOS. CI runs it on macOS. CI runners are virtual machines with a 1× display and no real GPU, so there it checks only the memory Reqlite controls and prints the other two numbers.
 
 `scripts/budgets.py` runs the other checks on Linux and macOS in CI and fails the build on a miss. It also checks that each crate depends only on the crates below it. To run it yourself:
 

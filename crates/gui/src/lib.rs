@@ -1,6 +1,7 @@
 //! The logic behind `reqlite-gui` that needs no window.
 
 pub mod draft;
+pub mod present;
 
 /// An error and every cause under it, on one line.
 pub fn chain(err: &dyn std::error::Error) -> String {
