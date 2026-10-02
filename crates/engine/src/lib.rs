@@ -1,7 +1,7 @@
 //! Resolves and sends requests. No UI knowledge lives here.
 
+use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 mod resolve;
@@ -20,17 +20,15 @@ pub struct Response {
 }
 
 /// A response body, held once: in memory when small, in a temp file when large.
-/// The temp file is deleted when the body is dropped.
+/// The temp file has no name on disk, so the OS frees it when the body is
+/// dropped or the process dies, even on a crash.
 #[derive(Debug)]
 pub struct Body(Store);
 
 #[derive(Debug)]
 enum Store {
     Memory(Vec<u8>),
-    File {
-        file: tempfile::NamedTempFile,
-        len: u64,
-    },
+    File { file: File, len: u64 },
 }
 
 impl Body {
@@ -45,19 +43,28 @@ impl Body {
         self.len() == 0
     }
 
-    /// The temp file holding a large body, for readers that map or seek it.
-    pub fn path(&self) -> Option<&Path> {
-        match &self.0 {
-            Store::Memory(_) => None,
-            Store::File { file, .. } => Some(file.path()),
-        }
-    }
-
     pub fn reader(&self) -> io::Result<Box<dyn Read + '_>> {
         Ok(match &self.0 {
             Store::Memory(b) => Box::new(b.as_slice()),
-            Store::File { file, .. } => Box::new(io::BufReader::new(file.reopen()?)),
+            Store::File { file, .. } => Box::new(io::BufReader::new(ReadAt { file, pos: 0 })),
         })
+    }
+}
+
+/// Reads from its own position, so readers of one file never move each other.
+struct ReadAt<'a> {
+    file: &'a File,
+    pos: u64,
+}
+
+impl Read for ReadAt<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(self.file, buf, self.pos)?;
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(self.file, buf, self.pos)?;
+        self.pos += n as u64;
+        Ok(n)
     }
 }
 
@@ -152,7 +159,7 @@ fn append(store: Store, chunk: &[u8]) -> io::Result<Store> {
             Ok(Store::Memory(buf))
         }
         Store::Memory(buf) => {
-            let mut file = tempfile::NamedTempFile::new()?;
+            let mut file = tempfile::tempfile()?;
             file.write_all(&buf)?;
             file.write_all(chunk)?;
             let len = (buf.len() + chunk.len()) as u64;
@@ -223,20 +230,26 @@ mod tests {
         let resp = send_plain(&request(&url)).await.unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(read_all(&resp.body), b"ok");
-        assert_eq!(resp.body.path(), None);
     }
 
     #[tokio::test]
-    async fn large_body_spills_to_a_temp_file_that_is_removed_on_drop() {
+    async fn large_body_reads_back_whole_from_two_readers_at_once() {
         let big: Vec<u8> = (0..5 * SPILL_AT).map(|i| (i % 251) as u8).collect();
         let (url, _srv) = serve_once(ok_with(&big)).await;
         let resp = send_plain(&request(&url)).await.unwrap();
-        let path = resp.body.path().unwrap().to_path_buf();
         assert_eq!(resp.body.len(), big.len() as u64);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), big.len() as u64);
-        assert!(read_all(&resp.body) == big, "body bytes differ");
-        drop(resp);
-        assert!(!path.exists());
+        let mut a = resp.body.reader().unwrap();
+        let mut b = resp.body.reader().unwrap();
+        let mut head = [0u8; 1000];
+        a.read_exact(&mut head).unwrap();
+        assert!(
+            read_all(&resp.body) == big,
+            "second reader saw different bytes"
+        );
+        let mut rest = Vec::new();
+        b.read_to_end(&mut rest).unwrap();
+        assert!(rest == big, "readers moved each other");
+        assert_eq!(head, big[..1000]);
     }
 
     #[tokio::test]

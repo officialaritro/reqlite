@@ -17,7 +17,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         doc.is_pretty(),
         built.as_millis(),
         window.elapsed().as_millis(),
-        lines.first().map(|l| l.chars().take(40).collect::<String>())
+        lines
+            .first()
+            .map(|l| l.chars().take(40).collect::<String>())
     );
     Ok(())
 }

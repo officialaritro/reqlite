@@ -5,7 +5,8 @@
 //! for the lines on screen with [`Document::lines`]. Memory stays flat: about
 //! 8 bytes per 64 lines, whatever the body size. The body is never held whole.
 
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
 /// Lines longer than this are split for display, so one huge line (minified
 /// text, a long JSON string) cannot stall rendering.
@@ -18,7 +19,8 @@ const CHECKPOINT_EVERY: usize = 64;
 const MAX_INDENT: usize = 64;
 
 pub struct Document {
-    file: tempfile::NamedTempFile,
+    /// Has no name on disk, so the OS frees it even if the process is killed.
+    file: File,
     /// Byte offset of line 0, 64, 128, ...
     checkpoints: Vec<u64>,
     line_count: usize,
@@ -29,8 +31,8 @@ impl Document {
     /// Reads `body` to the end. JSON (a body starting with `{` or `[`) is
     /// pretty-printed. Anything else is kept byte for byte.
     pub fn build(body: impl Read) -> io::Result<Document> {
-        let file = tempfile::NamedTempFile::new()?;
-        let mut out = Indexer::new(BufWriter::new(file.reopen()?));
+        let file = tempfile::tempfile()?;
+        let mut out = Indexer::new(BufWriter::new(&file));
         let mut input = BufReader::with_capacity(1 << 16, body);
 
         let mut lead = Vec::new();
@@ -77,9 +79,10 @@ impl Document {
             return Ok(Vec::new());
         }
         let checkpoint = start / CHECKPOINT_EVERY;
-        let mut file = self.file.reopen()?;
-        file.seek(SeekFrom::Start(self.checkpoints[checkpoint]))?;
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::new(ReadAt {
+            file: &self.file,
+            pos: self.checkpoints[checkpoint],
+        });
         let mut line = Vec::new();
         let mut out = Vec::with_capacity(end - start);
         for n in checkpoint * CHECKPOINT_EVERY..end {
@@ -90,6 +93,24 @@ impl Document {
             }
         }
         Ok(out)
+    }
+}
+
+/// Reads from its own position, so concurrent [`Document::lines`] calls never
+/// move each other.
+struct ReadAt<'a> {
+    file: &'a File,
+    pos: u64,
+}
+
+impl Read for ReadAt<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(self.file, buf, self.pos)?;
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(self.file, buf, self.pos)?;
+        self.pos += n as u64;
+        Ok(n)
     }
 }
 
@@ -292,7 +313,12 @@ mod tests {
         assert!(!doc.is_pretty());
         assert_eq!(all_lines(&doc), ["  hello", "world", "", "end"]);
         let mut raw = Vec::new();
-        doc.file.reopen().unwrap().read_to_end(&mut raw).unwrap();
+        ReadAt {
+            file: &doc.file,
+            pos: 0,
+        }
+        .read_to_end(&mut raw)
+        .unwrap();
         assert_eq!(raw, b"  hello\r\nworld\n\nend");
     }
 
