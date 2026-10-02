@@ -6,8 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
 reqlite-engine = { version = "0.0.1", path = "../engine" }
 reqlite-format = { version = "0.0.1", path = "../format" }
+thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt"] }
 
 [lints]

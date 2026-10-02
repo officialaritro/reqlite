@@ -145,7 +145,7 @@ impl<'de> Deserialize<'de> for OneOrMany {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
-    #[error("invalid request file: {0}")]
+    #[error("invalid request file")]
     Toml(#[from] toml::de::Error),
     #[error("unsupported request file version {found}, this build reads version {VERSION}")]
     UnsupportedVersion { found: u32 },
@@ -187,9 +187,9 @@ pub fn to_string(req: &Request) -> Result<String, toml::ser::Error> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SaveError {
-    #[error("cannot serialize request: {0}")]
+    #[error("cannot serialize request")]
     Serialize(#[from] toml::ser::Error),
-    #[error("cannot save {path}: {source}")]
+    #[error("cannot save {path}")]
     Io {
         path: PathBuf,
         #[source]
@@ -287,8 +287,12 @@ tag = ["a", "b"]
             ),
         ];
         for (text, reason) in cases {
-            let err = parse(&text).unwrap_err().to_string();
-            assert!(err.contains(reason), "{text:?} gave {err:?}");
+            let err = parse(&text).unwrap_err();
+            let mut msg = err.to_string();
+            if let Some(source) = std::error::Error::source(&err) {
+                msg = format!("{msg}: {source}");
+            }
+            assert!(msg.contains(reason), "{text:?} gave {msg:?}");
         }
     }
 

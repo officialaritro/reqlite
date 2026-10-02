@@ -1,37 +1,123 @@
+use clap::{Parser, Subcommand};
+use std::error::Error;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: reqlite send <request.toml>";
+/// A lean, local-first API client.
+#[derive(Parser)]
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Send one request file and print the response body to stdout.
+    Send {
+        file: PathBuf,
+        /// Environment file that fills `{{var}}` placeholders. A `.local.toml`
+        /// file next to it supplies secrets.
+        #[arg(long, short)]
+        env: Option<PathBuf>,
+    },
+}
+
+/// What failed decides the exit code.
+enum Failure {
+    /// A file is unreadable or invalid, or a placeholder cannot be filled. Exit 3.
+    Input(Box<dyn Error>),
+    /// The request did not complete. Exit 1.
+    Send(reqlite_engine::SendError),
+    /// Writing the response out failed. Exit 1.
+    Output(std::io::Error),
+}
+
+impl Failure {
+    fn input(e: impl Error + 'static) -> Self {
+        Failure::Input(Box::new(e))
+    }
+}
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let [cmd, path] = args.as_slice() else {
-        eprintln!("{USAGE}");
-        return ExitCode::from(2);
+    let cli = Cli::parse();
+    let result = match cli.command {
+        Command::Send { file, env } => send(&file, env.as_deref()),
     };
-    if cmd != "send" {
-        eprintln!("unknown command {cmd:?}\n{USAGE}");
-        return ExitCode::from(2);
-    }
-    match run(path) {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
+        Err(failure) => {
+            let (code, err): (u8, &dyn Error) = match &failure {
+                Failure::Input(e) => (3, e.as_ref()),
+                Failure::Send(e) => (1, e),
+                Failure::Output(e) => (1, e),
+            };
+            report(err);
+            ExitCode::from(code)
         }
     }
 }
 
-fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let req = reqlite_format::parse(&text)?;
-    let req = reqlite_engine::resolve(&req, &reqlite_format::Environment::default())?;
+fn report(err: &dyn Error) {
+    let mut line = format!("error: {err}");
+    let mut cause = err.source();
+    while let Some(c) = cause {
+        line.push_str(&format!(": {c}"));
+        cause = c.source();
+    }
+    eprintln!("{line}");
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("cannot read {path}")]
+struct ReadError {
+    path: PathBuf,
+    #[source]
+    source: std::io::Error,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{path}")]
+struct InFile<E: Error + 'static> {
+    path: PathBuf,
+    #[source]
+    source: E,
+}
+
+fn send(file: &Path, env: Option<&Path>) -> Result<(), Failure> {
+    let text = std::fs::read_to_string(file).map_err(|source| {
+        Failure::input(ReadError {
+            path: file.to_path_buf(),
+            source,
+        })
+    })?;
+    let req = reqlite_format::parse(&text).map_err(|source| {
+        Failure::input(InFile {
+            path: file.to_path_buf(),
+            source,
+        })
+    })?;
+    let env = match env {
+        Some(path) => reqlite_format::load_env(path).map_err(Failure::input)?,
+        None => reqlite_format::Environment::default(),
+    };
+    let req = reqlite_engine::resolve(&req, &env).map_err(|source| {
+        Failure::input(InFile {
+            path: file.to_path_buf(),
+            source,
+        })
+    })?;
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?;
+        .build()
+        .map_err(Failure::Output)?;
     let resp = rt.block_on(async {
-        let client = reqlite_engine::client()?;
-        Ok::<_, Box<dyn std::error::Error>>(reqlite_engine::send(&client, &req).await?)
-    })?;
+        let client = reqlite_engine::client().map_err(reqlite_engine::SendError::from)?;
+        reqlite_engine::send(&client, &req).await
+    });
+    let resp = resp.map_err(Failure::Send)?;
 
     eprintln!(
         "{} · {} ms · {} bytes",
@@ -42,6 +128,8 @@ fn run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     for (k, v) in &resp.headers {
         eprintln!("{k}: {}", String::from_utf8_lossy(v));
     }
-    std::io::copy(&mut resp.body.reader()?, &mut std::io::stdout().lock())?;
-    Ok(())
+    let mut out = std::io::stdout().lock();
+    let mut body = resp.body.reader().map_err(Failure::Output)?;
+    std::io::copy(&mut body, &mut out).map_err(Failure::Output)?;
+    out.flush().map_err(Failure::Output)
 }

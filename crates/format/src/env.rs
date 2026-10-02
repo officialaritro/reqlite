@@ -46,13 +46,13 @@ impl Environment {
 
 #[derive(Debug, thiserror::Error)]
 pub enum EnvError {
-    #[error("cannot read environment {path}: {source}")]
+    #[error("cannot read environment {path}")]
     Read {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("invalid environment {path}: {source}")]
+    #[error("invalid environment {path}")]
     Toml {
         path: PathBuf,
         #[source]
