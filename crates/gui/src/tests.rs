@@ -112,8 +112,8 @@ fn a_file_that_cannot_be_read_shows_why_and_never_saves() {
     let mut a = app(Some("version = 1\nnot toml at all"));
     assert!(a.file.is_none());
     drop(update(&mut a, Msg::Url("http://other/".into())));
+    assert!(title(&a).contains("(cannot save)"), "{}", title(&a));
     let mut ui = simulator(view::view(&a));
-    assert!(ui.find("cannot save").is_ok());
     ui.click("Save").unwrap();
     assert!(ui.into_messages().next().is_none());
 }
