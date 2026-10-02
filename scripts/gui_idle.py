@@ -141,7 +141,9 @@ def main() -> None:
     footprint = statistics.median(f for f, _, _ in runs)
     own = statistics.median(f - d for f, d, _ in runs)
     drawables = statistics.median(d for _, d, _ in runs)
-    idle_cpu = max(c for _, _, c in runs)
+    # The median, like the other figures: a redraw loop shows in every run, while
+    # the first launch of a fresh binary can do one-off work.
+    idle_cpu = statistics.median(c for _, _, c in runs)
     print(f"display scale {scale:g}, {args.runs} runs, medians")
     print(f"     drawables (window frame buffers): {drawables / MB:.1f} MB")
 
@@ -167,8 +169,8 @@ def main() -> None:
     cpu_budget = 0.05 * SCALE
     ok = idle_cpu <= cpu_budget
     print(
-        f"{'ok  ' if ok else 'MISS'} idle CPU: {idle_cpu:.2f} s over {IDLE_SAMPLE:g} s, "
-        f"worst run (budget {cpu_budget:.2f} s)"
+        f"{'ok  ' if ok else 'MISS'} idle CPU: {idle_cpu:.2f} s over {IDLE_SAMPLE:g} s "
+        f"(budget {cpu_budget:.2f} s)"
     )
     if not ok:
         failures.append("idle CPU")
