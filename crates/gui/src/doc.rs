@@ -155,14 +155,18 @@ impl Doc {
 
     /// Replaces the form with `req`, read from disk as `canonical`.
     pub fn load(&mut self, req: &reqlite_format::Request, canonical: &str) {
-        let d = Draft::from_request(req);
-        self.name = d.name;
-        self.method = d.method;
-        self.url = d.url;
+        self.saved = Some(canonical.to_string());
+        self.fill(&Draft::from_request(req));
+    }
+
+    /// Replaces the form with `d`, as typed. The file and `saved` stay.
+    pub fn fill(&mut self, d: &Draft) {
+        self.name.clone_from(&d.name);
+        self.method.clone_from(&d.method);
+        self.url.clone_from(&d.url);
         self.headers = text_editor::Content::with_text(&d.headers);
         self.query = text_editor::Content::with_text(&d.query);
         self.body = text_editor::Content::with_text(&d.body);
-        self.saved = Some(canonical.to_string());
         if !self.methods.contains(&self.method) {
             self.methods.push(self.method.clone());
         }

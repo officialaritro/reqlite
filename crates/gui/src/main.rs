@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod doc;
+mod history;
 mod motion;
 mod scrollbar;
 mod sidebar;
@@ -46,6 +47,9 @@ struct App {
     /// The folder of request files. `None` when the app was started with no path.
     workspace: Option<Workspace>,
     sidebar: Sidebar,
+    /// What the left panel shows.
+    panel: Panel,
+    history_view: history::History,
     /// The open tabs, left to right. It can be empty.
     docs: Vec<Doc>,
     /// The index of the shown tab in `docs`.
@@ -97,6 +101,9 @@ enum Msg {
     Discard(bool),
     /// The environment for the next sends.
     PickEnv(Env),
+    /// Show this in the left panel. Choosing the shown one hides the panel.
+    Panel(Panel),
+    History(history::HistMsg),
     Side(SideMsg),
     /// Cmd+W: close the shown tab.
     CloseActive,
@@ -105,6 +112,12 @@ enum Msg {
     /// Cmd+N: a new request in the sidebar, or a new untitled tab.
     New,
     FirstFrame,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Panel {
+    Files,
+    History,
 }
 
 /// A choice in the environment picker: a file, or no environment.
@@ -159,6 +172,8 @@ fn boot(args: &Args, start: &Start, started: Instant) -> (App, Task<Msg>) {
     let mut app = App {
         workspace: None,
         sidebar: Sidebar::default(),
+        panel: Panel::Files,
+        history_view: history::History::default(),
         docs: Vec::new(),
         active: 0,
         next_id: 0,
@@ -226,6 +241,17 @@ impl App {
         choices
     }
 
+    /// What the left panel shows, if anything. Files need a workspace.
+    fn left_panel(&self) -> Option<Panel> {
+        if self.sidebar.hidden {
+            return None;
+        }
+        match self.panel {
+            Panel::Files if self.workspace.is_none() => None,
+            p => Some(p),
+        }
+    }
+
     fn by_id(&mut self, id: DocId) -> Option<&mut Doc> {
         self.docs.iter_mut().find(|d| d.id == id)
     }
@@ -288,6 +314,7 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
                 app.history = opened;
             }
             app.notice = warning;
+            let refresh = app.left_panel() == Some(Panel::History);
             if let Some(doc) = app.by_id(id) {
                 doc.motion.running.go_mut(false, now);
                 match result {
@@ -301,6 +328,9 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
                     }
                     Err(e) => doc.send = Send::Finished(Err(e)),
                 }
+            }
+            if refresh {
+                return history::refresh(app);
             }
         }
         Msg::Saved(id, result) => match result {
@@ -389,6 +419,18 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
         },
         Msg::Side(m) => return sidebar::update(app, m),
         Msg::PickEnv(Env(path)) => app.env = path,
+        Msg::Panel(p) => {
+            if app.left_panel() == Some(p) {
+                app.sidebar.hidden = true;
+            } else {
+                app.panel = p;
+                app.sidebar.hidden = false;
+                if p == Panel::History {
+                    return history::refresh(app);
+                }
+            }
+        }
+        Msg::History(m) => return history::update(app, m),
         Msg::New => match &app.workspace {
             Some(w) => {
                 let dir = app
@@ -602,6 +644,7 @@ fn shortcut(key: &Key, modifiers: Modifiers) -> Option<Msg> {
         Key::Character("n") => Some(Msg::New),
         Key::Character("w") => Some(Msg::CloseActive),
         Key::Character("b") => Some(Msg::Side(SideMsg::ToggleHidden)),
+        Key::Character("y") => Some(Msg::Panel(Panel::History)),
         _ => None,
     }
 }

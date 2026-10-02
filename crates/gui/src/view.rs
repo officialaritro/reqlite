@@ -40,12 +40,37 @@ pub fn view(app: &App) -> Element<'_, Msg> {
         outer = outer.push(title_row(app.doc()));
     }
     let main = column![main(app), status_bar(app)].spacing(10);
-    match &app.workspace {
-        Some(w) if !app.sidebar.hidden => outer
-            .push(row![crate::sidebar::view(app, w), main].spacing(10))
-            .into(),
-        _ => outer.push(main).into(),
+    let left: Option<Element<'_, Msg>> = match (app.left_panel(), &app.workspace) {
+        (Some(super::Panel::Files), Some(w)) => Some(crate::sidebar::view(app, w)),
+        (Some(super::Panel::History), _) => Some(crate::history::view(app)),
+        _ => None,
+    };
+    match left {
+        Some(left) => {
+            let side = column![panel_switch(app), left].spacing(6);
+            outer.push(row![side, main].spacing(10)).into()
+        }
+        None => outer.push(main).into(),
     }
+}
+
+/// Files and History, above the left panel.
+fn panel_switch(app: &App) -> Element<'_, Msg> {
+    let choice = |p: super::Panel, name: &'static str| {
+        let active = app.panel == p;
+        button(text(name).size(12))
+            .padding([3, 10])
+            .on_press(Msg::Panel(p))
+            .style(move |t, s| style::tab(t, s, active))
+    };
+    let mut r = row![].spacing(4);
+    if app.workspace.is_some() {
+        r = r.push(choice(super::Panel::Files, "Files"));
+    }
+    r.push(choice(super::Panel::History, "History"))
+        .push(Space::new().width(Length::Fill))
+        .width(crate::sidebar::WIDTH)
+        .into()
 }
 
 /// Everything right of the sidebar, above the status bar.
@@ -502,7 +527,7 @@ fn status_bar(app: &App) -> Element<'_, Msg> {
     bar.push(Space::new().width(Length::Fill))
         .push(
             text(format!(
-                "{MOD}↵ send · {MOD}S save · {MOD}L URL · {MOD}1–3 sections · {MOD}N new · Ctrl+Tab next tab · Esc cancel"
+                "{MOD}↵ send · {MOD}S save · {MOD}L URL · {MOD}1–3 sections · {MOD}N new · {MOD}Y history · Ctrl+Tab next tab · Esc cancel"
             ))
             .size(12)
             .color(style::FAINT),

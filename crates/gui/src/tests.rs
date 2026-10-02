@@ -573,3 +573,129 @@ fn an_env_from_outside_the_workspace_stays_a_choice() {
     a.env = Some(outside.clone());
     assert_eq!(a.env_choices(), [Env(None), Env(Some(outside))]);
 }
+
+fn sent(url: &str, outcome: reqlite_store::Outcome) -> reqlite_store::Entry {
+    reqlite_store::Entry {
+        file: Some("users/list.toml".into()),
+        env: None,
+        request: reqlite_store::SentRequest {
+            method: "POST".into(),
+            url: url.into(),
+            headers: vec![("Authorization".into(), "Bearer {{token}}".into())],
+            query: vec![("tag".into(), "a".into()), ("tag".into(), "b".into())],
+            body: Some("{\"name\": \"ada\"}".into()),
+        },
+        outcome,
+    }
+}
+
+fn hist(a: &mut App, m: history::HistMsg) {
+    drop(update(a, Msg::History(m)));
+}
+
+#[test]
+fn a_history_entry_opens_in_a_new_tab_that_cannot_overwrite_a_file() {
+    let (_dir, mut a) = workspace();
+    let entry = sent(
+        "http://api/users?x=1",
+        reqlite_store::Outcome::Response {
+            status: 201,
+            headers: vec![],
+            body: b"{\"id\": 7}".to_vec(),
+            body_len: 9,
+            elapsed_ms: 40,
+        },
+    );
+    hist(&mut a, history::HistMsg::Fetched(Ok(Some(entry))));
+    assert_eq!(a.docs.len(), 1);
+    let d = active(&mut a);
+    assert_eq!(d.label, "POST /users");
+    assert_eq!(
+        (d.method.as_str(), d.url.as_str()),
+        ("POST", "http://api/users?x=1")
+    );
+    assert_eq!(d.headers.text(), "Authorization: Bearer {{token}}\n");
+    assert_eq!(d.query.text(), "tag: a\ntag: b\n");
+    assert_eq!(d.body.text(), "{\"name\": \"ada\"}");
+    assert!(d.file.is_none(), "no file, so Save cannot write over one");
+    assert!(matches!(
+        d.send,
+        Send::Finished(Ok(Summary { status: 201, .. }))
+    ));
+    assert_eq!(
+        d.viewer.as_ref().unwrap().doc.lines(0, 5).unwrap(),
+        ["{", "  \"id\": 7", "}"]
+    );
+    assert!(a.notice.is_none());
+}
+
+#[test]
+fn a_restored_failure_and_a_cut_body_say_so() {
+    let (_dir, mut a) = workspace();
+    let failed = sent(
+        "http://down/",
+        reqlite_store::Outcome::Failed {
+            error: "cannot connect".into(),
+        },
+    );
+    hist(&mut a, history::HistMsg::Fetched(Ok(Some(failed))));
+    assert!(matches!(&active(&mut a).send, Send::Finished(Err(e)) if e == "cannot connect"));
+
+    let cut = sent(
+        "http://big/",
+        reqlite_store::Outcome::Response {
+            status: 200,
+            headers: vec![],
+            body: vec![b'x'; 1024],
+            body_len: 50 * 1024 * 1024,
+            elapsed_ms: 80,
+        },
+    );
+    hist(&mut a, history::HistMsg::Fetched(Ok(Some(cut))));
+    assert!(a.notice.as_deref().unwrap().contains("first 1.0 KB"));
+}
+
+#[test]
+fn history_can_show_only_the_shown_request() {
+    let (dir, mut a) = workspace();
+    let list = dir.path().join("users/list.toml");
+    side(&mut a, SideMsg::Open(list.clone()));
+    let row = |id, file: Option<&Path>| reqlite_store::Summary {
+        id,
+        at_ms: 0,
+        file: file.map(|p| p.display().to_string()),
+        method: "GET".into(),
+        url: format!("http://h/{id}"),
+        status: Some(200),
+        error: None,
+        elapsed_ms: Some(5),
+    };
+    drop(update(&mut a, Msg::Panel(Panel::History)));
+    hist(
+        &mut a,
+        history::HistMsg::Listed(Ok(vec![row(2, None), row(1, Some(&list))])),
+    );
+    let count = |a: &App| {
+        let mut ui = simulator(view::view(a));
+        ["/1", "/2"].iter().filter(|u| ui.find(**u).is_ok()).count()
+    };
+    assert_eq!(count(&a), 2);
+    hist(&mut a, history::HistMsg::ThisRequest(true));
+    assert_eq!(count(&a), 1);
+}
+
+#[test]
+fn the_left_panel_switches_between_files_and_history_and_hides() {
+    let (_dir, mut a) = workspace();
+    assert_eq!(a.left_panel(), Some(Panel::Files));
+    drop(update(&mut a, Msg::Panel(Panel::History)));
+    assert_eq!(a.left_panel(), Some(Panel::History));
+    drop(update(&mut a, Msg::Panel(Panel::History)));
+    assert_eq!(a.left_panel(), None, "choosing the shown panel hides it");
+
+    let mut lone = app(Some(FILE));
+    lone.workspace = None;
+    assert_eq!(lone.left_panel(), None, "no workspace, no file tree");
+    drop(update(&mut lone, Msg::Panel(Panel::History)));
+    assert_eq!(lone.left_panel(), Some(Panel::History));
+}
