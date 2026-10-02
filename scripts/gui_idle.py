@@ -11,13 +11,15 @@ The app must open its default 1000x800 window. After 5 s of idle the script read
 Budgets:
   footprint              under 60 MB, on a 2x display only (it scales with the display)
   footprint - drawables  under 35 MB, on any display (memory Reqlite controls)
-  idle CPU               under 0.05 s of CPU time over the next 5 s. More means a
-                         redraw loop or an animation that never stops.
-  first frame            under 300 ms, on a Mac with a real GPU only. A virtual
-                         machine (a CI runner) lists no GPU or a paravirtual one,
-                         so the time is printed but not checked there. The app prints
+  idle CPU               under 0.05 s of CPU time over the next 5 s, on a Mac with
+                         a real GPU only. More means a redraw loop or an animation
+                         that never stops.
+  first frame            under 300 ms, on a Mac with a real GPU only. The app prints
                          `first-frame <ms>` and exits when
                          REQLITE_GUI_EXIT_ON_FIRST_FRAME is set.
+A virtual machine (a CI runner) lists no GPU or a paravirtual one. It renders in
+software and its CPU times include the hypervisor, so idle CPU and first frame are
+printed but not checked there.
 Set REQLITE_BUDGET_SCALE=0.01 to shrink every budget and watch the check fail.
 """
 
@@ -166,20 +168,29 @@ def main() -> None:
         )
     check("idle footprint minus drawables", own, 35 * MB)
 
-    cpu_budget = 0.05 * SCALE
-    ok = idle_cpu <= cpu_budget
-    print(
-        f"{'ok  ' if ok else 'MISS'} idle CPU: {idle_cpu:.2f} s over {IDLE_SAMPLE:g} s "
-        f"(budget {cpu_budget:.2f} s)"
-    )
-    if not ok:
-        failures.append("idle CPU")
+    model = gpu()
+    real_gpu = model != "none" and "paravirtual" not in model.lower()
+
+    cpu_runs = ", ".join(f"{c:.2f}" for _, _, c in runs)
+    if real_gpu:
+        cpu_budget = 0.05 * SCALE
+        ok = idle_cpu <= cpu_budget
+        print(
+            f"{'ok  ' if ok else 'MISS'} idle CPU: {idle_cpu:.2f} s over {IDLE_SAMPLE:g} s "
+            f"(budget {cpu_budget:.2f} s; runs {cpu_runs})"
+        )
+        if not ok:
+            failures.append("idle CPU")
+    else:
+        print(
+            f"skip idle CPU: {idle_cpu:.2f} s over {IDLE_SAMPLE:g} s ({cpu_runs}); "
+            f"GPU is {model}, the budget assumes a real GPU"
+        )
 
     starts = sorted(first_frame(args.exe) for _ in range(5))
     start = starts[2]
     runs_ms = ", ".join(f"{t:.0f}" for t in starts)
-    model = gpu()
-    if model == "none" or "paravirtual" in model.lower():
+    if not real_gpu:
         print(
             f"skip first frame: {start:.0f} ms ({runs_ms}); GPU is {model}, the budget assumes a real GPU"
         )

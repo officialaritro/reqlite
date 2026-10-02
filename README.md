@@ -159,7 +159,7 @@ Design rules:
 |---|---|---|---|
 | GUI idle footprint, 1000×800 window on a 2× display | under 60 MB | 58 MB | locally (`scripts/gui_idle.py`); CI runners have no 2× display |
 | GUI idle footprint minus window frame buffers, any display | under 35 MB | 33 MB | yes, macOS |
-| GUI idle CPU, over 5 s | under 0.05 s | 0.00 s | yes, macOS |
+| GUI idle CPU, over 5 s | under 0.05 s | 0.00 s | locally; CI prints it, because CI runners have no real GPU |
 | Binary | under 25 MB | CLI 3.7 MB, GUI 8.2 MB | yes |
 | Cold start | under 300 ms | CLI 3 ms, GUI first frame 97 ms | CLI yes; GUI locally, because CI runners have no real GPU |
 | Peak RAM while opening a 50 MB JSON response | under 50 MB | viewer 1.8 to 2.5 MB, CLI send 9.3 MB | yes |
