@@ -51,6 +51,17 @@ enum ImportFrom {
         #[arg(long)]
         force: bool,
     },
+    /// A Postman v2.1 collection file. Writes one request file per request,
+    /// one directory per folder.
+    Postman {
+        collection: PathBuf,
+        /// Directory to write into.
+        #[arg(long, short)]
+        out: PathBuf,
+        /// Replace request files that already exist.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -90,6 +101,14 @@ fn main() -> ExitCode {
                     force,
                 },
         } => import_curl(command, out.as_deref(), force),
+        Command::Import {
+            from:
+                ImportFrom::Postman {
+                    collection,
+                    out,
+                    force,
+                },
+        } => import_postman(&collection, &out, force),
         Command::Export {
             to: ExportTo::Curl { file },
         } => export_curl(&file),
@@ -156,6 +175,14 @@ fn open_history() -> Option<reqlite_store::Store> {
 #[derive(Debug, thiserror::Error)]
 #[error("cannot read {path}")]
 struct ReadError {
+    path: PathBuf,
+    #[source]
+    source: std::io::Error,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("cannot create {path}")]
+struct CreateDirError {
     path: PathBuf,
     #[source]
     source: std::io::Error,
@@ -327,4 +354,50 @@ fn export_curl(file: &Path) -> Result<(), Failure> {
     let req = read_request(file)?;
     let mut out = std::io::stdout().lock();
     writeln!(out, "{}", reqlite_import::curl::export(&req)).map_err(Failure::Output)
+}
+
+fn import_postman(collection: &Path, out: &Path, force: bool) -> Result<(), Failure> {
+    let json = std::fs::read_to_string(collection).map_err(|source| {
+        Failure::input(ReadError {
+            path: collection.to_path_buf(),
+            source,
+        })
+    })?;
+    let imported = reqlite_import::postman::import(&json).map_err(|source| {
+        Failure::input(InFile {
+            path: collection.to_path_buf(),
+            source,
+        })
+    })?;
+    for w in &imported.warnings {
+        eprintln!("warning: {w}");
+    }
+    let targets: Vec<(PathBuf, &reqlite_format::Request)> = imported
+        .files
+        .iter()
+        .map(|(rel, req)| (out.join(rel), req))
+        .collect();
+    if !force {
+        if let Some((path, _)) = targets.iter().find(|(p, _)| p.exists()) {
+            return Err(Failure::input(Exists(path.display().to_string())));
+        }
+    }
+    for (path, req) in &targets {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|source| {
+                Failure::input(CreateDirError {
+                    path: dir.to_path_buf(),
+                    source,
+                })
+            })?;
+        }
+        reqlite_format::save(path, req).map_err(Failure::input)?;
+    }
+    eprintln!(
+        "wrote {} requests from {:?} to {}",
+        targets.len(),
+        imported.name,
+        out.display()
+    );
+    Ok(())
 }

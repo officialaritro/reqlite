@@ -62,6 +62,14 @@ reqlite export curl users.toml
 
 Import never drops an option silently. Anything it cannot map prints a warning, for example `-k`, a body read from `@file`, or credentials given with `-u`, which are not written to a file you might commit. A header that holds a literal token also gets a warning, so you can move the token to a secret. Import refuses to replace an existing file unless you pass `--force`.
 
+### Postman import
+
+```sh
+reqlite import postman Shop.postman_collection.json -o shop/
+```
+
+Each folder becomes a directory and each request a file. `{{placeholders}}` carry over unchanged. Auth set on a folder or the collection is copied into each request that inherits it. Reqlite runs no scripts, so every pre-request and test script prints a warning that names its request. Disabled headers and parameters, form-data bodies, saved example responses and collection variables also print warnings.
+
 ### History
 
 Each send is saved to a local history file, `history.db` in your data directory (for example `~/Library/Application Support/reqlite` on macOS). Set `REQLITE_DATA_DIR` to put it somewhere else. History never leaves your machine and is never committed. Secret values are replaced with `{{name}}` before anything is saved, including in response bodies and headers that echo them. History keeps the first 256 KiB of each response body.
@@ -88,7 +96,7 @@ If the history file is damaged, Reqlite moves it aside as `history.db.corrupt-<t
 | `crates/format` | Request and environment file formats: schema, parser, writer |
 | `crates/engine` | Resolves placeholders, sends a request, returns the response. No UI code. |
 | `crates/store` | Local request history in SQLite |
-| `crates/import` | cURL import and export |
+| `crates/import` | cURL import and export, Postman import |
 | `crates/cli` | The `reqlite` command |
 
 Design rules:
