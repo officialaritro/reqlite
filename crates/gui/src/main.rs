@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod doc;
+mod guard;
 mod history;
 mod motion;
 mod scrollbar;

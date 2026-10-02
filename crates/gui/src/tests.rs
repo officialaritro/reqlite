@@ -699,3 +699,49 @@ fn the_left_panel_switches_between_files_and_history_and_hides() {
     drop(update(&mut lone, Msg::Panel(Panel::History)));
     assert_eq!(lone.left_panel(), Some(Panel::History));
 }
+
+/// Presses `c` with Cmd held in the focused URL field, the way macOS sends it:
+/// the modifier first, then the key with its text.
+fn cmd_key_in_url(c: &str) -> Vec<Msg> {
+    let a = app(Some(FILE));
+    let mut ui = simulator(view::view(&a));
+    ui.click(URL).unwrap();
+    let key = ch(c);
+    ui.simulate([
+        iced::Event::Keyboard(keyboard::Event::ModifiersChanged(Modifiers::COMMAND)),
+        iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: Physical::Code(Code::KeyS),
+            location: keyboard::Location::Standard,
+            modifiers: Modifiers::COMMAND,
+            text: Some(c.into()),
+            repeat: false,
+        }),
+    ]);
+    ui.into_messages().collect()
+}
+
+#[test]
+fn a_shortcut_never_types_into_the_url() {
+    for c in ["s", "w", "l", "n", "1"] {
+        let typed = cmd_key_in_url(c)
+            .into_iter()
+            .any(|m| matches!(m, Msg::Url(u) if u.ends_with(c)));
+        assert!(!typed, "Cmd+{c} typed into the URL");
+    }
+}
+
+#[test]
+fn copy_and_paste_keys_still_reach_the_url() {
+    // Cmd+A selects all: no edit, but the key is not swallowed either, so
+    // nothing is typed. Plain letters still type.
+    let a = app(Some(FILE));
+    let mut ui = simulator(view::view(&a));
+    ui.click(URL).unwrap();
+    ui.typewrite("x");
+    assert!(
+        ui.into_messages()
+            .any(|m| matches!(m, Msg::Url(u) if u.ends_with('x')))
+    );
+}

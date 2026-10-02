@@ -230,14 +230,16 @@ fn request_bar(doc: &Doc) -> Element<'_, Msg> {
             .width(110)
             .style(style::method_picker(style::method_color(&doc.method)))
             .menu_style(style::method_menu),
-        text_input("https://", &doc.url)
-            .id(URL)
-            .on_input(Msg::Url)
-            .on_submit(Msg::Send)
-            .font(style::MONO)
-            .size(13)
-            .padding([8, 12])
-            .style(style::input),
+        crate::guard::guard(
+            text_input("https://", &doc.url)
+                .id(URL)
+                .on_input(Msg::Url)
+                .on_submit(Msg::Send)
+                .font(style::MONO)
+                .size(13)
+                .padding([8, 12])
+                .style(style::input),
+        ),
         action.padding([8, 14]),
         save,
     ]

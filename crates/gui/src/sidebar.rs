@@ -432,7 +432,7 @@ fn edit_row(edit: &Edit, depth: usize) -> Element<'_, Msg> {
         Action::NewFolder { .. } => "Folder name",
         Action::Rename { .. } => "New name",
     };
-    let mut col = column![
+    let mut col = column![crate::guard::guard(
         text_input(placeholder, &edit.text)
             .id(NAME_INPUT)
             .on_input(|t| Msg::Side(SideMsg::Text(t)))
@@ -440,7 +440,7 @@ fn edit_row(edit: &Edit, depth: usize) -> Element<'_, Msg> {
             .size(13)
             .padding([4, 6])
             .style(style::input)
-    ]
+    )]
     .spacing(2);
     if let Some(e) = &edit.error {
         col = col.push(text(e).size(11).color(style::DANGER));
