@@ -107,13 +107,19 @@ Design rules:
 
 ## Resource budgets
 
-| Metric | Budget |
-|---|---|
-| Idle RAM (GUI) | under 50 MB |
-| Binary | under 25 MB |
-| Cold start | under 300 ms |
+| Metric | Budget | Now (macOS, M4) | Checked in CI |
+|---|---|---|---|
+| Idle RAM (GUI) | under 50 MB | no GUI yet | not yet |
+| Binary | under 25 MB | CLI 2.4 MB | yes |
+| Cold start | under 300 ms | CLI 2 ms | yes (CLI) |
+| Peak RAM while opening a 50 MB JSON response | under 50 MB | viewer 1.5 to 2.3 MB, CLI send 5.4 MB | yes |
 
-Current CLI release build: 2.4 MB binary, about 6.2 MB peak RAM for one HTTPS request (macOS, three runs).
+`scripts/budgets.py` runs these checks on Linux and macOS in CI and fails the build on a miss. It also checks that each crate depends only on the crates below it. To run it yourself:
+
+```sh
+cargo build --release --workspace --examples
+python3 scripts/budgets.py
+```
 
 ## License
 
