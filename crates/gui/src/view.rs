@@ -522,18 +522,16 @@ fn status_bar(app: &App) -> Element<'_, Msg> {
         style::FAINT
     }))
     .menu_style(style::method_menu);
-    let mut bar = row![env];
-    if let Some(n) = &app.notice {
-        bar = bar.push(text(n).size(12).color(style::WARNING));
-    }
-    bar.push(Space::new().width(Length::Fill))
-        .push(
-            text(format!(
-                "{MOD}↵ send · {MOD}S save · {MOD}L URL · {MOD}1–3 sections · {MOD}N new · {MOD}Y history · Ctrl+Tab next tab · Esc cancel"
-            ))
-            .size(12)
-            .color(style::FAINT),
-        )
+    // A notice takes the place of the shortcut hints, so the bar stays one line.
+    let right = match &app.notice {
+        Some(n) => text(n).size(12).color(style::WARNING),
+        None => text(format!(
+            "{MOD}↵ send · {MOD}S save · {MOD}L URL · {MOD}1–3 sections · {MOD}N new · {MOD}Y history · Ctrl+Tab next tab · Esc cancel"
+        ))
+        .size(12)
+        .color(style::FAINT),
+    };
+    row![env, Space::new().width(Length::Fill), right]
         .spacing(16)
         .align_y(Alignment::Center)
         .into()
