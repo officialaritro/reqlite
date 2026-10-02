@@ -120,9 +120,10 @@ The GUI rows use the physical footprint, which Activity Monitor shows as "Memory
 `scripts/budgets.py` runs the other checks on Linux and macOS in CI and fails the build on a miss. It also checks that each crate depends only on the crates below it. To run it yourself:
 
 ```sh
-cargo build --release --workspace --examples
 python3 scripts/budgets.py
 ```
+
+The script builds the release binaries and examples first, so it never measures a stale build.
 
 ## License
 

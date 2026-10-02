@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks Reqlite's resource budgets and crate boundaries. Exits 1 on any miss.
 
-Usage: scripts/budgets.py            (after `cargo build --release --workspace --examples`)
+Usage: scripts/budgets.py   (builds the release binaries and examples first)
 Set REQLITE_BUDGET_SCALE=0.01 to shrink every budget and watch the check fail.
 """
 
@@ -108,7 +108,18 @@ class Quiet(http.server.SimpleHTTPRequestHandler):
         pass
 
 
+def build() -> None:
+    """Builds what the checks measure. `--examples` alone skips the binaries,
+    which leaves a missing or stale CLI, so both target kinds are named."""
+    subprocess.run(
+        ["cargo", "build", "--release", "--workspace", "--bins", "--examples"],
+        cwd=ROOT,
+        check=True,
+    )
+
+
 def main() -> None:
+    build()
     crate_boundaries()
     check("CLI binary size", os.path.getsize(CLI), 25 * MB, "bytes")
 
