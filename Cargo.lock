@@ -994,6 +994,8 @@ name = "reqlite-import"
 version = "0.0.1"
 dependencies = [
  "reqlite-format",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

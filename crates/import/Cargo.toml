@@ -7,6 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 reqlite-format = { version = "0.0.1", path = "../format" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 thiserror = "2.0.21"
 
 [lints]

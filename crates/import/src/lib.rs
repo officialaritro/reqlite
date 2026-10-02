@@ -3,6 +3,7 @@
 //! back as a [`Warning`].
 
 pub mod curl;
+pub mod postman;
 
 use std::fmt;
 
@@ -19,6 +20,8 @@ pub enum Warning {
     CredentialsSkipped { option: String },
     /// A header holding what looks like a credential, written as is.
     LiteralCredential { header: String },
+    /// A Postman pre-request or test script. Reqlite runs no scripts.
+    Script { item: String, listen: String },
 }
 
 impl fmt::Display for Warning {
@@ -39,6 +42,9 @@ impl fmt::Display for Warning {
                 f,
                 "credentials from {option} were not imported; add an Authorization header that uses a {{{{secret}}}}"
             ),
+            Warning::Script { item, listen } => {
+                write!(f, "{item}: the {listen} script was not imported")
+            }
             Warning::LiteralCredential { header } => write!(
                 f,
                 "header {header} holds a literal credential; replace it with a {{{{secret}}}} before you commit"
