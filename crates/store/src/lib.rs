@@ -65,7 +65,7 @@ impl From<&Parts> for SentRequest {
             url: p.url.clone(),
             headers: p.headers.clone(),
             query: p.query.clone(),
-            body: p.body.clone(),
+            body: p.body.as_ref().map(reqlite_engine::SendBody::describe),
         }
     }
 }

@@ -70,6 +70,14 @@ pub enum Token {
     Number,
     Literal,
     Punct,
+    /// Markup: `<name`, `</name`, `>`, `/>`.
+    Tag,
+    /// Markup: an attribute name.
+    Attr,
+    /// Markup: text between tags.
+    Text,
+    /// Markup: `<!-- ... -->`, a doctype, or `<?xml ...?>`.
+    Comment,
 }
 
 /// Splits one pretty-printed JSON line into coloured pieces. Spaces stay in
@@ -122,6 +130,86 @@ pub fn json_tokens(line: &str) -> Vec<(&str, Token)> {
             }
         };
         out.push((&line[start..i], token));
+    }
+    out
+}
+
+/// Splits one pretty-printed XML or HTML line into coloured pieces. Like
+/// [`json_tokens`], the pieces always join back into the line.
+pub fn markup_tokens(line: &str) -> Vec<(&str, Token)> {
+    let b = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = b.iter().take_while(|c| c.is_ascii_whitespace()).count();
+    if i > 0 {
+        out.push((&line[..i], Token::Punct));
+    }
+    let rest = &line[i..];
+    if rest.starts_with("<!") || rest.starts_with("<?") {
+        out.push((rest, Token::Comment));
+        return out;
+    }
+    // Runs of bytes while `keep` holds. Every stop byte is ASCII, so each
+    // piece ends on a character boundary.
+    let run = |i: usize, keep: &dyn Fn(u8) -> bool| -> usize {
+        i + b[i..].iter().take_while(|&&c| keep(c)).count()
+    };
+    let name = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b':' | b'.');
+    while i < b.len() {
+        if b[i] != b'<' {
+            let end = run(i, &|c| c != b'<');
+            out.push((&line[i..end], Token::Text));
+            i = end;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        if b.get(i) == Some(&b'/') {
+            i += 1;
+        }
+        i = run(i, &name);
+        out.push((&line[start..i], Token::Tag));
+        while i < b.len() {
+            match b[i] {
+                b'>' => {
+                    out.push((&line[i..=i], Token::Tag));
+                    i += 1;
+                    break;
+                }
+                b'/' if b.get(i + 1) == Some(&b'>') => {
+                    out.push((&line[i..i + 2], Token::Tag));
+                    i += 2;
+                    break;
+                }
+                c if c.is_ascii_whitespace() => {
+                    let end = run(i, &|c| c.is_ascii_whitespace());
+                    out.push((&line[i..end], Token::Punct));
+                    i = end;
+                }
+                b'=' => {
+                    out.push((&line[i..=i], Token::Punct));
+                    i += 1;
+                    let end = match b.get(i) {
+                        Some(&q @ (b'"' | b'\'')) => {
+                            let close = run(i + 1, &|c| c != q);
+                            (close + 1).min(b.len())
+                        }
+                        _ => run(i, &|c| !c.is_ascii_whitespace() && c != b'>' && c != b'/'),
+                    };
+                    if end > i {
+                        out.push((&line[i..end], Token::String));
+                        i = end;
+                    }
+                }
+                _ => {
+                    let end = run(i, &|c| {
+                        !c.is_ascii_whitespace() && !matches!(c, b'=' | b'>' | b'/')
+                    })
+                    .max(i + 1);
+                    out.push((&line[i..end], Token::Attr));
+                    i = end;
+                }
+            }
+        }
     }
     out
 }
@@ -235,6 +323,68 @@ mod tests {
             r#""\é""#,
         ] {
             let joined: std::string::String = json_tokens(line).iter().map(|(s, _)| *s).collect();
+            assert_eq!(joined, line);
+        }
+    }
+
+    #[test]
+    fn markup_lines_split_into_tags_attributes_values_and_text() {
+        use Token::*;
+        assert_eq!(
+            markup_tokens(r#"  <user id="1" admin>Ada</user>"#),
+            [
+                ("  ", Punct),
+                ("<user", Tag),
+                (" ", Punct),
+                ("id", Attr),
+                ("=", Punct),
+                (r#""1""#, String),
+                (" ", Punct),
+                ("admin", Attr),
+                (">", Tag),
+                ("Ada", Text),
+                ("</user", Tag),
+                (">", Tag),
+            ]
+        );
+        assert_eq!(
+            markup_tokens("<meta charset=utf-8/>"),
+            [
+                ("<meta", Tag),
+                (" ", Punct),
+                ("charset", Attr),
+                ("=", Punct),
+                ("utf-8", String),
+                ("/>", Tag),
+            ]
+        );
+        assert_eq!(
+            markup_tokens("    <!-- a > b -->"),
+            [("    ", Punct), ("<!-- a > b -->", Comment)]
+        );
+        assert_eq!(
+            markup_tokens("<?xml version=\"1.0\"?>"),
+            [("<?xml version=\"1.0\"?>", Comment)]
+        );
+        assert_eq!(
+            markup_tokens("  plain words"),
+            [("  ", Punct), ("plain words", Text)]
+        );
+    }
+
+    #[test]
+    fn markup_pieces_always_join_back_into_the_line() {
+        for line in [
+            "<a title='x > y' href=\"/q\">é</a>",
+            "<a b=\"unclosed",
+            "<",
+            "</",
+            "<a =x>",
+            "text < more",
+            "",
+            "<br><br>",
+        ] {
+            let joined: std::string::String = markup_tokens(line).iter().map(|(s, _)| *s).collect();
             assert_eq!(joined, line);
         }
     }
