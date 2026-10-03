@@ -144,10 +144,10 @@ def main() -> None:
             check=True,
             capture_output=True,
         )
-        for name in ("array", "nested", "string"):
-            path = os.path.join(fixtures, f"{name}.json")
+        for name in ("array.json", "nested.json", "string.json", "markup.xml"):
+            path = os.path.join(fixtures, name)
             check(
-                f"viewer peak RAM, 50 MB {name}.json",
+                f"viewer peak RAM, 50 MB {name}",
                 peak_rss([OPEN, path]),
                 50 * MB,
                 "bytes",

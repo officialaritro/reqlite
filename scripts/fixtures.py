@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes the 50 MB JSON fixtures the resource budgets use. Usage: fixtures.py OUT_DIR"""
+"""Writes the 50 MB JSON and XML fixtures the resource budgets use. Usage: fixtures.py OUT_DIR"""
 
 import json
 import os
@@ -53,15 +53,28 @@ def long_string(f: TextIO) -> None:
     f.write('"}')
 
 
+def markup(f: TextIO) -> None:
+    f.write('<?xml version="1.0"?><users>')
+    i, n = 0, 0
+    while n < SIZE:
+        rec = f'<user id="{i}"><name>user {i}</name><email>u{i}@example.com</email><active/></user>'
+        f.write(rec)
+        n += len(rec)
+        i += 1
+    f.write("</users>")
+
+
 out = sys.argv[1]
 os.makedirs(out, exist_ok=True)
 for name, gen in [
     ("array.json", array_of_objects),
     ("nested.json", deep_nesting),
     ("string.json", long_string),
+    ("markup.xml", markup),
 ]:
     with open(os.path.join(out, name), "w") as f:
         gen(f)
-    with open(os.path.join(out, name)) as f:
-        json.load(f)
+    if name.endswith(".json"):
+        with open(os.path.join(out, name)) as f:
+            json.load(f)
     print(name, os.path.getsize(os.path.join(out, name)))
