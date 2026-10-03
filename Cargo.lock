@@ -3282,6 +3282,7 @@ dependencies = [
  "notify",
  "reqlite-engine",
  "reqlite-format",
+ "reqlite-import",
  "reqlite-store",
  "reqlite-viewer",
  "reqwest",

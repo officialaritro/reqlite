@@ -214,6 +214,18 @@ pub fn markup_tokens(line: &str) -> Vec<(&str, Token)> {
     out
 }
 
+/// True when pasted text is a cURL command, so it should be imported and not
+/// typed into the URL field: the first word is `curl`, and something follows.
+pub fn is_curl(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    // `/usr/bin/curl` is a path to the program. `https://h/curl` is a URL.
+    let is_curl = first == "curl"
+        || (first.ends_with("/curl") && !first.contains("://"))
+        || first.eq_ignore_ascii_case("curl.exe");
+    is_curl && words.next().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +398,30 @@ mod tests {
         ] {
             let joined: std::string::String = markup_tokens(line).iter().map(|(s, _)| *s).collect();
             assert_eq!(joined, line);
+        }
+    }
+
+    #[test]
+    fn only_a_curl_command_counts_as_one() {
+        for yes in [
+            "curl https://h/",
+            "  curl -X POST 'https://h/' \\\n  -H 'a: b'\n",
+            "curl.exe https://h/",
+            "/usr/bin/curl -s https://h/",
+            "CURL.EXE https://h/",
+        ] {
+            assert!(is_curl(yes), "{yes:?}");
+        }
+        for no in [
+            "",
+            "curl",
+            "curl   ",
+            "https://h/curl https://x",
+            "curlhost.example/path",
+            "echo curl https://h/",
+            "wget https://h/",
+        ] {
+            assert!(!is_curl(no), "{no:?}");
         }
     }
 }
