@@ -592,9 +592,11 @@ mod tests {
             }
         );
         assert_eq!(parts[1].value, PartValue::Text("http://api".into()));
+        // The platform's own separator joins the folder and the file.
+        let file = Path::new("/work/api").join("f/x.bin");
         assert_eq!(
             r.sent().body.as_ref().unwrap().describe(),
-            "a: @/work/api/f/x.bin\nb: http://api\n"
+            format!("a: @{}\nb: http://api\n", file.display())
         );
     }
 
