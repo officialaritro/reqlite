@@ -7,18 +7,59 @@
 //! itself works. Every other event and operation passes through.
 
 use super::{Msg, shortcut};
+use iced::advanced::clipboard;
 use iced::advanced::layout::{self, Layout};
-use iced::advanced::widget::{Operation, Tree, tree};
+use iced::advanced::widget::operation::Focusable;
+use iced::advanced::widget::{Id, Operation, Tree, tree};
 use iced::advanced::{Clipboard, Shell, Widget, overlay, renderer};
 use iced::{Element, Event, Length, Rectangle, Size, Theme, Vector, keyboard, mouse};
+use reqlite_gui::present::is_curl;
 
 pub struct Guard<'a> {
     inner: Element<'a, Msg>,
+    /// Looks at the clipboard text when a paste lands in the focused field.
+    on_paste: Option<fn(&str) -> Option<Msg>>,
 }
 
 pub fn guard<'a>(inner: impl Into<Element<'a, Msg>>) -> Guard<'a> {
     Guard {
         inner: inner.into(),
+        on_paste: None,
+    }
+}
+
+impl Guard<'_> {
+    /// When a paste (Cmd/Ctrl+V) lands in the focused field, `f` sees the whole
+    /// clipboard text. `Some(msg)` takes the paste: the message is published
+    /// and the field gets nothing. `None` leaves the paste to the field. The
+    /// text is read here because the field drops line breaks from what it
+    /// pastes, and a cURL command from a browser has them.
+    pub(crate) fn on_paste(mut self, f: fn(&str) -> Option<Msg>) -> Self {
+        self.on_paste = Some(f);
+        self
+    }
+}
+
+/// What the URL field does with a paste.
+pub(crate) struct PasteProbe;
+
+impl PasteProbe {
+    /// A cURL command is imported. Anything else is left to the field.
+    pub(crate) fn curl(text: &str) -> Option<Msg> {
+        is_curl(text).then(|| Msg::PasteCurl(text.to_string()))
+    }
+}
+
+/// Finds out whether the wrapped field has the keyboard focus.
+struct FocusProbe(bool);
+
+impl Operation for FocusProbe {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+
+    fn focusable(&mut self, _id: Option<&Id>, _bounds: Rectangle, state: &mut dyn Focusable) {
+        self.0 |= state.is_focused();
     }
 }
 
@@ -77,9 +118,36 @@ impl Widget<Msg, Theme, iced::Renderer> for Guard<'_> {
         shell: &mut Shell<'_, Msg>,
         viewport: &Rectangle,
     ) {
-        if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
+        if let Event::Keyboard(keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            physical_key,
+            ..
+        }) = event
+        {
             if shortcut(key, *modifiers).is_some() {
                 return;
+            }
+            let paste =
+                modifiers.command() && !modifiers.alt() && key.to_latin(*physical_key) == Some('v');
+            if let (true, Some(on_paste)) = (paste, self.on_paste) {
+                let mut probe = FocusProbe(false);
+                self.inner.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    &mut probe,
+                );
+                let msg = probe
+                    .0
+                    .then(|| clipboard.read(clipboard::Kind::Standard))
+                    .flatten()
+                    .and_then(|text| on_paste(&text));
+                if let Some(msg) = msg {
+                    shell.publish(msg);
+                    shell.capture_event();
+                    return;
+                }
             }
         }
         self.inner.as_widget_mut().update(

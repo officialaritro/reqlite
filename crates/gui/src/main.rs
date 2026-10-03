@@ -6,6 +6,7 @@ use doc::{Doc, DocId, Opened, Section, Send, Summary, Viewer};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{self, text_editor};
 use iced::{Subscription, Task, event, keyboard::Modifiers, time, window};
+use reqlite_gui::draft::Draft;
 use reqlite_gui::draft::{AuthKind, BodyKind};
 use reqlite_gui::present::glass_supported;
 use reqlite_gui::{chain, recent};
@@ -121,6 +122,8 @@ enum Msg {
     Escape,
     /// Cmd+N: a new request in the sidebar, or a new untitled tab.
     New,
+    /// A cURL command pasted into the URL field: import it into the shown tab.
+    PasteCurl(String),
     /// Cmd+O: choose a workspace folder in the system dialog.
     OpenFolder,
     FolderPicked(Option<PathBuf>),
@@ -474,6 +477,7 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
             _ => app.closing = None,
         },
         Msg::Side(m) => return sidebar::update(app, m),
+        Msg::PasteCurl(command) => import_curl(app, &command),
         Msg::OpenFolder => {
             return Task::perform(
                 async {
@@ -567,6 +571,33 @@ fn edit(doc: &mut Doc, msg: Msg, now: Instant) {
             } = v;
         }
         _ => {}
+    }
+}
+
+/// Fills the shown tab from a cURL command. A command that cannot be read
+/// changes nothing. The tab keeps its name, and a tab with no name yet takes
+/// the command's.
+fn import_curl(app: &mut App, command: &str) {
+    let Some(doc) = app.doc_mut() else { return };
+    match reqlite_import::curl::import(command) {
+        Err(e) => app.notice = Some(format!("Cannot read the cURL command: {}", chain(&e))),
+        Ok((req, warnings)) => {
+            let name = std::mem::take(&mut doc.name);
+            doc.fill(&Draft::from_request(&req));
+            if doc.file.is_some() || name != "Untitled" {
+                doc.name = name;
+            }
+            doc.show_first_filled();
+            doc.refresh();
+            app.notice = Some(match warnings.split_first() {
+                None => "Imported the cURL command.".to_string(),
+                Some((first, [])) => format!("Imported the cURL command. Note: {first}"),
+                Some((first, rest)) => format!(
+                    "Imported the cURL command with {} notes. First: {first}",
+                    rest.len() + 1
+                ),
+            });
+        }
     }
 }
 

@@ -264,7 +264,8 @@ fn request_bar(doc: &Doc) -> Element<'_, Msg> {
                 .size(13)
                 .padding([8, 12])
                 .style(style::input),
-        ),
+        )
+        .on_paste(crate::guard::PasteProbe::curl),
         action.padding([8, 14]),
         save,
     ]

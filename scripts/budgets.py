@@ -31,6 +31,7 @@ ALLOWED: dict[str, set[str]] = {
     "reqlite-store": {"reqlite-format", "reqlite-engine"},
     "reqlite-gui": {
         "reqlite-format",
+        "reqlite-import",
         "reqlite-engine",
         "reqlite-store",
         "reqlite-viewer",
