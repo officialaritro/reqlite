@@ -13,6 +13,17 @@ cargo run --release -p reqlite-gui -- examples            # the desktop app on a
 
 ### The desktop app
 
+#### Install on macOS
+
+```sh
+scripts/macos-app.sh     # builds target/macos/Reqlite.app and target/macos/Reqlite.dmg
+open target/macos/Reqlite.dmg
+```
+
+Drag Reqlite to Applications. Run the script again to get a newer build. The app is signed ad-hoc, which is enough on the Mac that built it. Sharing it with other Macs needs a Developer ID signature and Apple notarization, which are not set up yet.
+
+#### Use
+
 ```sh
 reqlite-gui api/                      # a folder of request files: the workspace
 reqlite-gui api/users.toml            # one file; its folder is the workspace
@@ -21,7 +32,7 @@ reqlite-gui api/ --env api/envs/dev.toml
 
 ![reqlite-gui showing a 50 MB JSON response, 5,467,582 lines](docs/images/reqlite-gui.png)
 
-`reqlite-gui` opens a folder as a workspace. The sidebar shows its request files (`*.toml`) as a tree. `envs/` and `*.local.toml` secret files are not shown. Each request you open gets a tab. Started with no path, the app opens one untitled tab and no sidebar.
+`reqlite-gui` opens a folder as a workspace. The sidebar shows its request files (`*.toml`) as a tree. `envs/` and `*.local.toml` secret files are not shown. Each request you open gets a tab. Open folder… (Cmd+O or Ctrl+O) picks a workspace in the system dialog. The app remembers the last workspace in `last-workspace.txt` next to `history.db`, and started with no path, for example from Finder or the Dock, it opens that folder again. On the first start it offers Open folder… and New request.
 
 The sidebar can make a new request or folder, and rename or delete an entry: right-click it for its actions. A new request is written to disk by its first Save, once it has a URL. Delete asks first, and a folder is deleted only when it is empty.
 
@@ -40,6 +51,7 @@ In each tab, the request is on the left and the response is on the right. When t
 | Save | Cmd+S or Ctrl+S, or the Save button. Enabled only when the form differs from the file. |
 | Go to the URL | Cmd+L or Ctrl+L |
 | Switch sections | Cmd+1, 2, 3, 4 or Ctrl+1, 2, 3, 4 for Query, Headers, Body, Auth |
+| Open a folder | Cmd+O or Ctrl+O, Open… above the sidebar, or Open folder… in an empty window |
 | New request | Cmd+N or Ctrl+N, or + Request in the sidebar |
 | Next tab | Ctrl+Tab |
 | Close a tab | Cmd+W or Ctrl+W, or × on the tab. A tab with unsaved changes asks first. |
