@@ -45,6 +45,9 @@ pub struct Doc {
     pub counts: Counts,
     pub send: Send,
     pub viewer: Option<Viewer>,
+    /// The last response's headers, decoded for display.
+    pub response_headers: Vec<(String, String)>,
+    pub response_tab: ResponseTab,
     /// Why the file could not be opened. Shown for as long as the tab lives.
     pub open_error: Option<String>,
     /// The last save found the file changed on disk. The next Save overwrites.
@@ -75,6 +78,13 @@ pub enum Section {
     Headers,
     Body,
     Auth,
+}
+
+/// The two views of a response.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResponseTab {
+    Body,
+    Headers,
 }
 
 /// What each section holds, shown on its tab.
@@ -138,6 +148,8 @@ impl Doc {
             counts: Counts::default(),
             send: Send::Idle,
             viewer: None,
+            response_headers: Vec::new(),
+            response_tab: ResponseTab::Body,
             open_error: None,
             conflict: false,
             motion: Motion::new(reduced_motion),

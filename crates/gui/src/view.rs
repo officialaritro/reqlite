@@ -16,7 +16,8 @@ use iced::widget::{
     scrollable, span, text, text_editor, text_input,
 };
 use iced::{Alignment, Color, Element, Length, Padding, mouse};
-use reqlite_gui::present::{Token, human_size, json_tokens};
+use reqlite_gui::present::{Token, human_size, json_tokens, markup_tokens};
+use reqlite_viewer::Kind;
 
 /// Below this width of the area right of the sidebar, the response moves under
 /// the request.
@@ -464,11 +465,26 @@ fn auth_editor(doc: &Doc) -> Element<'_, Msg> {
 }
 
 fn response_pane(doc: &Doc) -> container::Container<'_, Msg> {
+    use crate::doc::ResponseTab;
     let mut header = row![status(doc), Space::new().width(Length::Fill)]
         .spacing(10)
         .align_y(Alignment::Center)
         .height(28);
-    if let Some(v) = doc.shown() {
+    let shown = doc.shown();
+    if shown.is_some() {
+        let tab = |t: ResponseTab, name: String| {
+            let active = doc.response_tab == t;
+            button(text(name).size(12))
+                .padding([3, 10])
+                .on_press(Msg::ResponseTab(t))
+                .style(move |th, st| style::tab(th, st, active))
+        };
+        header = header.push(tab(ResponseTab::Body, "Body".into())).push(tab(
+            ResponseTab::Headers,
+            format!("Headers {}", doc.response_headers.len()),
+        ));
+    }
+    if let (Some(v), ResponseTab::Body) = (shown, doc.response_tab) {
         header = header.push(
             text(format!(
                 "line {} of {}",
@@ -479,14 +495,38 @@ fn response_pane(doc: &Doc) -> container::Container<'_, Msg> {
             .color(style::FAINT),
         );
     }
-    let body: Element<'_, Msg> = match (&doc.send, doc.shown()) {
+    let body: Element<'_, Msg> = match (&doc.send, shown) {
         (Send::Finished(Err(e)), _) => message(e, style::DANGER),
+        (_, Some(_)) if doc.response_tab == ResponseTab::Headers => headers(&doc.response_headers),
         (_, Some(v)) => viewer(v, doc.motion.reveal.interpolate(0.0, 1.0, doc.motion.now)),
         (Send::Running(_), None) => message("Sending…", pulse(doc)),
         (Send::Cancelled, None) => message("Cancelled.", style::MUTED),
         _ => hint(),
     };
     panel(column![header, divider(), body].spacing(8))
+}
+
+/// The response headers, one per line, in the order the server sent them.
+fn headers(list: &[(String, String)]) -> Element<'_, Msg> {
+    let rows = list.iter().map(|(k, v)| {
+        row![
+            text(k)
+                .size(13)
+                .font(style::MONO)
+                .color(style::JSON_KEY)
+                .width(Length::FillPortion(2)),
+            text(v)
+                .size(13)
+                .font(style::MONO)
+                .width(Length::FillPortion(5)),
+        ]
+        .spacing(12)
+        .into()
+    });
+    scrollable(column(rows).spacing(4))
+        .spacing(4)
+        .height(Length::Fill)
+        .into()
 }
 
 /// "Sending…" breathes once every 1.2 s, unless motion is reduced.
@@ -587,8 +627,8 @@ fn viewer(v: &Viewer, fade: f32) -> Element<'_, Msg> {
                 .align_x(Alignment::End)
                 .into()
         }));
-        let pretty = doc.is_pretty();
-        let body = column(lines.into_iter().map(|l| line(l, pretty, fade)));
+        let kind = doc.kind();
+        let body = column(lines.into_iter().map(|l| line(l, kind, fade)));
         container(row![numbers, body].spacing(14))
             .padding(Padding::ZERO.top(4.0 * (1.0 - fade)))
             .clip(true)
@@ -613,8 +653,13 @@ fn viewer(v: &Viewer, fade: f32) -> Element<'_, Msg> {
         .into()
 }
 
-fn line(l: String, json: bool, fade: f32) -> Element<'static, Msg> {
-    if !json {
+fn line(l: String, kind: Kind, fade: f32) -> Element<'static, Msg> {
+    let tokens = match kind {
+        Kind::Json => json_tokens(&l),
+        Kind::Markup => markup_tokens(&l),
+        Kind::Plain => Vec::new(),
+    };
+    if tokens.is_empty() {
         return text(l)
             .color(style::TEXT.scale_alpha(fade))
             .font(style::MONO)
@@ -623,15 +668,17 @@ fn line(l: String, json: bool, fade: f32) -> Element<'static, Msg> {
             .wrapping(text::Wrapping::None)
             .into();
     }
-    let spans: Vec<text::Span<'static, (), iced::Font>> = json_tokens(&l)
+    let spans: Vec<text::Span<'static, (), iced::Font>> = tokens
         .into_iter()
         .map(|(piece, token)| {
             let color = match token {
-                Token::Key => style::JSON_KEY,
+                Token::Key | Token::Tag => style::JSON_KEY,
                 Token::String => style::JSON_STRING,
                 Token::Number => style::JSON_NUMBER,
-                Token::Literal => style::JSON_LITERAL,
+                Token::Literal | Token::Attr => style::JSON_LITERAL,
                 Token::Punct => style::MUTED,
+                Token::Text => style::TEXT,
+                Token::Comment => style::FAINT,
             };
             span(piece.to_string()).color(color.scale_alpha(fade))
         })

@@ -104,13 +104,15 @@ fn restore(app: &mut App, entry: Entry) {
         Outcome::Failed { error } => d.send = Send::Finished(Err(error)),
         Outcome::Response {
             status,
+            headers,
             body,
             body_len,
             elapsed_ms,
-            ..
         } => {
             let shown = body.len() as u64;
-            match reqlite_viewer::Document::build(&body[..]) {
+            d.response_headers = super::display_headers(&headers);
+            let content_type = super::content_type(&d.response_headers);
+            match reqlite_viewer::Document::build_with(&body[..], content_type.as_deref()) {
                 Ok(doc) => {
                     d.viewer = Some(Viewer {
                         doc: Arc::new(doc),

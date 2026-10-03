@@ -94,6 +94,7 @@ enum Msg {
     Scroll(i64),
     ScrollTo(f64),
     Section(Section),
+    ResponseTab(doc::ResponseTab),
     BodyKind(BodyKind),
     BodyFile(String),
     AuthKind(AuthKind),
@@ -157,6 +158,8 @@ impl std::fmt::Display for Env {
 struct Loaded {
     doc: Arc<Document>,
     summary: Summary,
+    /// Values decoded for display.
+    headers: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -341,6 +344,7 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
                             doc: loaded.doc,
                             top: 0,
                         });
+                        doc.response_headers = loaded.headers;
                         doc.send = Send::Finished(Ok(loaded.summary));
                     }
                     Err(e) => doc.send = Send::Finished(Err(e)),
@@ -498,6 +502,7 @@ fn edit(doc: &mut Doc, msg: Msg, now: Instant) {
         Msg::Scroll(lines) => doc.scroll(|top| top + lines),
         Msg::ScrollTo(v) => doc.scroll(|_| v.round() as i64),
         Msg::Section(s) => doc.section = s,
+        Msg::ResponseTab(t) => doc.response_tab = t,
         Msg::BodyKind(k) => doc.body_kind = k,
         Msg::BodyFile(p) => doc.body_file = p,
         Msg::AuthKind(k) => doc.auth.kind = k,
@@ -620,16 +625,33 @@ async fn show(
         elapsed: resp.elapsed,
         bytes: resp.body.len(),
     };
+    let headers = display_headers(&resp.headers);
+    let content_type = content_type(&headers);
     let doc = blocking(move || {
         let reader = resp.body.reader()?;
-        Document::build(reader)
+        Document::build_with(reader, content_type.as_deref())
     })
     .await?
     .map_err(|e| format!("cannot show the response: {e}"))?;
     Ok(Loaded {
         doc: Arc::new(doc),
         summary,
+        headers,
     })
+}
+
+/// Header values as text. Bytes that are not UTF-8 show as U+FFFD.
+fn display_headers(raw: &[(String, Vec<u8>)]) -> Vec<(String, String)> {
+    raw.iter()
+        .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
+        .collect()
+}
+
+fn content_type(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
 }
 
 fn save(app: &mut App) -> Task<Msg> {

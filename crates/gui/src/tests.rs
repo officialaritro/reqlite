@@ -812,3 +812,61 @@ fn picking_a_body_type_and_auth_changes_what_is_saved() {
         Some(Msg::Section(Section::Auth))
     ));
 }
+
+#[test]
+fn the_headers_tab_lists_the_response_headers_in_order() {
+    let mut a = app(Some(FILE));
+    let id = a.docs[0].id;
+    let doc = Document::build_with(&b"<a>1</a>"[..], Some("text/xml")).unwrap();
+    let done = Finished {
+        result: Ok(Loaded {
+            doc: Arc::new(doc),
+            summary: Summary {
+                status: 200,
+                elapsed: Duration::ZERO,
+                bytes: 8,
+            },
+            headers: vec![
+                ("content-type".into(), "text/xml".into()),
+                ("x-trace".into(), "abc".into()),
+            ],
+        }),
+        opened: None,
+        warning: None,
+    };
+    drop(update(&mut a, Msg::Sent(id, Box::new(done))));
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("Headers 2").is_ok());
+    assert!(ui.find("x-trace").is_err(), "the body shows first");
+    drop(ui);
+    drop(update(&mut a, Msg::ResponseTab(doc::ResponseTab::Headers)));
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("x-trace").is_ok() && ui.find("abc").is_ok());
+}
+
+#[test]
+fn a_restored_xml_response_keeps_its_headers_and_kind() {
+    let (_dir, mut a) = workspace();
+    let entry = sent(
+        "http://api/feed",
+        reqlite_store::Outcome::Response {
+            status: 200,
+            headers: vec![("Content-Type".into(), b"application/xml".to_vec())],
+            body: b"<feed><item/></feed>".to_vec(),
+            body_len: 20,
+            elapsed_ms: 3,
+        },
+    );
+    hist(&mut a, history::HistMsg::Fetched(Ok(Some(entry))));
+    let d = active(&mut a);
+    assert_eq!(
+        d.response_headers,
+        [("Content-Type".to_string(), "application/xml".to_string())]
+    );
+    let v = d.viewer.as_ref().unwrap();
+    assert_eq!(v.doc.kind(), reqlite_viewer::Kind::Markup);
+    assert_eq!(
+        v.doc.lines(0, 5).unwrap(),
+        ["<feed>", "  <item/>", "</feed>"]
+    );
+}
