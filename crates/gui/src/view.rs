@@ -70,6 +70,12 @@ fn panel_switch(app: &App) -> Element<'_, Msg> {
     }
     r.push(choice(super::Panel::History, "History"))
         .push(Space::new().width(Length::Fill))
+        .push(
+            button(text("Open…").size(11))
+                .padding([2, 6])
+                .on_press(Msg::OpenFolder)
+                .style(style::close),
+        )
         .width(crate::sidebar::WIDTH)
         .into()
 }
@@ -189,23 +195,41 @@ fn discard_prompt(name: &str) -> Element<'_, Msg> {
     .into()
 }
 
-/// No tab is open.
+/// No tab is open. With no workspace, this is the first-start window.
 fn empty(workspace: bool) -> Element<'static, Msg> {
-    let hint = if workspace {
-        format!("Choose a request in the sidebar, or press {MOD}N for a new one.")
+    let (title, hint) = if workspace {
+        (
+            "No request is open.",
+            format!("Choose a request in the sidebar, or press {MOD}N for a new one."),
+        )
     } else {
-        format!("Press {MOD}N for a new request.")
+        (
+            "Open a folder of request files, or start a new request.",
+            format!("{MOD}O open a folder · {MOD}N new request"),
+        )
     };
-    container(
-        column![
-            text("No request is open.").size(13).color(style::MUTED),
-            text(hint).size(12).color(style::FAINT),
-        ]
-        .spacing(6)
-        .align_x(Alignment::Center),
-    )
-    .center(Length::Fill)
-    .into()
+    let mut col = column![
+        text(title).size(13).color(style::MUTED),
+        text(hint).size(12).color(style::FAINT),
+    ]
+    .spacing(6)
+    .align_x(Alignment::Center);
+    if !workspace {
+        col = col.push(
+            row![
+                button(text("Open folder…").size(13))
+                    .padding([6, 14])
+                    .on_press(Msg::OpenFolder)
+                    .style(style::action(0.0)),
+                button(text("New request").size(13))
+                    .padding([6, 14])
+                    .on_press(Msg::New)
+                    .style(style::neutral),
+            ]
+            .spacing(8),
+        );
+    }
+    container(col).center(Length::Fill).into()
 }
 
 fn request_bar(doc: &Doc) -> Element<'_, Msg> {
@@ -240,7 +264,8 @@ fn request_bar(doc: &Doc) -> Element<'_, Msg> {
                 .size(13)
                 .padding([8, 12])
                 .style(style::input),
-        ),
+        )
+        .on_paste(crate::guard::PasteProbe::curl),
         action.padding([8, 14]),
         save,
     ]

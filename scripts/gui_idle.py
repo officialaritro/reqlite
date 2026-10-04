@@ -24,18 +24,25 @@ Set REQLITE_BUDGET_SCALE=0.01 to shrink every budget and watch the check fail.
 """
 
 import argparse
+import atexit
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 
 MB = 1024 * 1024
 SCALE = float(os.environ.get("REQLITE_BUDGET_SCALE", "1"))
 UNITS = {"K": 1024, "KB": 1024, "M": MB, "MB": MB, "G": 1024 * MB, "GB": 1024 * MB}
 IDLE_SAMPLE = 5.0
+# An empty data folder, so the app opens its first-start window every time
+# instead of the folder you used last.
+DATA_DIR = tempfile.mkdtemp(prefix="reqlite-gui-idle-")
+atexit.register(shutil.rmtree, DATA_DIR, ignore_errors=True)
 
 
 def size(text: str) -> int:
@@ -76,7 +83,12 @@ def cpu_time(pid: int) -> float:
 
 
 def measure(exe: str) -> tuple[int, int, float]:
-    p = subprocess.Popen([exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(
+        [exe],
+        env=dict(os.environ, REQLITE_DATA_DIR=DATA_DIR),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     try:
         time.sleep(5)
         before = cpu_time(p.pid)
@@ -120,7 +132,9 @@ def gpu() -> str:
 
 
 def first_frame(exe: str) -> float:
-    env = dict(os.environ, REQLITE_GUI_EXIT_ON_FIRST_FRAME="1")
+    env = dict(
+        os.environ, REQLITE_GUI_EXIT_ON_FIRST_FRAME="1", REQLITE_DATA_DIR=DATA_DIR
+    )
     out = subprocess.run(
         [exe], env=env, capture_output=True, text=True, timeout=60, check=False
     ).stdout
