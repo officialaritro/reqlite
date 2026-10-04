@@ -3,7 +3,7 @@
 //! placeholders carry over unchanged.
 
 use crate::{Warning, is_literal_credential};
-use reqlite_format::{Method, Params, Request, VERSION};
+use reqlite_format::{Auth as ReqAuth, Body as ReqBody, KeyIn, Method, Params, Part, Request};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -114,9 +114,35 @@ struct Body {
     options: Value,
     #[serde(default)]
     urlencoded: Vec<Kv>,
+    #[serde(default)]
+    formdata: Vec<FormKv>,
+    file: Option<FileSrc>,
     graphql: Option<Graphql>,
     #[serde(default)]
     disabled: bool,
+}
+
+#[derive(Deserialize)]
+struct FormKv {
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    value: Value,
+    #[serde(rename = "type", default)]
+    kind: String,
+    /// A file path, or an array of them.
+    #[serde(default)]
+    src: Value,
+    #[serde(rename = "contentType")]
+    content_type: Option<String>,
+    #[serde(default)]
+    disabled: bool,
+}
+
+#[derive(Deserialize)]
+struct FileSrc {
+    #[serde(default)]
+    src: Value,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +161,8 @@ struct Auth {
     bearer: Vec<AuthKv>,
     #[serde(default)]
     apikey: Vec<AuthKv>,
+    #[serde(default)]
+    basic: Vec<AuthKv>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -262,23 +290,56 @@ fn request_of(
         }
     }
 
-    match r.auth.as_ref().or(inherited) {
-        None => {}
-        Some(a) if a.kind == "noauth" || a.kind == "inherit" => {}
-        Some(a) if a.kind == "bearer" => {
-            let token = field(&a.bearer, "token");
-            headers.append("Authorization", format!("Bearer {token}"));
+    // A literal credential becomes a placeholder, so no secret is committed.
+    let mut secret = |value: String, name: &str, what: &str| {
+        if value.contains("{{") {
+            return value;
         }
-        Some(a) if a.kind == "apikey" && field(&a.apikey, "in") != "query" => {
-            headers.append(field(&a.apikey, "key"), field(&a.apikey, "value"));
+        warnings.push(Warning::CredentialPlaceholder {
+            option: format!("{label}: {what}"),
+            placeholder: name.into(),
+        });
+        format!("{{{{{name}}}}}")
+    };
+    let mut auth = match r.auth.as_ref().or(inherited) {
+        None => None,
+        Some(a) if a.kind == "noauth" || a.kind == "inherit" => None,
+        Some(a) if a.kind == "bearer" => Some(ReqAuth::Bearer {
+            token: secret(field(&a.bearer, "token"), "token", "bearer token"),
+        }),
+        Some(a) if a.kind == "apikey" => Some(ReqAuth::ApiKey {
+            name: field(&a.apikey, "key"),
+            value: secret(field(&a.apikey, "value"), "api_key", "API key"),
+            location: if field(&a.apikey, "in") == "query" {
+                KeyIn::Query
+            } else {
+                KeyIn::Header
+            },
+        }),
+        Some(a) if a.kind == "basic" => Some(ReqAuth::Basic {
+            username: field(&a.basic, "username"),
+            password: secret(
+                field(&a.basic, "password"),
+                "password",
+                "basic auth password",
+            ),
+        }),
+        Some(a) => {
+            warnings.push(Warning::Unsupported {
+                option: format!("{} auth", a.kind),
+                item: Some(label.into()),
+            });
+            None
         }
-        Some(a) if a.kind == "basic" => warnings.push(Warning::CredentialsSkipped {
-            option: format!("{label}: basic auth"),
-        }),
-        Some(a) => warnings.push(Warning::Unsupported {
-            option: format!("{} auth", a.kind),
-            item: Some(label.into()),
-        }),
+    };
+    if let Some(header) = auth.as_ref().and_then(ReqAuth::header) {
+        if has_header(&headers, header) {
+            warnings.push(Warning::Unsupported {
+                option: format!("auth, next to a {header} header (the header is kept)"),
+                item: Some(label.into()),
+            });
+            auth = None;
+        }
     }
 
     let body = match &r.body {
@@ -301,13 +362,10 @@ fn request_of(
                         headers.append("Content-Type", ct);
                     }
                 }
-                raw
+                raw.map(ReqBody::Text)
             }
             "urlencoded" => {
-                if !has_header(&headers, "Content-Type") {
-                    headers.append("Content-Type", "application/x-www-form-urlencoded");
-                }
-                let mut pairs = Vec::new();
+                let mut fields = Params::default();
                 for kv in &b.urlencoded {
                     if kv.disabled {
                         warnings.push(Warning::Unsupported {
@@ -315,10 +373,51 @@ fn request_of(
                             item: Some(label.into()),
                         });
                     } else {
-                        pairs.push(format!("{}={}", form(&kv.key), form(&text(&kv.value))));
+                        fields.append(kv.key.clone(), text(&kv.value));
                     }
                 }
-                Some(pairs.join("&"))
+                Some(ReqBody::Form(fields))
+            }
+            "formdata" => {
+                let mut parts = Vec::new();
+                for kv in &b.formdata {
+                    if kv.disabled {
+                        warnings.push(Warning::Unsupported {
+                            option: format!("disabled form field {}", kv.key),
+                            item: Some(label.into()),
+                        });
+                        continue;
+                    }
+                    if kv.kind == "file" {
+                        let files = match &kv.src {
+                            Value::Array(list) => list.iter().map(text).collect(),
+                            Value::Null => Vec::new(),
+                            v => vec![text(v)],
+                        };
+                        if files.is_empty() {
+                            warnings.push(Warning::BodyFromFile {
+                                path: format!("{label}: form file {} (no file chosen)", kv.key),
+                            });
+                        }
+                        for file in files {
+                            parts.push(Part {
+                                name: kv.key.clone(),
+                                text: None,
+                                file: Some(file),
+                                content_type: kv.content_type.clone(),
+                            });
+                        }
+                    } else {
+                        parts.push(Part {
+                            name: kv.key.clone(),
+                            text: Some(text(&kv.value)),
+                            file: None,
+                            content_type: None,
+                        });
+                    }
+                }
+                // An empty form sends no body.
+                (!parts.is_empty()).then_some(ReqBody::Multipart(parts))
             }
             "graphql" => {
                 if !has_header(&headers, "Content-Type") {
@@ -330,14 +429,24 @@ fn request_of(
                     Value::String(s) => serde_json::from_str(s).unwrap_or(Value::String(s.clone())),
                     v => v.clone(),
                 });
-                Some(serde_json::json!({ "query": query, "variables": vars }).to_string())
+                Some(ReqBody::Text(
+                    serde_json::json!({ "query": query, "variables": vars }).to_string(),
+                ))
             }
-            "file" => {
-                warnings.push(Warning::BodyFromFile {
-                    path: format!("{label} (Postman file body)"),
-                });
-                None
-            }
+            "file" => match b
+                .file
+                .as_ref()
+                .map(|f| text(&f.src))
+                .filter(|p| !p.is_empty())
+            {
+                Some(path) => Some(ReqBody::File { path }),
+                None => {
+                    warnings.push(Warning::BodyFromFile {
+                        path: format!("{label} (a Postman file body with no file chosen)"),
+                    });
+                    None
+                }
+            },
             other => {
                 warnings.push(Warning::Unsupported {
                     option: format!("{other} body"),
@@ -355,15 +464,17 @@ fn request_of(
             });
         }
     }
-    let req = Request {
-        version: VERSION,
+    let mut req = Request {
+        version: 1,
         name: label.into(),
         method,
         url,
         headers,
         query: Params::default(),
         body,
+        auth,
     };
+    req.version = reqlite_format::needed_version(&req);
     reqlite_format::validate(&req).map_err(|e| invalid(e.to_string()))?;
     Ok(req)
 }
@@ -439,19 +550,6 @@ fn text(v: &Value) -> String {
         Value::Null => String::new(),
         v => v.to_string(),
     }
-}
-
-/// `application/x-www-form-urlencoded` encoding. Braces stay for `{{placeholders}}`.
-fn form(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b' ' => out.push('+'),
-            b if b.is_ascii_alphanumeric() || b"-._~*{}".contains(&b) => out.push(char::from(b)),
-            b => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// A name safe on Windows, macOS and Linux.
@@ -563,16 +661,20 @@ mod tests {
         assert_eq!(list.url, "{{base}}/users?page=1");
         assert_eq!(list.headers.get("Accept"), ["application/json"]);
         assert!(list.headers.get("X-Debug").is_empty());
-        assert_eq!(list.headers.get("Authorization"), ["Bearer {{token}}"]);
+        assert_eq!(
+            list.auth,
+            Some(ReqAuth::Bearer {
+                token: "{{token}}".into()
+            }),
+            "inherited from the collection"
+        );
 
         let login = &c.files[1].1;
         assert_eq!(login.method.as_str(), "POST");
-        assert!(login.headers.get("Authorization").is_empty());
-        assert_eq!(login.body.as_deref(), Some("user=ada+lovelace"));
-        assert_eq!(
-            login.headers.get("Content-Type"),
-            ["application/x-www-form-urlencoded"]
-        );
+        assert_eq!(login.auth, None, "noauth stops the inherited auth");
+        let mut fields = Params::default();
+        fields.append("user", "ada lovelace");
+        assert_eq!(login.body, Some(ReqBody::Form(fields)));
 
         assert_eq!(c.files[2].1.url, "{{base}}/users");
         assert_eq!(c.files[3].1.url, "https://api.shop.io/files");
@@ -594,7 +696,6 @@ mod tests {
             "List users: 1 saved example responses is not supported and was skipped",
             "List users: disabled header X-Debug is not supported and was skipped",
             "Login: disabled form field remember is not supported and was skipped",
-            "Upload: formdata body is not supported and was skipped",
         ];
         assert_eq!(warnings, expect);
     }
@@ -634,11 +735,106 @@ mod tests {
               "body": {"mode": "graphql", "graphql": {"query": "{ me { id } }", "variables": "{\"a\": 1}"}}}}]}"#)
         .unwrap();
         let req = &c.files[0].1;
-        let body: Value = serde_json::from_str(req.body.as_deref().unwrap()).unwrap();
+        let Some(ReqBody::Text(text)) = &req.body else {
+            panic!("{:?}", req.body)
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
         assert_eq!(
             body,
             serde_json::json!({"query": "{ me { id } }", "variables": {"a": 1}})
         );
         assert_eq!(req.headers.get("Content-Type"), ["application/json"]);
+    }
+
+    fn one(request: &str) -> (Request, Vec<String>) {
+        let c = import(&format!(
+            r#"{{"info": {{"name": "c", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"}},
+            "item": [{{"name": "R", "request": {request}}}]}}"#
+        ))
+        .unwrap();
+        let warnings = c.warnings.iter().map(ToString::to_string).collect();
+        (c.files.into_iter().next().unwrap().1, warnings)
+    }
+
+    #[test]
+    fn form_data_and_file_bodies_keep_their_files() {
+        let (req, warnings) = one(
+            r#"{"method": "POST", "url": "http://h/up", "body": {"mode": "formdata", "formdata": [
+                {"key": "note", "value": "hi", "type": "text"},
+                {"key": "pics", "type": "file", "src": ["a.png", "b.png"], "contentType": "image/png"},
+                {"key": "off", "value": "x", "type": "text", "disabled": true}]}}"#,
+        );
+        let file = |f: &str| Part {
+            name: "pics".into(),
+            text: None,
+            file: Some(f.into()),
+            content_type: Some("image/png".into()),
+        };
+        assert_eq!(
+            req.body,
+            Some(ReqBody::Multipart(vec![
+                Part {
+                    name: "note".into(),
+                    text: Some("hi".into()),
+                    file: None,
+                    content_type: None
+                },
+                file("a.png"),
+                file("b.png"),
+            ]))
+        );
+        assert_eq!(
+            warnings,
+            ["R: disabled form field off is not supported and was skipped"]
+        );
+
+        let (bin, _) = one(
+            r#"{"method": "PUT", "url": "http://h/p", "body": {"mode": "file", "file": {"src": "data/p.bin"}}}"#,
+        );
+        assert_eq!(
+            bin.body,
+            Some(ReqBody::File {
+                path: "data/p.bin".into()
+            })
+        );
+    }
+
+    #[test]
+    fn auth_maps_to_its_table_and_literal_secrets_become_placeholders() {
+        let (basic, warnings) = one(r#"{"url": "http://h/", "auth": {"type": "basic", "basic": [
+                {"key": "username", "value": "ada"}, {"key": "password", "value": "hunter2"}]}}"#);
+        assert_eq!(
+            basic.auth,
+            Some(ReqAuth::Basic {
+                username: "ada".into(),
+                password: "{{password}}".into()
+            })
+        );
+        assert_eq!(
+            warnings,
+            [
+                "the credential from R: basic auth password became {{password}}; set password as a secret in the environment's .local.toml file"
+            ]
+        );
+
+        let (key, _) = one(
+            r#"{"url": "http://h/", "auth": {"type": "apikey", "apikey": [
+                {"key": "key", "value": "X-Key"}, {"key": "value", "value": "{{k}}"}, {"key": "in", "value": "query"}]}}"#,
+        );
+        assert_eq!(
+            key.auth,
+            Some(ReqAuth::ApiKey {
+                name: "X-Key".into(),
+                value: "{{k}}".into(),
+                location: KeyIn::Query
+            })
+        );
+
+        let (both, warnings) = one(
+            r#"{"url": "http://h/", "header": [{"key": "Authorization", "value": "Bearer {{t}}"}],
+                "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "{{token}}"}]}}"#,
+        );
+        assert_eq!(both.auth, None, "the hand-written header is kept");
+        assert!(warnings[0].contains("the header is kept"), "{warnings:?}");
     }
 }

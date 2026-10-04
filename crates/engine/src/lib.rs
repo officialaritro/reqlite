@@ -5,7 +5,9 @@ use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 mod resolve;
-pub use resolve::{Parts, ResolveError, Resolved, resolve};
+pub use resolve::{
+    PartValue, Parts, ResolveError, Resolved, SendBody, SendPart, resolve, resolve_in,
+};
 
 /// Bodies larger than this go to a temp file instead of memory.
 pub const SPILL_AT: usize = 1 << 20;
@@ -86,6 +88,14 @@ pub enum SendError {
     Transport(#[source] reqwest::Error),
     #[error("cannot write the response body to a temp file")]
     Spill(#[source] io::Error),
+    #[error("cannot read the body file {path}")]
+    BodyFile {
+        path: std::path::PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid content type {content_type:?} for part {part:?}")]
+    PartType { part: String, content_type: String },
 }
 
 impl From<reqwest::Error> for SendError {
@@ -179,8 +189,39 @@ pub async fn send(client: &reqwest::Client, req: &Resolved) -> Result<Response, 
     for (k, v) in &req.headers {
         builder = builder.header(k, v);
     }
-    if let Some(body) = &req.body {
-        builder = builder.body(body.clone());
+    match &req.body {
+        None => {}
+        Some(SendBody::Text(text)) => builder = builder.body(text.clone()),
+        Some(SendBody::File(path)) => {
+            let (file, len) = open_body(path).await?;
+            builder = builder
+                .header(reqwest::header::CONTENT_LENGTH, len)
+                .body(file);
+        }
+        Some(SendBody::Multipart(parts)) => {
+            let mut form = reqwest::multipart::Form::new();
+            for p in parts {
+                form = match &p.value {
+                    PartValue::Text(t) => form.text(p.name.clone(), t.clone()),
+                    PartValue::File { path, content_type } => {
+                        let (file, len) = open_body(path).await?;
+                        let mut part = reqwest::multipart::Part::stream_with_length(file, len);
+                        if let Some(name) = path.file_name() {
+                            part = part.file_name(name.to_string_lossy().into_owned());
+                        }
+                        let ct = content_type
+                            .as_deref()
+                            .unwrap_or("application/octet-stream");
+                        let part = part.mime_str(ct).map_err(|_bad| SendError::PartType {
+                            part: p.name.clone(),
+                            content_type: ct.to_string(),
+                        })?;
+                        form.part(p.name.clone(), part)
+                    }
+                };
+            }
+            builder = builder.multipart(form);
+        }
     }
 
     let start = Instant::now();
@@ -206,6 +247,17 @@ pub async fn send(client: &reqwest::Client, req: &Resolved) -> Result<Response, 
         body: Body(body),
         elapsed: start.elapsed(),
     })
+}
+
+/// A body file, opened for streaming, and its length.
+async fn open_body(path: &std::path::Path) -> Result<(tokio::fs::File, u64), SendError> {
+    let fail = |source| SendError::BodyFile {
+        path: path.to_path_buf(),
+        source,
+    };
+    let file = tokio::fs::File::open(path).await.map_err(fail)?;
+    let len = file.metadata().await.map_err(fail)?.len();
+    Ok((file, len))
 }
 
 fn append(store: Store, chunk: &[u8]) -> io::Result<Store> {
@@ -250,6 +302,45 @@ mod tests {
             String::from_utf8_lossy(&buf[..n]).into_owned()
         });
         (url, handle)
+    }
+
+    /// Like [`serve_once`], but reads the whole request: by Content-Length, or
+    /// to the last chunk of a chunked body.
+    async fn serve_whole(reply: Vec<u8>) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let n = sock.read(&mut buf).await.unwrap();
+                got.extend_from_slice(&buf[..n]);
+                let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+                let body = got.len() - end - 4;
+                let len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length: "))
+                    .and_then(|v| v.trim().parse::<usize>().ok());
+                let done = match len {
+                    Some(len) => body >= len,
+                    None => !head.contains("chunked") || got.ends_with(b"0\r\n\r\n"),
+                };
+                if done || n == 0 {
+                    break;
+                }
+            }
+            sock.write_all(&reply).await.unwrap();
+            got
+        });
+        (url, handle)
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
     }
 
     fn ok_with(body: &[u8]) -> Vec<u8> {
@@ -326,7 +417,7 @@ mod tests {
         req.query.append("tag", "b");
         req.headers.append("X-Test", "yes");
         req.headers.append("X-Key", "{{key}}");
-        req.body = Some("hello".into());
+        req.body = Some(reqlite_format::Body::Text("hello".into()));
         let env = reqlite_format::parse_env(
             std::path::Path::new("dev.toml"),
             "version = 1\nsecrets = ['key']\n",
@@ -473,5 +564,104 @@ mod tests {
             t.to_string(),
             "connect limit 10 s, no-data limit 30 s, total limit 1500 ms"
         );
+    }
+
+    fn v2(url: &str, extra: &str) -> Request {
+        reqlite_format::parse(&format!(
+            "version = 2\nname = \"t\"\nmethod = \"POST\"\nurl = \"{url}/up\"\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    async fn sent_in(req: &Request, dir: &std::path::Path) -> Result<Vec<u8>, SendError> {
+        let (url, srv) = serve_whole(ok_with(b"")).await;
+        let mut req = req.clone();
+        req.url = req.url.replace("URL", &url);
+        let r = resolve_in(&req, &Environment::default(), dir).unwrap();
+        send(&client().unwrap(), &r).await?;
+        Ok(srv.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_json_body_says_so_and_a_form_is_url_encoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = v2("URL", "[body]\ntype = 'json'\ntext = '{\"a\": 1}'\n");
+        let raw = sent_in(&json, dir.path()).await.unwrap();
+        let text = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+        assert!(text.contains("content-type: application/json"), "{text}");
+        assert!(raw.ends_with(b"{\"a\": 1}"));
+
+        let form = v2(
+            "URL",
+            "[body]\ntype = 'form'\n[body.fields]\nname = 'Ada L'\nnote = 'a&b=c'\n",
+        );
+        let raw = sent_in(&form, dir.path()).await.unwrap();
+        let text = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+        assert!(
+            text.contains("content-type: application/x-www-form-urlencoded"),
+            "{text}"
+        );
+        assert!(raw.ends_with(b"name=Ada+L&note=a%26b%3Dc"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_file_body_is_streamed_whole_with_its_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("blob.bin"), &bytes).unwrap();
+        let req = v2("URL", "[body]\ntype = 'file'\npath = 'blob.bin'\n");
+        let raw = sent_in(&req, dir.path()).await.unwrap();
+        let text = String::from_utf8_lossy(&raw[..300]).to_ascii_lowercase();
+        assert!(text.contains("content-length: 200000"), "{text}");
+        assert!(raw.ends_with(&bytes));
+    }
+
+    #[tokio::test]
+    async fn a_missing_body_file_is_named_in_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = v2("URL", "[body]\ntype = 'file'\npath = 'gone.bin'\n");
+        let err = sent_in(&req, dir.path()).await.unwrap_err();
+        match err {
+            SendError::BodyFile { path, .. } => assert_eq!(path, dir.path().join("gone.bin")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_sends_text_and_file_parts_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ada.png"), b"\x89PNG-bytes").unwrap();
+        let req = v2(
+            "URL",
+            "[body]\ntype = 'multipart'\n[[body.parts]]\nname = 'note'\ntext = 'hi'\n\
+             [[body.parts]]\nname = 'avatar'\nfile = 'ada.png'\ncontent_type = 'image/png'\n",
+        );
+        let raw = sent_in(&req, dir.path()).await.unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            text.to_ascii_lowercase()
+                .contains("content-type: multipart/form-data; boundary=")
+        );
+        let note = text.find("name=\"note\"").unwrap();
+        let avatar = text.find("name=\"avatar\"; filename=\"ada.png\"").unwrap();
+        assert!(note < avatar, "{text}");
+        assert!(text.contains("Content-Type: image/png"), "{text}");
+        assert!(contains(&raw, b"\x89PNG-bytes"));
+    }
+
+    #[tokio::test]
+    async fn auth_adds_its_header_or_query_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let bearer = v2("URL", "[auth]\ntype = 'bearer'\ntoken = 'abc.def'\n");
+        let raw =
+            String::from_utf8_lossy(&sent_in(&bearer, dir.path()).await.unwrap()).into_owned();
+        assert!(raw.contains("authorization: Bearer abc.def"), "{raw}");
+
+        let key = v2(
+            "URL",
+            "[auth]\ntype = 'api_key'\nname = 'key'\nvalue = 'k1'\nin = 'query'\n",
+        );
+        let raw = String::from_utf8_lossy(&sent_in(&key, dir.path()).await.unwrap()).into_owned();
+        assert!(raw.starts_with("POST /up?key=k1 HTTP/1.1"), "{raw}");
     }
 }

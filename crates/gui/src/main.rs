@@ -7,6 +7,7 @@ use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{self, text_editor};
 use iced::{Subscription, Task, event, keyboard::Modifiers, time, window};
 use reqlite_gui::chain;
+use reqlite_gui::draft::{AuthKind, BodyKind};
 use reqlite_gui::present::glass_supported;
 use reqlite_viewer::Document;
 use sidebar::{SideMsg, Sidebar, Workspace};
@@ -93,6 +94,12 @@ enum Msg {
     Scroll(i64),
     ScrollTo(f64),
     Section(Section),
+    ResponseTab(doc::ResponseTab),
+    BodyKind(BodyKind),
+    BodyFile(String),
+    AuthKind(AuthKind),
+    Auth(AuthField, String),
+    KeyIn(reqlite_format::KeyIn),
     FocusUrl,
     Select(usize),
     NextTab,
@@ -121,6 +128,16 @@ enum Panel {
     History,
 }
 
+/// The text fields of the Auth section.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AuthField {
+    Token,
+    Username,
+    Password,
+    KeyName,
+    KeyValue,
+}
+
 /// A choice in the environment picker: a file, or no environment.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Env(Option<PathBuf>);
@@ -141,6 +158,8 @@ impl std::fmt::Display for Env {
 struct Loaded {
     doc: Arc<Document>,
     summary: Summary,
+    /// Values decoded for display.
+    headers: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -325,6 +344,7 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
                             doc: loaded.doc,
                             top: 0,
                         });
+                        doc.response_headers = loaded.headers;
                         doc.send = Send::Finished(Ok(loaded.summary));
                     }
                     Err(e) => doc.send = Send::Finished(Err(e)),
@@ -482,6 +502,21 @@ fn edit(doc: &mut Doc, msg: Msg, now: Instant) {
         Msg::Scroll(lines) => doc.scroll(|top| top + lines),
         Msg::ScrollTo(v) => doc.scroll(|_| v.round() as i64),
         Msg::Section(s) => doc.section = s,
+        Msg::ResponseTab(t) => doc.response_tab = t,
+        Msg::BodyKind(k) => doc.body_kind = k,
+        Msg::BodyFile(p) => doc.body_file = p,
+        Msg::AuthKind(k) => doc.auth.kind = k,
+        Msg::KeyIn(k) => doc.auth.key_in = k,
+        Msg::Auth(field, v) => {
+            let a = &mut doc.auth;
+            *match field {
+                AuthField::Token => &mut a.token,
+                AuthField::Username => &mut a.username,
+                AuthField::Password => &mut a.password,
+                AuthField::KeyName => &mut a.key_name,
+                AuthField::KeyValue => &mut a.key_value,
+            } = v;
+        }
         _ => {}
     }
 }
@@ -498,6 +533,12 @@ fn start_send(app: &mut App) -> Task<Msg> {
     if doc.running() {
         return Task::none();
     }
+    // Body files are relative to the request file, or to the current folder.
+    let dir = doc
+        .file
+        .as_deref()
+        .and_then(Path::parent)
+        .map_or_else(PathBuf::new, Path::to_path_buf);
     let req = match doc.draft().to_request() {
         Ok(r) => r,
         Err(e) => {
@@ -509,14 +550,15 @@ fn start_send(app: &mut App) -> Task<Msg> {
         None => Ok(reqlite_format::Environment::default()),
         Some(path) => reqlite_format::load_env(path).map_err(|e| chain(&e)),
     };
-    let resolved =
-        match env.and_then(|env| reqlite_engine::resolve(&req, &env).map_err(|e| e.to_string())) {
-            Ok(r) => r,
-            Err(e) => {
-                doc.send = Send::Finished(Err(e));
-                return Task::none();
-            }
-        };
+    let resolved = match env
+        .and_then(|env| reqlite_engine::resolve_in(&req, &env, &dir).map_err(|e| e.to_string()))
+    {
+        Ok(r) => r,
+        Err(e) => {
+            doc.send = Send::Finished(Err(e));
+            return Task::none();
+        }
+    };
     let id = doc.id;
     let file = doc.file.as_ref().map(|p| p.display().to_string());
     let env = env_path.as_ref().map(|p| p.display().to_string());
@@ -583,16 +625,33 @@ async fn show(
         elapsed: resp.elapsed,
         bytes: resp.body.len(),
     };
+    let headers = display_headers(&resp.headers);
+    let content_type = content_type(&headers);
     let doc = blocking(move || {
         let reader = resp.body.reader()?;
-        Document::build(reader)
+        Document::build_with(reader, content_type.as_deref())
     })
     .await?
     .map_err(|e| format!("cannot show the response: {e}"))?;
     Ok(Loaded {
         doc: Arc::new(doc),
         summary,
+        headers,
     })
+}
+
+/// Header values as text. Bytes that are not UTF-8 show as U+FFFD.
+fn display_headers(raw: &[(String, Vec<u8>)]) -> Vec<(String, String)> {
+    raw.iter()
+        .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
+        .collect()
+}
+
+fn content_type(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
 }
 
 fn save(app: &mut App) -> Task<Msg> {
@@ -642,6 +701,7 @@ fn shortcut(key: &Key, modifiers: Modifiers) -> Option<Msg> {
         Key::Character("1") => Some(Msg::Section(Section::Query)),
         Key::Character("2") => Some(Msg::Section(Section::Headers)),
         Key::Character("3") => Some(Msg::Section(Section::Body)),
+        Key::Character("4") => Some(Msg::Section(Section::Auth)),
         Key::Character("n") => Some(Msg::New),
         Key::Character("w") => Some(Msg::CloseActive),
         Key::Character("b") => Some(Msg::Side(SideMsg::ToggleHidden)),

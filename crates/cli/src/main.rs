@@ -232,7 +232,9 @@ fn send(file: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<()
         Some(path) => reqlite_format::load_env(path).map_err(Failure::input)?,
         None => reqlite_format::Environment::default(),
     };
-    let req = reqlite_engine::resolve(&req, &env).map_err(|source| {
+    // Body files are relative to the request file.
+    let dir = file.parent().unwrap_or(Path::new(""));
+    let req = reqlite_engine::resolve_in(&req, &env, dir).map_err(|source| {
         Failure::input(InFile {
             path: file.to_path_buf(),
             source,
@@ -265,6 +267,8 @@ fn send(file: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<()
     }
     let resp = resp.map_err(|e| match e {
         reqlite_engine::SendError::Timeout(_) => Failure::Timeout(e, limits),
+        // A missing body file is a problem with the input, like a bad request file.
+        e @ reqlite_engine::SendError::BodyFile { .. } => Failure::input(e),
         e => Failure::Send(e),
     })?;
 

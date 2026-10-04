@@ -12,9 +12,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let window = Instant::now();
     let lines = doc.lines(middle, 60)?;
     println!(
-        "lines={} pretty={} build_ms={} window_ms={} first={:?}",
+        "lines={} kind={:?} build_ms={} window_ms={} first={:?}",
         doc.line_count(),
-        doc.is_pretty(),
+        doc.kind(),
         built.as_millis(),
         window.elapsed().as_millis(),
         lines

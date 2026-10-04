@@ -1,7 +1,7 @@
 //! `curl` command lines, as copied from a browser or a terminal (POSIX shell quoting).
 
 use crate::{Warning, is_literal_credential};
-use reqlite_format::{Method, Params, Request, VERSION};
+use reqlite_format::{Auth, Body, KeyIn, Method, Params, Part, Request};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CurlError {
@@ -33,6 +33,10 @@ enum Opt {
     Referer,
     Cookie,
     User,
+    /// `-F`, and `--form-string` (`literal`: `@` and `<` are plain text).
+    Form {
+        literal: bool,
+    },
     Url,
     /// Changes only what curl prints, or matches what Reqlite already does.
     NoEffect,
@@ -43,8 +47,10 @@ enum Opt {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Data {
-    /// `-d`, `--data`, `--data-ascii`, `--data-binary`: `@file` reads a file.
+    /// `-d`, `--data`, `--data-ascii`: `@file` reads a file, without newlines.
     MaybeFile,
+    /// `--data-binary`: `@file` sends the file as it is.
+    Binary,
     /// `--data-raw`: `@` is literal.
     Raw,
     UrlEncode,
@@ -55,7 +61,7 @@ const OPTIONS: &[(Option<char>, &str, Opt)] = &[
     (Some('H'), "--header", Opt::Header),
     (Some('d'), "--data", Opt::Data(Data::MaybeFile)),
     (None, "--data-ascii", Opt::Data(Data::MaybeFile)),
-    (None, "--data-binary", Opt::Data(Data::MaybeFile)),
+    (None, "--data-binary", Opt::Data(Data::Binary)),
     (None, "--data-raw", Opt::Data(Data::Raw)),
     (None, "--data-urlencode", Opt::Data(Data::UrlEncode)),
     (None, "--json", Opt::Json),
@@ -93,7 +99,8 @@ const OPTIONS: &[(Option<char>, &str, Opt)] = &[
         "--connect-timeout",
         Opt::Unsupported { takes_value: true },
     ),
-    (Some('F'), "--form", Opt::Unsupported { takes_value: true }),
+    (Some('F'), "--form", Opt::Form { literal: false }),
+    (None, "--form-string", Opt::Form { literal: true }),
     (Some('x'), "--proxy", Opt::Unsupported { takes_value: true }),
     (
         Some('T'),
@@ -118,6 +125,11 @@ struct Parsed {
     url: Option<String>,
     headers: Vec<(String, String)>,
     data: Vec<String>,
+    /// `--data-binary @file`.
+    file_body: Option<String>,
+    parts: Vec<Part>,
+    /// `-u name:password`.
+    user: Option<String>,
     json: bool,
     get: bool,
     head: bool,
@@ -225,7 +237,10 @@ impl Parsed {
             Opt::Data(kind) => {
                 let d = need()?;
                 match kind {
-                    Data::MaybeFile if d.starts_with('@') => {
+                    Data::Binary if d.starts_with('@') && self.file_body.is_none() => {
+                        self.file_body = Some(d[1..].to_string());
+                    }
+                    Data::MaybeFile | Data::Binary if d.starts_with('@') => {
                         self.warnings.push(Warning::BodyFromFile {
                             path: d[1..].to_string(),
                         });
@@ -256,11 +271,39 @@ impl Parsed {
                     });
                 }
             }
-            Opt::User => {
-                need()?;
-                self.warnings.push(Warning::CredentialsSkipped {
-                    option: flag.to_string(),
-                });
+            Opt::User => self.user = Some(need()?),
+            Opt::Form { literal } => {
+                let f = need()?;
+                let (name, value) = f.split_once('=').ok_or_else(|| {
+                    CurlError::Invalid(format!("{flag} {f}: write it as name=value"))
+                })?;
+                let part = match value.strip_prefix('@') {
+                    Some(file) if !literal => {
+                        let (path, ct) = match file.split_once(";type=") {
+                            Some((p, t)) => (p, Some(t.to_string())),
+                            None => (file, None),
+                        };
+                        Part {
+                            name: name.into(),
+                            text: None,
+                            file: Some(path.into()),
+                            content_type: ct,
+                        }
+                    }
+                    _ if !literal && value.starts_with('<') => {
+                        self.warnings.push(Warning::BodyFromFile {
+                            path: value[1..].to_string(),
+                        });
+                        return Ok(());
+                    }
+                    _ => Part {
+                        name: name.into(),
+                        text: Some(value.into()),
+                        file: None,
+                        content_type: None,
+                    },
+                };
+                self.parts.push(part);
             }
             Opt::Url => self.url_word(need()?)?,
             Opt::NoEffect => {}
@@ -281,28 +324,44 @@ impl Parsed {
             headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
         };
         let mut body = None;
-        if !self.data.is_empty() {
+        if !self.parts.is_empty() && (!self.data.is_empty() || self.file_body.is_some()) {
+            return Err(CurlError::Invalid("-F cannot be mixed with -d".into()));
+        }
+        if !self.parts.is_empty() {
+            body = Some(Body::Multipart(std::mem::take(&mut self.parts)));
+        } else if let Some(path) = self.file_body.take() {
+            if !self.data.is_empty() {
+                return Err(CurlError::Invalid(
+                    "--data-binary @file cannot be mixed with other -d data".into(),
+                ));
+            }
+            body = Some(Body::File { path });
+        } else if !self.data.is_empty() {
             let joined = self.data.join("&");
             if self.get {
                 url.push(if url.contains('?') { '&' } else { '?' });
                 url.push_str(&joined);
             } else {
                 if self.json {
-                    for (name, v) in [
-                        ("Content-Type", "application/json"),
-                        ("Accept", "application/json"),
-                    ] {
-                        if !has(&self.headers, name) {
-                            self.headers.push((name.into(), v.into()));
-                        }
+                    // A JSON body adds its own Content-Type when sent.
+                    if !has(&self.headers, "Accept") {
+                        self.headers
+                            .push(("Accept".into(), "application/json".into()));
                     }
-                } else if !has(&self.headers, "Content-Type") {
-                    self.headers.push((
-                        "Content-Type".into(),
-                        "application/x-www-form-urlencoded".into(),
-                    ));
+                    body = Some(if has(&self.headers, "Content-Type") {
+                        Body::Text(joined)
+                    } else {
+                        Body::Json(joined)
+                    });
+                } else {
+                    if !has(&self.headers, "Content-Type") {
+                        self.headers.push((
+                            "Content-Type".into(),
+                            "application/x-www-form-urlencoded".into(),
+                        ));
+                    }
+                    body = Some(Body::Text(joined));
                 }
-                body = Some(joined);
             }
         }
         let method = match (self.method, self.head, body.is_some()) {
@@ -313,6 +372,27 @@ impl Parsed {
         };
         let method = Method::try_from(method).map_err(CurlError::Invalid)?;
 
+        let auth = match self.user.take() {
+            None => None,
+            Some(_) if has(&self.headers, "Authorization") => {
+                self.warnings.push(Warning::Unsupported {
+                    option: "-u, next to an Authorization header".into(),
+                    item: None,
+                });
+                None
+            }
+            Some(user) => {
+                let name = user.split_once(':').map_or(user.as_str(), |(n, _)| n);
+                self.warnings.push(Warning::CredentialPlaceholder {
+                    option: "-u".into(),
+                    placeholder: "password".into(),
+                });
+                Some(Auth::Basic {
+                    username: name.to_string(),
+                    password: "{{password}}".into(),
+                })
+            }
+        };
         let mut headers = Params::default();
         for (name, value) in self.headers {
             if is_literal_credential(&name, &value) {
@@ -322,15 +402,17 @@ impl Parsed {
             }
             headers.append(name, value);
         }
-        let req = Request {
-            version: VERSION,
+        let mut req = Request {
+            version: 1,
             name: format!("{} {}", method.as_str(), path_of(&url)),
             method,
             url,
             headers,
             query: Params::default(),
             body,
+            auth,
         };
+        req.version = reqlite_format::needed_version(&req);
         reqlite_format::validate(&req).map_err(|e| CurlError::Invalid(e.to_string()))?;
         Ok((req, self.warnings))
     }
@@ -476,7 +558,16 @@ fn ansi_c(
 /// A curl command that sends `req`. `{{placeholders}}` stay as written.
 pub fn export(req: &Request) -> String {
     let mut url = req.url.clone();
-    for (name, value) in req.query.pairs() {
+    let mut query: Vec<(&str, &str)> = req.query.pairs().collect();
+    if let Some(Auth::ApiKey {
+        name,
+        value,
+        location: KeyIn::Query,
+    }) = &req.auth
+    {
+        query.push((name, value));
+    }
+    for (name, value) in query {
         url.push(if url.contains('?') { '&' } else { '?' });
         url.push_str(&encode(name));
         url.push('=');
@@ -487,11 +578,62 @@ pub fn export(req: &Request) -> String {
         parts.push(format!("-X {}", req.method.as_str()));
     }
     parts.push(quote(&url));
+    let header = |name: &str, value: &str| format!("-H {}", quote(&format!("{name}: {value}")));
     for (name, value) in req.headers.pairs() {
-        parts.push(format!("-H {}", quote(&format!("{name}: {value}"))));
+        parts.push(header(name, value));
     }
-    if let Some(body) = &req.body {
-        parts.push(format!("--data-raw {}", quote(body)));
+    match &req.auth {
+        Some(Auth::Bearer { token }) => {
+            parts.push(header("Authorization", &format!("Bearer {token}")))
+        }
+        Some(Auth::Basic { username, password }) => {
+            parts.push(format!("-u {}", quote(&format!("{username}:{password}"))));
+        }
+        Some(Auth::ApiKey {
+            name,
+            value,
+            location: KeyIn::Header,
+        }) => parts.push(header(name, value)),
+        _ => {}
+    }
+    let has_type = req
+        .headers
+        .pairs()
+        .any(|(n, _)| n.eq_ignore_ascii_case("Content-Type"));
+    match &req.body {
+        None => {}
+        Some(Body::Text(text)) => parts.push(format!("--data-raw {}", quote(text))),
+        Some(Body::Json(text)) if !has_type => parts.push(format!("--json {}", quote(text))),
+        Some(Body::Json(text)) => parts.push(format!("--data-raw {}", quote(text))),
+        Some(Body::Form(fields)) => {
+            for (name, value) in fields.pairs() {
+                parts.push(format!(
+                    "--data-urlencode {}",
+                    quote(&format!("{name}={value}"))
+                ));
+            }
+        }
+        Some(Body::Multipart(list)) => {
+            for p in list {
+                let value = match (&p.text, &p.file) {
+                    (Some(text), _) => text.clone(),
+                    (None, Some(file)) => match &p.content_type {
+                        Some(ct) => format!("@{file};type={ct}"),
+                        None => format!("@{file}"),
+                    },
+                    (None, None) => String::new(),
+                };
+                let flag = if p.text.is_some() {
+                    "--form-string"
+                } else {
+                    "-F"
+                };
+                parts.push(format!("{flag} {}", quote(&format!("{}={value}", p.name))));
+            }
+        }
+        Some(Body::File { path }) => {
+            parts.push(format!("--data-binary {}", quote(&format!("@{path}"))))
+        }
     }
     parts.join(" \\\n  ")
 }
@@ -539,8 +681,10 @@ mod tests {
         assert_eq!(req.headers.get("accept"), ["application/json"]);
         assert_eq!(req.headers.get("Cookie"), ["session=xyz"]);
         assert_eq!(
-            req.body.as_deref(),
-            Some("{\"name\":\"O'Brien\",\"note\":\"line\nbreak\"}")
+            req.body,
+            Some(Body::Text(
+                "{\"name\":\"O'Brien\",\"note\":\"line\nbreak\"}".into()
+            ))
         );
         assert_eq!(
             warnings,
@@ -559,7 +703,7 @@ mod tests {
     fn follows_curl_rules_for_method_body_and_content_type() {
         let (form, _) = import_ok("curl -d a=1 -d b=2 http://h/f");
         assert_eq!(form.method.as_str(), "POST");
-        assert_eq!(form.body.as_deref(), Some("a=1&b=2"));
+        assert_eq!(form.body, Some(Body::Text("a=1&b=2".into())));
         assert_eq!(
             form.headers.get("Content-Type"),
             ["application/x-www-form-urlencoded"]
@@ -572,7 +716,11 @@ mod tests {
 
         let (json, _) = import_ok(r#"curl --json '{"a":1}' http://h/j"#);
         assert_eq!(json.method.as_str(), "POST");
-        assert_eq!(json.headers.get("Content-Type"), ["application/json"]);
+        assert_eq!(json.body, Some(Body::Json("{\"a\":1}".into())));
+        assert!(
+            json.headers.get("Content-Type").is_empty(),
+            "added at send time"
+        );
         assert_eq!(json.headers.get("Accept"), ["application/json"]);
 
         let (head, _) = import_ok("curl -sSLI http://h/");
@@ -587,14 +735,19 @@ mod tests {
             import_ok("curl -k -u ada:pw -o out.json -d @body.json --frobnicate http://h/");
         assert_eq!(req.body, None);
         assert_eq!(
+            req.auth,
+            Some(Auth::Basic {
+                username: "ada".into(),
+                password: "{{password}}".into()
+            }),
+            "the password never reaches the file"
+        );
+        assert_eq!(
             warnings,
             [
                 Warning::Unsupported {
                     option: "-k".into(),
                     item: None
-                },
-                Warning::CredentialsSkipped {
-                    option: "-u".into()
                 },
                 Warning::Unsupported {
                     option: "-o out.json".into(),
@@ -607,8 +760,72 @@ mod tests {
                     option: "--frobnicate".into(),
                     item: None
                 },
+                Warning::CredentialPlaceholder {
+                    option: "-u".into(),
+                    placeholder: "password".into()
+                },
             ]
         );
+    }
+
+    #[test]
+    fn forms_and_binary_files_become_body_tables() {
+        let (up, warnings) = import_ok(
+            "curl -F note=hi -F 'avatar=@img/ada.png;type=image/png' --form-string 'raw=@kept' http://h/up",
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(up.method.as_str(), "POST");
+        let part = |name: &str, text: Option<&str>, file: Option<&str>, ct: Option<&str>| Part {
+            name: name.into(),
+            text: text.map(Into::into),
+            file: file.map(Into::into),
+            content_type: ct.map(Into::into),
+        };
+        assert_eq!(
+            up.body,
+            Some(Body::Multipart(vec![
+                part("note", Some("hi"), None, None),
+                part("avatar", None, Some("img/ada.png"), Some("image/png")),
+                part("raw", Some("@kept"), None, None),
+            ]))
+        );
+        assert_eq!(up.version, 2);
+
+        let (bin, warnings) = import_ok("curl --data-binary @payload.bin http://h/p");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            bin.body,
+            Some(Body::File {
+                path: "payload.bin".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_form_cannot_be_mixed_with_data() {
+        assert!(matches!(
+            import("curl -F a=1 -d b=2 http://h/"),
+            Err(CurlError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn every_body_type_and_auth_exports_and_imports_back() {
+        for tail in [
+            "\n[body]\ntype = \"json\"\ntext = '{\"a\": 1}'\n",
+            "\n[body]\ntype = \"multipart\"\n\n[[body.parts]]\nname = \"note\"\ntext = \"hi\"\n\n[[body.parts]]\nname = \"f\"\nfile = \"a.png\"\ncontent_type = \"image/png\"\n",
+            "\n[body]\ntype = \"file\"\npath = \"p.bin\"\n",
+            "\n[auth]\ntype = \"basic\"\nusername = \"ada\"\npassword = \"{{password}}\"\n",
+        ] {
+            let text = format!(
+                "version = 2\nname = \"x\"\nmethod = \"POST\"\nurl = \"http://h/x\"\n{tail}"
+            );
+            let req = reqlite_format::parse(&text).unwrap();
+            let cmd = export(&req);
+            let (back, _) = import(&cmd).unwrap_or_else(|e| panic!("{cmd}: {e}"));
+            assert_eq!(back.body, req.body, "{cmd}");
+            assert_eq!(back.auth, req.auth, "{cmd}");
+        }
     }
 
     #[test]

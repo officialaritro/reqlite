@@ -18,6 +18,8 @@ pub enum Warning {
     BodyFromFile { path: String },
     /// Credentials that would end up committed. They were not imported.
     CredentialsSkipped { option: String },
+    /// A credential became a placeholder. Its value must go in the environment.
+    CredentialPlaceholder { option: String, placeholder: String },
     /// A header holding what looks like a credential, written as is.
     LiteralCredential { header: String },
     /// A Postman pre-request or test script. Reqlite runs no scripts.
@@ -41,6 +43,13 @@ impl fmt::Display for Warning {
             Warning::CredentialsSkipped { option } => write!(
                 f,
                 "credentials from {option} were not imported; add an Authorization header that uses a {{{{secret}}}}"
+            ),
+            Warning::CredentialPlaceholder {
+                option,
+                placeholder,
+            } => write!(
+                f,
+                "the credential from {option} became {{{{{placeholder}}}}}; set {placeholder} as a secret in the environment's .local.toml file"
             ),
             Warning::Script { item, listen } => {
                 write!(f, "{item}: the {listen} script was not imported")
