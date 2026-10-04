@@ -50,6 +50,7 @@ In each tab, the request is on the left and the response is on the right. When t
 | Cancel a send | Escape, or the Cancel button |
 | Save | Cmd+S or Ctrl+S, or the Save button. Enabled only when the form differs from the file. |
 | Go to the URL | Cmd+L or Ctrl+L |
+| Import a cURL command | Paste it into the URL field (Cmd+V or Ctrl+V). It fills the method, URL, headers, query, body and auth of the shown request, and the status bar lists anything it could not map. A command that cannot be read changes nothing. Other pasted text goes into the field as before. |
 | Switch sections | Cmd+1, 2, 3, 4 or Ctrl+1, 2, 3, 4 for Query, Headers, Body, Auth |
 | Open a folder | Cmd+O or Ctrl+O, Open… above the sidebar, or Open folder… in an empty window |
 | New request | Cmd+N or Ctrl+N, or + Request in the sidebar |

@@ -163,15 +163,24 @@ impl Doc {
             }
         }
         doc.refresh();
-        // Open on the first section that has something in it.
-        if doc.counts.query == 0 {
-            if doc.counts.headers > 0 {
-                doc.section = Section::Headers;
-            } else if doc.counts.body {
-                doc.section = Section::Body;
-            }
-        }
+        doc.show_first_filled();
         doc
+    }
+
+    /// Shows the first request section that has something in it.
+    pub fn show_first_filled(&mut self) {
+        let c = &self.counts;
+        self.section = if c.query > 0 {
+            Section::Query
+        } else if c.headers > 0 {
+            Section::Headers
+        } else if c.body {
+            Section::Body
+        } else if c.auth {
+            Section::Auth
+        } else {
+            Section::Query
+        };
     }
 
     /// Replaces the form with `req`, read from disk as `canonical`.

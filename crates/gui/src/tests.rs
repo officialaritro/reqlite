@@ -916,3 +916,88 @@ fn the_first_start_offers_a_folder_and_the_next_start_reopens_it() {
         Some(Msg::OpenFolder)
     ));
 }
+
+/// What Chrome's "Copy as cURL (bash)" gives: parts joined with `\` and a line break.
+const CHROME_CURL: &str = "curl 'https://api.example.com/v1/users?page=2' \\\n  -H 'accept: application/json' \\\n  -H 'content-type: application/json' \\\n  -u ada:pw \\\n  --data-raw '{\"name\":\"ada\",\n\"tags\":[1]}'";
+
+#[test]
+fn a_pasted_curl_command_fills_the_shown_request() {
+    let mut a = app(Some(FILE));
+    drop(update(&mut a, Msg::PasteCurl(CHROME_CURL.into())));
+    let d = active(&mut a);
+    assert_eq!(d.method, "POST", "curl sends a body as POST");
+    assert_eq!(d.url, "https://api.example.com/v1/users?page=2");
+    assert_eq!(
+        d.headers.text(),
+        "accept: application/json\ncontent-type: application/json\n"
+    );
+    assert_eq!(
+        d.body.text(),
+        "{\"name\":\"ada\",\n\"tags\":[1]}",
+        "line breaks in the body stay"
+    );
+    assert_eq!(d.auth.kind, AuthKind::Basic);
+    assert_eq!(d.auth.username, "ada");
+    assert_eq!(
+        d.auth.password, "{{password}}",
+        "the password never enters the form"
+    );
+    assert!(d.unsaved(), "the file now differs");
+    assert_eq!(d.name, "t", "an existing request keeps its name");
+    assert!(
+        a.notice
+            .as_deref()
+            .unwrap()
+            .starts_with("Imported the cURL command"),
+        "{:?}",
+        a.notice
+    );
+    assert!(
+        a.notice.as_deref().unwrap().contains("password"),
+        "{:?}",
+        a.notice
+    );
+}
+
+#[test]
+fn a_clean_curl_command_says_so_and_an_untitled_tab_takes_the_command_name() {
+    let mut a = app(None);
+    drop(update(
+        &mut a,
+        Msg::PasteCurl("curl -H 'X-Tag: a' https://h/x".into()),
+    ));
+    assert_eq!(a.notice.as_deref(), Some("Imported the cURL command."));
+    let d = active(&mut a);
+    assert_eq!((d.method.as_str(), d.url.as_str()), ("GET", "https://h/x"));
+    assert_eq!(d.headers.text(), "X-Tag: a\n");
+    assert_eq!(
+        d.section,
+        Section::Headers,
+        "opens on what the command filled"
+    );
+}
+
+#[test]
+fn a_curl_command_that_cannot_be_read_changes_nothing_and_says_why() {
+    let mut a = app(Some(FILE));
+    drop(update(&mut a, Msg::PasteCurl("curl 'https://h/".into())));
+    let d = active(&mut a);
+    assert_eq!(d.url, "http://h/");
+    assert!(!d.unsaved());
+    assert!(
+        a.notice
+            .as_deref()
+            .unwrap()
+            .starts_with("Cannot read the cURL command"),
+        "{:?}",
+        a.notice
+    );
+}
+
+#[test]
+fn the_url_field_asks_for_a_paste_of_a_curl_command_only() {
+    use crate::guard::PasteProbe;
+    let ask = |text: &str| PasteProbe::curl(text);
+    assert!(matches!(ask("curl https://h/"), Some(Msg::PasteCurl(t)) if t == "curl https://h/"));
+    assert!(ask("https://h/users").is_none());
+}

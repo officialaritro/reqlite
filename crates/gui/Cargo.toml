@@ -11,6 +11,7 @@ iced = { version = "0.14.0", features = ["advanced", "tokio"] }
 notify = "8.2.0"
 reqlite-engine = { version = "0.0.1", path = "../engine" }
 reqlite-format = { version = "0.0.1", path = "../format" }
+reqlite-import = { version = "0.0.1", path = "../import" }
 reqlite-store = { version = "0.0.1", path = "../store" }
 reqlite-viewer = { version = "0.0.1", path = "../viewer" }
 reqwest = { version = "0.13.5", default-features = false, features = ["query", "rustls"] }
