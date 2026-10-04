@@ -40,7 +40,7 @@ fn app(text: Option<&str>) -> App {
         path: Some(file),
         env: None,
     };
-    boot(&args, &start(args.path.as_deref()), Instant::now()).0
+    boot(&args, &start(args.path.as_deref()), Instant::now(), None).0
 }
 
 /// The shown tab.
@@ -316,7 +316,7 @@ fn workspace() -> (tempfile::TempDir, App) {
         path: Some(dir.path().to_path_buf()),
         env: None,
     };
-    let a = boot(&args, &start(args.path.as_deref()), Instant::now()).0;
+    let a = boot(&args, &start(args.path.as_deref()), Instant::now(), None).0;
     (dir, a)
 }
 
@@ -869,4 +869,50 @@ fn a_restored_xml_response_keeps_its_headers_and_kind() {
         v.doc.lines(0, 5).unwrap(),
         ["<feed>", "  <item/>", "</feed>"]
     );
+}
+
+#[test]
+fn the_first_start_offers_a_folder_and_the_next_start_reopens_it() {
+    let data = tempfile::tempdir().unwrap();
+    let args = Args {
+        path: None,
+        env: None,
+    };
+    let first = |data: &Path| {
+        boot(
+            &args,
+            &Start::Nothing,
+            Instant::now(),
+            Some(data.to_path_buf()),
+        )
+        .0
+    };
+
+    let mut a = first(data.path());
+    assert!(a.workspace.is_none() && a.docs.is_empty(), "no folder yet");
+    let mut ui = simulator(view::view(&a));
+    ui.click("Open folder…").unwrap();
+    assert!(matches!(ui.into_messages().next(), Some(Msg::OpenFolder)));
+
+    let (ws, _) = workspace();
+    drop(update(
+        &mut a,
+        Msg::FolderPicked(Some(ws.path().to_path_buf())),
+    ));
+    assert_eq!(a.workspace.as_ref().unwrap().root, ws.path());
+    assert_eq!(a.left_panel(), Some(Panel::Files));
+
+    let again = first(data.path());
+    let root = &again.workspace.as_ref().expect("reopened").root;
+    assert_eq!(
+        root.canonicalize().unwrap(),
+        ws.path().canonicalize().unwrap()
+    );
+
+    drop(update(&mut a, Msg::FolderPicked(None)));
+    assert!(a.workspace.is_some(), "a cancelled dialog changes nothing");
+    assert!(matches!(
+        shortcut(&ch("o"), Modifiers::COMMAND),
+        Some(Msg::OpenFolder)
+    ));
 }

@@ -6,9 +6,9 @@ use doc::{Doc, DocId, Opened, Section, Send, Summary, Viewer};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{self, text_editor};
 use iced::{Subscription, Task, event, keyboard::Modifiers, time, window};
-use reqlite_gui::chain;
 use reqlite_gui::draft::{AuthKind, BodyKind};
 use reqlite_gui::present::glass_supported;
+use reqlite_gui::{chain, recent};
 use reqlite_viewer::Document;
 use sidebar::{SideMsg, Sidebar, Workspace};
 use std::path::{Path, PathBuf};
@@ -71,6 +71,8 @@ struct App {
     started: Instant,
     exit_after_first_frame: bool,
     reduced_motion: bool,
+    /// Where `last-workspace.txt` lives. `None` in tests.
+    data_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -119,6 +121,9 @@ enum Msg {
     Escape,
     /// Cmd+N: a new request in the sidebar, or a new untitled tab.
     New,
+    /// Cmd+O: choose a workspace folder in the system dialog.
+    OpenFolder,
+    FolderPicked(Option<PathBuf>),
     FirstFrame,
 }
 
@@ -187,7 +192,18 @@ fn start(path: Option<&Path>) -> Start {
     }
 }
 
-fn boot(args: &Args, start: &Start, started: Instant) -> (App, Task<Msg>) {
+/// Where the app keeps its own files: history, and the last workspace.
+fn data_dir() -> Option<PathBuf> {
+    reqlite_store::default_path().and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
+/// `data_dir` is `None` in tests, so they never touch the real data folder.
+fn boot(
+    args: &Args,
+    start: &Start,
+    started: Instant,
+    data_dir: Option<PathBuf>,
+) -> (App, Task<Msg>) {
     let reduced_motion = std::env::var_os("REQLITE_REDUCE_MOTION").is_some_and(|v| v != "0");
     let mut app = App {
         workspace: None,
@@ -206,18 +222,23 @@ fn boot(args: &Args, start: &Start, started: Instant) -> (App, Task<Msg>) {
         started,
         exit_after_first_frame: std::env::var_os("REQLITE_GUI_EXIT_ON_FIRST_FRAME").is_some(),
         reduced_motion,
+        data_dir,
     };
     match start {
+        // Started from Finder or the Dock: the last workspace, or the
+        // first-start window with Open folder and New request.
         Start::Nothing => {
-            app.open_tab(None, &Opened::Missing);
+            if let Some(dir) = app.data_dir.as_deref().and_then(recent::last_workspace) {
+                app.open_workspace(dir);
+            }
         }
-        Start::Folder(dir) => app.workspace = Some(Workspace::open(dir.clone())),
+        Start::Folder(dir) => app.open_workspace(dir.clone()),
         Start::File(file, opened) => {
             let dir = file
                 .parent()
                 .filter(|d| !d.as_os_str().is_empty())
                 .unwrap_or(Path::new("."));
-            app.workspace = Some(Workspace::open(dir.to_path_buf()));
+            app.open_workspace(dir.to_path_buf());
             app.open_tab(Some(file.clone()), opened);
         }
     }
@@ -235,6 +256,20 @@ impl App {
 
     fn doc_mut(&mut self) -> Option<&mut Doc> {
         self.docs.get_mut(self.active)
+    }
+
+    /// Shows `dir` in the sidebar and remembers it for the next start.
+    fn open_workspace(&mut self, dir: PathBuf) {
+        if let Some(data) = &self.data_dir {
+            if let Err(e) = recent::remember(data, &dir) {
+                self.notice = Some(format!(
+                    "this folder will not reopen on the next start: {e}"
+                ));
+            }
+        }
+        self.workspace = Some(Workspace::open(dir));
+        self.panel = Panel::Files;
+        self.sidebar.hidden = false;
     }
 
     /// Opens `file` as `opened` read it, in a new tab, and shows that tab.
@@ -439,6 +474,20 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
             _ => app.closing = None,
         },
         Msg::Side(m) => return sidebar::update(app, m),
+        Msg::OpenFolder => {
+            return Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Open a folder of requests")
+                        .pick_folder()
+                        .await
+                        .map(|f| f.path().to_path_buf())
+                },
+                Msg::FolderPicked,
+            );
+        }
+        Msg::FolderPicked(Some(dir)) => app.open_workspace(dir),
+        Msg::FolderPicked(None) => {}
         Msg::PickEnv(Env(path)) => app.env = path,
         Msg::Panel(p) => {
             if app.left_panel() == Some(p) {
@@ -703,6 +752,7 @@ fn shortcut(key: &Key, modifiers: Modifiers) -> Option<Msg> {
         Key::Character("3") => Some(Msg::Section(Section::Body)),
         Key::Character("4") => Some(Msg::Section(Section::Auth)),
         Key::Character("n") => Some(Msg::New),
+        Key::Character("o") => Some(Msg::OpenFolder),
         Key::Character("w") => Some(Msg::CloseActive),
         Key::Character("b") => Some(Msg::Side(SideMsg::ToggleHidden)),
         Key::Character("y") => Some(Msg::Panel(Panel::History)),
@@ -772,25 +822,30 @@ fn main() -> iced::Result {
     let args = Args::parse();
     let start = start(args.path.as_deref());
     let glass = glass();
-    let mut app = iced::application(move || boot(&args, &start, started), update, view::view)
-        .title(title)
-        .subscription(subscription)
-        .theme(style::theme())
-        .style(move |_, _| style::window(glass))
-        .default_font(style::SANS)
-        .window(window::Settings {
-            size: iced::Size::new(1000.0, 800.0),
-            min_size: Some(iced::Size::new(560.0, 420.0)),
-            transparent: glass,
-            blur: glass,
-            #[cfg(target_os = "macos")]
-            platform_specific: window::settings::PlatformSpecific {
-                title_hidden: true,
-                titlebar_transparent: true,
-                fullsize_content_view: true,
-            },
-            ..window::Settings::default()
-        });
+    let data = data_dir();
+    let mut app = iced::application(
+        move || boot(&args, &start, started, data.clone()),
+        update,
+        view::view,
+    )
+    .title(title)
+    .subscription(subscription)
+    .theme(style::theme())
+    .style(move |_, _| style::window(glass))
+    .default_font(style::SANS)
+    .window(window::Settings {
+        size: iced::Size::new(1000.0, 800.0),
+        min_size: Some(iced::Size::new(560.0, 420.0)),
+        transparent: glass,
+        blur: glass,
+        #[cfg(target_os = "macos")]
+        platform_specific: window::settings::PlatformSpecific {
+            title_hidden: true,
+            titlebar_transparent: true,
+            fullsize_content_view: true,
+        },
+        ..window::Settings::default()
+    });
     for face in style::FONTS {
         app = app.font(face);
     }
