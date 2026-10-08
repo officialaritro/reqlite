@@ -3,6 +3,7 @@
 
 use clap::Parser;
 use doc::{Doc, DocId, Opened, Section, Send, Summary, Viewer};
+use iced::futures::{SinkExt, channel::mpsc};
 use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{self, text_editor};
 use iced::{Subscription, Task, event, keyboard::Modifiers, time, window};
@@ -103,6 +104,10 @@ enum Msg {
     AuthKind(AuthKind),
     Auth(AuthField, String),
     KeyIn(reqlite_format::KeyIn),
+    Grant(reqlite_format::Grant),
+    ClientAuth(reqlite_format::ClientAuth),
+    /// A send waits for an OAuth 2.0 sign-in. The text says what to do.
+    SignIn(String),
     FocusUrl,
     Select(usize),
     NextTab,
@@ -144,6 +149,12 @@ enum AuthField {
     Password,
     KeyName,
     KeyValue,
+    TokenUrl,
+    AuthUrl,
+    DeviceUrl,
+    ClientId,
+    ClientSecret,
+    Scope,
 }
 
 /// A choice in the environment picker: a file, or no environment.
@@ -478,6 +489,7 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
         },
         Msg::Side(m) => return sidebar::update(app, m),
         Msg::PasteCurl(command) => import_curl(app, &command),
+        Msg::SignIn(what) => app.notice = Some(what),
         Msg::OpenFolder => {
             return Task::perform(
                 async {
@@ -560,6 +572,8 @@ fn edit(doc: &mut Doc, msg: Msg, now: Instant) {
         Msg::BodyFile(p) => doc.body_file = p,
         Msg::AuthKind(k) => doc.auth.kind = k,
         Msg::KeyIn(k) => doc.auth.key_in = k,
+        Msg::Grant(g) => doc.auth.grant = g,
+        Msg::ClientAuth(c) => doc.auth.client_auth = c,
         Msg::Auth(field, v) => {
             let a = &mut doc.auth;
             *match field {
@@ -568,6 +582,12 @@ fn edit(doc: &mut Doc, msg: Msg, now: Instant) {
                 AuthField::Password => &mut a.password,
                 AuthField::KeyName => &mut a.key_name,
                 AuthField::KeyValue => &mut a.key_value,
+                AuthField::TokenUrl => &mut a.token_url,
+                AuthField::AuthUrl => &mut a.auth_url,
+                AuthField::DeviceUrl => &mut a.device_url,
+                AuthField::ClientId => &mut a.client_id,
+                AuthField::ClientSecret => &mut a.client_secret,
+                AuthField::Scope => &mut a.scope,
             } = v;
         }
         _ => {}
@@ -644,11 +664,30 @@ fn start_send(app: &mut App) -> Task<Msg> {
     let id = doc.id;
     let file = doc.file.as_ref().map(|p| p.display().to_string());
     let env = env_path.as_ref().map(|p| p.display().to_string());
-    let (task, handle) = Task::perform(
-        run_send(client, resolved, history, !history_tried, file, env),
-        move |f| Msg::Sent(id, Box::new(f)),
-    )
-    .abortable();
+    // A stream, so a sign-in prompt can reach the window while the send waits.
+    let sending = iced::stream::channel(1, async move |mut out: mpsc::Sender<Msg>| {
+        let tell = out.clone();
+        let prompt = move |p: reqlite_engine::oauth::Prompt| {
+            let mut what = p.to_string();
+            if reqlite_engine::oauth::open_browser(p.url()).is_err() {
+                what.push_str(" (open it in a browser)");
+            }
+            // A full channel drops only the hint; the browser is already open.
+            tell.clone().try_send(Msg::SignIn(what)).ok();
+        };
+        let done = run_send(
+            client,
+            resolved,
+            history,
+            !history_tried,
+            file,
+            env,
+            &prompt,
+        )
+        .await;
+        out.send(Msg::Sent(id, Box::new(done))).await.ok();
+    });
+    let (task, handle) = Task::run(sending, |m| m).abortable();
     doc.send = Send::Running(handle);
     let now = Instant::now();
     doc.motion.since = now;
@@ -664,6 +703,7 @@ async fn run_send(
     open: bool,
     file: Option<String>,
     env: Option<String>,
+    prompt: &(dyn Fn(reqlite_engine::oauth::Prompt) + std::marker::Send + Sync),
 ) -> Finished {
     let mut warning = None;
     let mut opened = None;
@@ -681,7 +721,12 @@ async fn run_send(
         },
         None => None,
     };
-    let result = reqlite_engine::send(&client, &req).await;
+    let auth = reqlite_engine::oauth::Authorizer {
+        cache: &reqlite_secrets::KeychainTokens,
+        prompt,
+        wait: std::time::Duration::from_secs(300),
+    };
+    let result = reqlite_engine::send_with(&client, &req, Some(&auth)).await;
     if let Some(store) = store {
         let recorded = match reqlite_store::Entry::from_send(file, env, &req, result.as_ref()) {
             Ok(entry) => store.record(entry).await.map(drop).map_err(|e| chain(&e)),

@@ -1,7 +1,7 @@
 //! The form being edited and how it maps to a request file. No iced types live
 //! here, so every rule is a plain unit test.
 
-use reqlite_format::{Auth, Body, KeyIn, Method, Params, Part, Request};
+use reqlite_format::{Auth, Body, ClientAuth, Grant, KeyIn, Method, OAuth2, Params, Part, Request};
 
 /// The text of each field, as the user typed it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -63,6 +63,14 @@ pub struct AuthDraft {
     pub key_name: String,
     pub key_value: String,
     pub key_in: KeyIn,
+    pub grant: Grant,
+    pub token_url: String,
+    pub auth_url: String,
+    pub device_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub scope: String,
+    pub client_auth: ClientAuth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,14 +80,16 @@ pub enum AuthKind {
     Bearer,
     Basic,
     ApiKey,
+    OAuth2,
 }
 
 impl AuthKind {
-    pub const ALL: [AuthKind; 4] = [
+    pub const ALL: [AuthKind; 5] = [
         AuthKind::None,
         AuthKind::Bearer,
         AuthKind::Basic,
         AuthKind::ApiKey,
+        AuthKind::OAuth2,
     ];
 }
 
@@ -90,6 +100,7 @@ impl std::fmt::Display for AuthKind {
             AuthKind::Bearer => "Bearer token",
             AuthKind::Basic => "Basic",
             AuthKind::ApiKey => "API key",
+            AuthKind::OAuth2 => "OAuth 2.0",
         })
     }
 }
@@ -140,6 +151,14 @@ impl Draft {
                 } => {
                     (a.kind, a.key_name, a.key_value, a.key_in) =
                         (AuthKind::ApiKey, name.clone(), value.clone(), *location);
+                }
+                Auth::Oauth2(o) => {
+                    let text = |v: &Option<String>| v.clone().unwrap_or_default();
+                    a.kind = AuthKind::OAuth2;
+                    (a.grant, a.client_auth) = (o.grant, o.client_auth);
+                    (a.token_url, a.client_id) = (o.token_url.clone(), o.client_id.clone());
+                    (a.auth_url, a.device_url) = (text(&o.auth_url), text(&o.device_url));
+                    (a.client_secret, a.scope) = (text(&o.client_secret), text(&o.scope));
                 }
             }
         }
@@ -197,6 +216,22 @@ impl Draft {
                 value: a.key_value.clone(),
                 location: a.key_in,
             }),
+            AuthKind::OAuth2 => {
+                let opt = |v: &str| Some(v.trim().to_string()).filter(|v| !v.is_empty());
+                // Only the endpoints the grant uses, so a grant changed in the
+                // form leaves no stale field in the file.
+                let only = |grant: Grant, v: &str| opt(v).filter(|_| a.grant == grant);
+                Some(Auth::Oauth2(OAuth2 {
+                    grant: a.grant,
+                    token_url: a.token_url.trim().to_string(),
+                    auth_url: only(Grant::AuthorizationCode, &a.auth_url),
+                    device_url: only(Grant::DeviceCode, &a.device_url),
+                    client_id: a.client_id.trim().to_string(),
+                    client_secret: opt(&a.client_secret),
+                    scope: opt(&a.scope),
+                    client_auth: a.client_auth,
+                }))
+            }
         })
     }
 
@@ -388,6 +423,9 @@ redirect = "http://x/y"
             "\n[auth]\ntype = \"bearer\"\ntoken = \"{{token}}\"\n",
             "\n[auth]\ntype = \"basic\"\nusername = \"ada\"\npassword = \"{{pw}}\"\n",
             "\n[auth]\ntype = \"api_key\"\nname = \"key\"\nvalue = \"{{key}}\"\nin = \"query\"\n",
+            "\n[auth]\ntype = \"oauth2\"\ngrant = \"client_credentials\"\ntoken_url = \"https://id/token\"\nclient_id = \"app\"\nclient_secret = \"{{cs}}\"\nscope = \"read\"\nclient_auth = \"body\"\n",
+            "\n[auth]\ntype = \"oauth2\"\ngrant = \"authorization_code\"\ntoken_url = \"https://id/token\"\nauth_url = \"https://id/auth\"\nclient_id = \"app\"\n",
+            "\n[auth]\ntype = \"oauth2\"\ngrant = \"device_code\"\ntoken_url = \"https://id/token\"\ndevice_url = \"https://id/device\"\nclient_id = \"app\"\n",
         ] {
             let file = format!("{V2}{tail}");
             let req = reqlite_format::parse(&file).unwrap();
@@ -449,6 +487,32 @@ redirect = "http://x/y"
         d.body_kind = BodyKind::File;
         assert_eq!(d.to_request().unwrap().body, None, "no file chosen yet");
         assert_eq!(d.body, "{\"a\": 1}", "the text is still there");
+    }
+
+    #[test]
+    fn a_changed_grant_keeps_only_the_endpoints_it_uses() {
+        let mut d = Draft::empty("x");
+        d.url = "http://a".into();
+        let a = &mut d.auth;
+        (a.kind, a.grant) = (AuthKind::OAuth2, Grant::AuthorizationCode);
+        (a.token_url, a.auth_url, a.client_id) =
+            ("https://id/t".into(), "https://id/a".into(), "app".into());
+        a.device_url = "https://id/d".into();
+        let Some(Auth::Oauth2(o)) = d.to_request().unwrap().auth else {
+            panic!()
+        };
+        assert_eq!(
+            (o.auth_url.as_deref(), o.device_url),
+            (Some("https://id/a"), None)
+        );
+        d.auth.grant = Grant::DeviceCode;
+        let Some(Auth::Oauth2(o)) = d.to_request().unwrap().auth else {
+            panic!()
+        };
+        assert_eq!(
+            (o.auth_url, o.device_url.as_deref()),
+            (None, Some("https://id/d"))
+        );
     }
 
     #[test]

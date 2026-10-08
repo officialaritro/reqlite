@@ -425,10 +425,16 @@ fn body_editor<'a, E: Into<Element<'a, Msg>>>(
 
 fn auth_editor(doc: &Doc) -> Element<'_, Msg> {
     use super::AuthField as F;
-    use reqlite_format::KeyIn;
+    use reqlite_format::{ClientAuth, Grant, KeyIn};
     use reqlite_gui::draft::AuthKind as K;
     let a = &doc.auth;
     let on = |f: F| move |v| Msg::Auth(f, v);
+    let choice = |active: bool, name: &'static str, msg: Msg| {
+        button(text(name).size(12))
+            .padding([3, 10])
+            .on_press(msg)
+            .style(move |t, s| style::tab(t, s, active))
+    };
     let fields: Element<'_, Msg> = match a.kind {
         K::None => note("Add an Authorization header in Headers, or pick an auth type."),
         K::Bearer => column![field(
@@ -448,13 +454,7 @@ fn auth_editor(doc: &Doc) -> Element<'_, Msg> {
         .spacing(6)
         .into(),
         K::ApiKey => {
-            let place = |k: KeyIn, name: &'static str| {
-                let active = a.key_in == k;
-                button(text(name).size(12))
-                    .padding([3, 10])
-                    .on_press(Msg::KeyIn(k))
-                    .style(move |t, s| style::tab(t, s, active))
-            };
+            let place = |k: KeyIn, name| choice(a.key_in == k, name, Msg::KeyIn(k));
             column![
                 row![
                     note("Send it in"),
@@ -473,9 +473,67 @@ fn auth_editor(doc: &Doc) -> Element<'_, Msg> {
             .spacing(6)
             .into()
         }
+        K::OAuth2 => {
+            let client = |c: ClientAuth, name| choice(a.client_auth == c, name, Msg::ClientAuth(c));
+            // Several URLs look alike once filled, so each field keeps a label.
+            let labeled = |label, placeholder, value, f| {
+                column![note(label), field(placeholder, value, on(f))].spacing(2)
+            };
+            let endpoint = match a.grant {
+                Grant::ClientCredentials => None,
+                Grant::AuthorizationCode => Some(labeled(
+                    "Authorization URL",
+                    "https://id.example.com/authorize",
+                    &a.auth_url,
+                    F::AuthUrl,
+                )),
+                Grant::DeviceCode => Some(labeled(
+                    "Device authorization URL",
+                    "https://id.example.com/device",
+                    &a.device_url,
+                    F::DeviceUrl,
+                )),
+            };
+            let secret = match a.grant {
+                Grant::ClientCredentials => "{{client_secret}}",
+                _ => "Only if the client has one",
+            };
+            column![
+                row![note("Grant"), picker(&Grant::ALL, a.grant, Msg::Grant)]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                labeled(
+                    "Token URL",
+                    "https://id.example.com/token",
+                    &a.token_url,
+                    F::TokenUrl
+                ),
+            ]
+            .push(endpoint)
+            .push(labeled("Client ID", "", &a.client_id, F::ClientId))
+            .push(labeled(
+                "Client secret",
+                secret,
+                &a.client_secret,
+                F::ClientSecret,
+            ))
+            .push(labeled("Scope", "read write", &a.scope, F::Scope))
+            .push(
+                row![
+                    note("Send the secret in"),
+                    client(ClientAuth::Basic, "Header"),
+                    client(ClientAuth::Body, "Body")
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .spacing(8)
+            .into()
+        }
     };
     let hint = match a.kind {
         K::None => "",
+        K::OAuth2 => "Tokens stay in the OS keychain, never in the file.",
         _ => "Use a {{secret}} so the value stays out of the file.",
     };
     column![
