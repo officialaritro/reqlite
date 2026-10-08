@@ -77,6 +77,18 @@ pub struct Resolved {
     /// secrets stay `{{name}}`.
     asserts: Vec<(Assert, String)>,
     capture: BTreeMap<String, Source>,
+    /// The gRPC call, when the request is one. Its message is the sent body.
+    grpc: Option<GrpcCall>,
+}
+
+/// What a gRPC call needs beyond the request parts.
+#[derive(Debug, Clone)]
+pub(crate) struct GrpcCall {
+    pub service: String,
+    pub method: String,
+    /// The `.proto` file, from the request file's folder. `None` asks the
+    /// server by reflection.
+    pub proto: Option<PathBuf>,
 }
 
 impl Resolved {
@@ -114,6 +126,15 @@ impl Resolved {
     pub(crate) fn capture(&self) -> &BTreeMap<String, Source> {
         &self.capture
     }
+
+    pub(crate) fn grpc(&self) -> Option<&GrpcCall> {
+        self.grpc.as_ref()
+    }
+
+    /// True for a gRPC call.
+    pub fn is_grpc(&self) -> bool {
+        self.grpc.is_some()
+    }
 }
 
 impl fmt::Debug for Resolved {
@@ -144,6 +165,8 @@ pub enum ResolveError {
     HeaderValue { name: String },
     #[error("the GraphQL variables are not JSON: {reason}")]
     GraphqlVariables { reason: String },
+    #[error("gRPC method {method:?} is not package.Service/Method")]
+    GrpcMethod { method: String },
 }
 
 /// `name=value` in `application/x-www-form-urlencoded`: unreserved bytes stay,
@@ -216,7 +239,7 @@ pub fn resolve(req: &Request, env: &Environment) -> Result<Resolved, ResolveErro
 pub fn resolve_in(req: &Request, env: &Environment, dir: &Path) -> Result<Resolved, ResolveError> {
     let mut used = BTreeMap::new();
     let mut fill = |text: &str, field: &str| fill(text, env, field, &mut used);
-    let (url, url_r) = fill(&req.url, "url")?;
+    let (mut url, mut url_r) = fill(&req.url, "url")?;
     let mut headers = (Vec::new(), Vec::new());
     for (name, value) in req.headers.pairs() {
         let (v, v_r) = fill(value, &format!("header {name}"))?;
@@ -389,6 +412,25 @@ pub fn resolve_in(req: &Request, env: &Environment, dir: &Path) -> Result<Resolv
             target.1.push((name.clone(), v_r));
         }
     }
+    let mut method = req.method.clone();
+    let mut grpc = None;
+    let (mut body, mut body_r) = (body, body_r);
+    if let Some(g) = &req.grpc {
+        let (service, name) = g.parts().ok_or_else(|| ResolveError::GrpcMethod {
+            method: g.method.clone(),
+        })?;
+        let (m, m_r) = fill(&g.message, "gRPC message")?;
+        grpc = Some(GrpcCall {
+            service: service.to_string(),
+            method: name.to_string(),
+            proto: g.proto.as_deref().map(path),
+        });
+        // History shows what went out: a POST to the method's path.
+        url = format!("{}/{service}/{name}", url.trim_end_matches('/'));
+        url_r = format!("{}/{service}/{name}", url_r.trim_end_matches('/'));
+        method = Method::try_from("POST".to_string()).unwrap_or_default();
+        (body, body_r) = (Some(SendBody::Text(m)), Some(SendBody::Text(m_r)));
+    }
     let mut asserts = Vec::new();
     for a in &req.assert {
         let (v, v_r) = fill(&a.value, "assert")?;
@@ -420,15 +462,16 @@ pub fn resolve_in(req: &Request, env: &Environment, dir: &Path) -> Result<Resolv
         secrets,
         asserts,
         capture: req.capture.clone(),
+        grpc,
         sent: Parts {
-            method: req.method.clone(),
+            method: method.clone(),
             url,
             headers: headers.0,
             query: query.0,
             body,
         },
         redacted: Parts {
-            method: req.method.clone(),
+            method,
             url: url_r,
             headers: headers.1,
             query: query.1,

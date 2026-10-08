@@ -473,6 +473,7 @@ fn request_of(
         auth,
         assert: Vec::new(),
         capture: Default::default(),
+        grpc: None,
     };
     req.version = reqlite_format::needed_version(&req);
     reqlite_format::validate(&req).map_err(|e| invalid(e.to_string()))?;

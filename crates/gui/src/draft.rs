@@ -2,7 +2,8 @@
 //! here, so every rule is a plain unit test.
 
 use reqlite_format::{
-    Assert, Auth, Body, ClientAuth, Grant, KeyIn, Method, OAuth2, Params, Part, Request, Source,
+    Assert, Auth, Body, ClientAuth, Grant, Grpc, KeyIn, Method, OAuth2, Params, Part, Request,
+    Source,
 };
 
 /// The text of each field, as the user typed it.
@@ -23,6 +24,10 @@ pub struct Draft {
     pub body_file: String,
     /// The JSON variables of a GraphQL body. Its query is in `body`.
     pub variables: String,
+    /// A gRPC call's `package.Service/Method`. Its message is in `body`.
+    pub grpc_method: String,
+    /// A gRPC call's `.proto` file. Empty asks the server by reflection.
+    pub grpc_proto: String,
     pub auth: AuthDraft,
     /// One assertion per line, such as `status == 200`, and one capture per
     /// line as `capture NAME = json PATH`.
@@ -38,13 +43,16 @@ pub enum BodyKind {
     Multipart,
     File,
     Graphql,
+    /// Not a body: the request is a gRPC call, and `body` is its message.
+    Grpc,
 }
 
 impl BodyKind {
-    pub const ALL: [BodyKind; 6] = [
+    pub const ALL: [BodyKind; 7] = [
         BodyKind::Text,
         BodyKind::Json,
         BodyKind::Graphql,
+        BodyKind::Grpc,
         BodyKind::Form,
         BodyKind::Multipart,
         BodyKind::File,
@@ -60,6 +68,7 @@ impl std::fmt::Display for BodyKind {
             BodyKind::Multipart => "Multipart",
             BodyKind::File => "File",
             BodyKind::Graphql => "GraphQL",
+            BodyKind::Grpc => "gRPC",
         })
     }
 }
@@ -150,6 +159,11 @@ impl Draft {
                 d.variables = variables.clone().unwrap_or_default();
             }
         }
+        if let Some(g) = &req.grpc {
+            (d.body_kind, d.body) = (BodyKind::Grpc, g.message.clone());
+            d.grpc_method.clone_from(&g.method);
+            d.grpc_proto = g.proto.clone().unwrap_or_default();
+        }
         for a in &req.assert {
             d.tests.push_str(&format!("{a}\n"));
         }
@@ -199,6 +213,11 @@ impl Draft {
             auth: self.auth()?,
             assert: Vec::new(),
             capture: Default::default(),
+            grpc: (self.body_kind == BodyKind::Grpc).then(|| Grpc {
+                method: self.grpc_method.trim().to_string(),
+                proto: Some(self.grpc_proto.trim().to_string()).filter(|p| !p.is_empty()),
+                message: self.body.clone(),
+            }),
         };
         self.tests(&mut req)?;
         req.version = reqlite_format::needed_version(&req);
@@ -223,6 +242,9 @@ impl Draft {
     }
 
     fn body(&self) -> Result<Option<Body>, String> {
+        if self.body_kind == BodyKind::Grpc {
+            return Ok(None);
+        }
         if self.body_kind == BodyKind::File {
             let path = self.body_file.trim();
             return Ok((!path.is_empty()).then(|| Body::File { path: path.into() }));
@@ -239,7 +261,7 @@ impl Draft {
                 query: self.body.clone(),
                 variables: Some(self.variables.clone()).filter(|v| !v.trim().is_empty()),
             },
-            BodyKind::File => return Ok(None),
+            BodyKind::File | BodyKind::Grpc => return Ok(None),
         }))
     }
 
@@ -532,6 +554,27 @@ redirect = "http://x/y"
         d.body_kind = BodyKind::File;
         assert_eq!(d.to_request().unwrap().body, None, "no file chosen yet");
         assert_eq!(d.body, "{\"a\": 1}", "the text is still there");
+    }
+
+    #[test]
+    fn a_grpc_call_comes_back_through_the_form() {
+        for tail in ["proto = \"s.proto\"\nmessage = '{\"id\": 1}'\n", ""] {
+            let file = format!(
+                "version = 4\nname = \"g\"\nmethod = \"GET\"\nurl = \"http://h:1\"\n\n[grpc]\nmethod = \"t.S/Get\"\n{tail}"
+            );
+            let req = reqlite_format::parse(&file).unwrap();
+            let draft = Draft::from_request(&req);
+            assert_eq!(draft.body_kind, BodyKind::Grpc);
+            assert_eq!(draft.to_request().unwrap(), req, "{tail}");
+            assert!(!draft.differs_from(Some(&file)), "{tail}");
+        }
+        let mut d = Draft::empty("g");
+        (d.url, d.body_kind) = ("http://h:1".into(), BodyKind::Grpc);
+        assert!(
+            d.to_request()
+                .unwrap_err()
+                .contains("is not package.Service/Method")
+        );
     }
 
     #[test]

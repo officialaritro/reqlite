@@ -89,6 +89,8 @@ enum Msg {
     Body(text_editor::Action),
     Tests(text_editor::Action),
     Variables(text_editor::Action),
+    GrpcMethod(String),
+    GrpcProto(String),
     Send,
     /// Ask the GraphQL server for its schema, and show it as the response.
     Schema,
@@ -585,6 +587,8 @@ fn edit(doc: &mut Doc, msg: Msg, now: Instant) {
         Msg::Body(a) => doc.body.perform(a),
         Msg::Tests(a) => doc.tests.perform(a),
         Msg::Variables(a) => doc.variables.perform(a),
+        Msg::GrpcMethod(m) => doc.grpc_method = m,
+        Msg::GrpcProto(p) => doc.grpc_proto = p,
         Msg::Cancel => {
             if let Send::Running(handle) = &doc.send {
                 handle.abort();

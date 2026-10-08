@@ -130,7 +130,7 @@ An undefined placeholder stops the send and names the variable.
 
 ### Bodies and auth
 
-A body written as a string is sent as it is, and the file stays at `version = 1`. Other body types and auth need `version = 2`, and checks and captures `version = 3`. Reqlite writes the lowest version a request needs, so files that use nothing new do not change.
+A body written as a string is sent as it is, and the file stays at `version = 1`. Other body types and auth need `version = 2`, checks and captures `version = 3`, and gRPC `version = 4`. Reqlite writes the lowest version a request needs, so files that use nothing new do not change.
 
 ```toml
 version = 2
@@ -217,6 +217,26 @@ reqlite graphql schema user.toml --env envs/dev.toml
 ```
 
 `reqlite graphql schema` asks the request's server for its schema by introspection, with the request's URL, headers and auth, and prints it as SDL: the root types first, then the others by name. In the app, the GraphQL body has a query editor, a variables editor, and a Schema button that shows the schema in the response pane. A server that refuses introspection gives its message, with exit code 1.
+
+### gRPC
+
+```toml
+version = 4
+name = "Get user"
+url = "http://localhost:50051"   # https:// for TLS
+
+[headers]
+x-team = "core"                  # headers go as gRPC metadata
+
+[grpc]
+method = "users.v1.Users/GetUser"
+proto = "protos/users.proto"     # leave out to ask the server by reflection
+message = '{"id": "{{user_id}}"}'
+```
+
+A `[grpc]` table makes the request a unary gRPC call to the URL's server. The message is JSON in the protobuf JSON mapping, and placeholders work in it. The `.proto` file is compiled when the call is made, with its imports looked up next to it; the well-known `google/protobuf` types are built in. Without `proto`, Reqlite asks the server for the schema by server reflection (v1, then v1alpha). Auth works as for HTTP: a bearer or OAuth 2.0 token goes as `authorization` metadata.
+
+The answer is JSON, with every field shown, also those at their default value. Its `grpc-status` and `grpc-message` are among the response headers, so a check reads `header grpc-status == 0`. A call the server refuses is still an answer: its body is `{"code": 5, "status": "NOT_FOUND", "message": "..."}`. A `.proto` file that does not compile, or a message with a field the schema lacks, exits with code 3. `reqlite send`, `reqlite run` and the app all make the call; in the app, the gRPC body type has the method, the `.proto` file and the message, and the status shows as `0 OK` or `5 NOT_FOUND`. cURL export refuses a gRPC call. A call stops after 30 s without an answer. Streaming methods come next.
 
 ### WebSocket and server-sent events
 
@@ -356,9 +376,9 @@ Design rules:
 | GUI idle footprint, 1000×800 window on a 2× display | under 70 MB | 58 MB | locally (`scripts/gui_idle.py`); CI runners have no 2× display |
 | GUI idle footprint minus window frame buffers, any display | under 45 MB | 33 MB | yes, macOS |
 | GUI idle CPU, over 5 s | under 0.05 s | 0.00 s | locally; CI prints it, because CI runners have no real GPU |
-| Binary | under 25 MB | CLI 3.8 MB, GUI 8.4 MB | yes |
+| Binary | under 25 MB | CLI 5.1 MB, GUI 9.7 MB | yes |
 | Cold start | under 300 ms | CLI 3 ms, GUI first frame 97 ms | CLI yes; GUI locally, because CI runners have no real GPU |
-| Peak RAM while opening a 50 MB JSON or XML response | under 50 MB | viewer 1.8 to 2.5 MB, CLI send 9.3 MB | yes |
+| Peak RAM while opening a 50 MB JSON or XML response | under 50 MB | viewer 1.7 to 2.5 MB, CLI send 8.8 MB | yes |
 
 The GUI rows use the physical footprint, which Activity Monitor shows as "Memory". The window's frame buffers grow with the window size and the display scale, so the first GUI row fixes both. The second row counts only the memory Reqlite controls. See [issue #1](https://github.com/officialaritro/reqlite/issues/1) for the measurements behind these numbers. The budgets were 60 MB and 35 MB until Phase A ([#11](https://github.com/officialaritro/reqlite/issues/11)): an empty iced window already uses 55 MB, which left about 5 MB for every v1 feature. `scripts/gui_idle.py target/release/reqlite-gui` checks both, plus idle CPU and the GUI cold start, on macOS. CI runs it on macOS. CI runners are virtual machines with a 1× display and no real GPU, so there it checks only the memory Reqlite controls and prints the other two numbers.
 

@@ -25,6 +25,7 @@ pub fn introspection(req: &Request) -> Request {
         }),
         assert: Vec::new(),
         capture: Default::default(),
+        grpc: None,
         version: 2,
         ..req.clone()
     }
