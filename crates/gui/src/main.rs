@@ -88,7 +88,10 @@ enum Msg {
     Query(text_editor::Action),
     Body(text_editor::Action),
     Tests(text_editor::Action),
+    Variables(text_editor::Action),
     Send,
+    /// Ask the GraphQL server for its schema, and show it as the response.
+    Schema,
     Cancel,
     Sent(DocId, Box<Finished>),
     /// A frame or pulse tick, while something moves.
@@ -377,7 +380,8 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
     }
     match msg {
         Msg::Tick(_) => {}
-        Msg::Send => return start_send(app),
+        Msg::Send => return start_send(app, false),
+        Msg::Schema => return start_send(app, true),
         Msg::Save => return save(app),
         Msg::Sent(id, done) => {
             let Finished {
@@ -569,6 +573,7 @@ fn edit(doc: &mut Doc, msg: Msg, now: Instant) {
         Msg::Query(a) => doc.query.perform(a),
         Msg::Body(a) => doc.body.perform(a),
         Msg::Tests(a) => doc.tests.perform(a),
+        Msg::Variables(a) => doc.variables.perform(a),
         Msg::Cancel => {
             if let Send::Running(handle) = &doc.send {
                 handle.abort();
@@ -633,7 +638,8 @@ fn import_curl(app: &mut App, command: &str) {
     }
 }
 
-fn start_send(app: &mut App) -> Task<Msg> {
+/// Sends the shown request, or with `schema`, its GraphQL introspection.
+fn start_send(app: &mut App, schema: bool) -> Task<Msg> {
     let (Some(client), env_path) = (app.client.clone(), app.env.clone()) else {
         return Task::none();
     };
@@ -653,12 +659,16 @@ fn start_send(app: &mut App) -> Task<Msg> {
         .and_then(Path::parent)
         .map_or_else(PathBuf::new, Path::to_path_buf);
     let req = match doc.draft().to_request() {
+        Ok(r) if schema => reqlite_engine::graphql::introspection(&r),
         Ok(r) => r,
         Err(e) => {
             doc.send = Send::Finished(Err(e));
             return Task::none();
         }
     };
+    if schema {
+        doc.response_tab = doc::ResponseTab::Body;
+    }
     let env = match &env_path {
         None => Ok(reqlite_format::Environment::default()),
         Some(path) => {
@@ -694,16 +704,20 @@ fn start_send(app: &mut App) -> Task<Msg> {
             // A full channel drops only the hint; the browser is already open.
             tell.clone().try_send(Msg::SignIn(what)).ok();
         };
-        let done = run_send(
-            client,
-            resolved,
-            history,
-            !history_tried,
-            file,
-            env,
-            &prompt,
-        )
-        .await;
+        let done = if schema {
+            run_schema(client, resolved, &prompt).await
+        } else {
+            run_send(
+                client,
+                resolved,
+                history,
+                !history_tried,
+                file,
+                env,
+                &prompt,
+            )
+            .await
+        };
         out.send(Msg::Sent(id, Box::new(done))).await.ok();
     });
     let (task, handle) = Task::run(sending, |m| m).abortable();
@@ -764,6 +778,54 @@ async fn run_send(
         checked,
         opened,
         warning,
+    }
+}
+
+/// The schema as SDL text in the viewer. Introspection is not saved to history.
+async fn run_schema(
+    client: reqwest::Client,
+    req: reqlite_engine::Resolved,
+    prompt: &(dyn Fn(reqlite_engine::oauth::Prompt) + std::marker::Send + Sync),
+) -> Finished {
+    let auth = reqlite_engine::oauth::Authorizer {
+        cache: &reqlite_secrets::KeychainTokens,
+        prompt,
+        wait: std::time::Duration::from_secs(300),
+    };
+    let result = match reqlite_engine::send_with(&client, &req, Some(&auth)).await {
+        Err(e) => Err(chain(&e)),
+        Ok(resp) => {
+            let summary = Summary {
+                status: resp.status,
+                elapsed: resp.elapsed,
+                bytes: resp.body.len(),
+            };
+            let headers = display_headers(&resp.headers);
+            blocking(move || {
+                let mut body = Vec::new();
+                resp.body
+                    .reader()
+                    .and_then(|mut r| std::io::Read::read_to_end(&mut r, &mut body))
+                    .map_err(|e| format!("cannot read the schema: {e}"))?;
+                let sdl = reqlite_engine::graphql::schema(&body)
+                    .map_err(|e| format!("{e} (status {})", resp.status))?;
+                Document::build_with(sdl.as_bytes(), Some("text/plain"))
+                    .map_err(|e| format!("cannot show the schema: {e}"))
+            })
+            .await
+            .and_then(|r| r)
+            .map(|doc| Loaded {
+                doc: Arc::new(doc),
+                summary,
+                headers,
+            })
+        }
+    };
+    Finished {
+        result,
+        checked: None,
+        opened: None,
+        warning: None,
     }
 }
 

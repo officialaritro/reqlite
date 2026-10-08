@@ -847,6 +847,19 @@ fn the_headers_tab_lists_the_response_headers_in_order() {
 }
 
 #[test]
+fn a_graphql_body_has_a_variables_editor_and_a_schema_button() {
+    let mut a = app(Some(
+        "version = 2\nname = \"q\"\nmethod = \"POST\"\nurl = \"http://h/graphql\"\n\n[body]\ntype = \"graphql\"\nquery = \"{ me { id } }\"\nvariables = '{\"a\": 1}'\n",
+    ));
+    drop(update(&mut a, Msg::Section(Section::Body)));
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("Variables, as JSON").is_ok());
+    ui.click("Schema").unwrap();
+    assert!(matches!(ui.into_messages().next(), Some(Msg::Schema)));
+    assert_eq!(a.docs[0].variables.text().trim_end(), "{\"a\": 1}");
+}
+
+#[test]
 fn a_captured_value_fills_the_next_send() {
     let mut a = app(Some(
         "version = 1\nname = \"user\"\nurl = \"http://127.0.0.1:9/users/{{id}}\"\n",

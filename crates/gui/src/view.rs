@@ -312,7 +312,7 @@ fn request_pane(doc: &Doc) -> container::Container<'_, Msg> {
             }));
         }
         button(caption)
-            .padding([5, 10])
+            .padding([5, 8])
             .on_press(Msg::Section(s))
             .style(move |theme, status| style::tab(theme, status, active))
     };
@@ -325,7 +325,10 @@ fn request_pane(doc: &Doc) -> container::Container<'_, Msg> {
         tab(Section::Auth, "Auth", dot(doc.counts.auth)),
         tab(Section::Tests, "Tests", count(doc.counts.tests)),
     ]
-    .spacing(4);
+    .spacing(4)
+    // A narrow pane puts the last tabs on a second line rather than hiding them.
+    .wrap()
+    .vertical_spacing(4);
     let editor = |content, placeholder, on: fn(text_editor::Action) -> Msg| {
         text_editor(content)
             .placeholder(placeholder)
@@ -402,6 +405,21 @@ fn body_editor<'a, E: Into<Element<'a, Msg>>>(
             Msg::Body,
         )
         .into(),
+        K::Graphql => column![
+            editor(&doc.body, "query { user(id: 1) { name } }", Msg::Body).into(),
+            row![
+                note("Variables, as JSON"),
+                Space::new().width(Length::Fill),
+                button(text("Schema").size(12))
+                    .padding([3, 10])
+                    .on_press(Msg::Schema)
+                    .style(|t, s| style::tab(t, s, false)),
+            ]
+            .align_y(Alignment::Center),
+            editor(&doc.variables, "{\"id\": \"{{user_id}}\"}", Msg::Variables).into(),
+        ]
+        .spacing(6)
+        .into(),
         K::File => column![
             field(
                 "path/to/file, from the request file's folder",
@@ -419,6 +437,7 @@ fn body_editor<'a, E: Into<Element<'a, Msg>>>(
         K::Form => "Sent URL-encoded, with its Content-Type.",
         K::Multipart => "@ marks a file part, read when the request is sent.",
         K::File => "",
+        K::Graphql => "Sent as a JSON POST. Schema shows the server's types.",
     };
     column![
         row![kind, note(hint)]

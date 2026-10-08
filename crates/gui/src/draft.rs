@@ -21,6 +21,8 @@ pub struct Draft {
     pub body: String,
     /// The file a File body sends, relative to the request file.
     pub body_file: String,
+    /// The JSON variables of a GraphQL body. Its query is in `body`.
+    pub variables: String,
     pub auth: AuthDraft,
     /// One assertion per line, such as `status == 200`, and one capture per
     /// line as `capture NAME = json PATH`.
@@ -35,12 +37,14 @@ pub enum BodyKind {
     Form,
     Multipart,
     File,
+    Graphql,
 }
 
 impl BodyKind {
-    pub const ALL: [BodyKind; 5] = [
+    pub const ALL: [BodyKind; 6] = [
         BodyKind::Text,
         BodyKind::Json,
+        BodyKind::Graphql,
         BodyKind::Form,
         BodyKind::Multipart,
         BodyKind::File,
@@ -55,6 +59,7 @@ impl std::fmt::Display for BodyKind {
             BodyKind::Form => "Form",
             BodyKind::Multipart => "Multipart",
             BodyKind::File => "File",
+            BodyKind::Graphql => "GraphQL",
         })
     }
 }
@@ -139,6 +144,10 @@ impl Draft {
             }
             Some(Body::File { path }) => {
                 (d.body_kind, d.body_file) = (BodyKind::File, path.clone())
+            }
+            Some(Body::Graphql { query, variables }) => {
+                (d.body_kind, d.body) = (BodyKind::Graphql, query.clone());
+                d.variables = variables.clone().unwrap_or_default();
             }
         }
         for a in &req.assert {
@@ -226,6 +235,10 @@ impl Draft {
             BodyKind::Json => Body::Json(self.body.clone()),
             BodyKind::Form => Body::Form(from_lines(&self.body, "form")?),
             BodyKind::Multipart => Body::Multipart(parts(&self.body)?),
+            BodyKind::Graphql => Body::Graphql {
+                query: self.body.clone(),
+                variables: Some(self.variables.clone()).filter(|v| !v.trim().is_empty()),
+            },
             BodyKind::File => return Ok(None),
         }))
     }
@@ -450,6 +463,8 @@ redirect = "http://x/y"
             "\n[body]\ntype = \"form\"\n\n[body.fields]\nname = \"ada\"\ntag = [\"a\", \"b\"]\n",
             "\n[body]\ntype = \"multipart\"\n\n[[body.parts]]\nname = \"z\"\ntext = \"first\"\n\n[[body.parts]]\nname = \"a\"\nfile = \"img/ada.png\"\ncontent_type = \"image/png\"\n",
             "\n[body]\ntype = \"file\"\npath = \"payload.bin\"\n",
+            "\n[body]\ntype = \"graphql\"\nquery = \"{ me { id } }\"\nvariables = '{\"a\": 1}'\n",
+            "\n[body]\ntype = \"graphql\"\nquery = \"{ me { id } }\"\n",
             "\n[auth]\ntype = \"bearer\"\ntoken = \"{{token}}\"\n",
             "\n[auth]\ntype = \"basic\"\nusername = \"ada\"\npassword = \"{{pw}}\"\n",
             "\n[auth]\ntype = \"api_key\"\nname = \"key\"\nvalue = \"{{key}}\"\nin = \"query\"\n",

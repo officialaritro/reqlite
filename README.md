@@ -154,6 +154,7 @@ token = "{{token}}"
 | `form` | `[body.fields]`, `name = "value"`, a name may repeat | URL-encoded, with its Content-Type |
 | `multipart` | `[[body.parts]]` with `name`, and `text` or `file`; a file part may have `content_type` | `multipart/form-data`, parts in order |
 | `file` | `path` | The file's bytes, streamed. Set Content-Type in `[headers]`. |
+| `graphql` | `query`, and `variables` as JSON text | `{"query": ..., "variables": ...}`, with `Content-Type: application/json`. See [GraphQL](#graphql). |
 
 File paths are relative to the request file. Files are read when the request is sent, and streamed, never loaded whole. A missing file stops the send and names the file, with exit code 3.
 
@@ -194,6 +195,28 @@ The CLI prints the sign-in step to stderr, and opens the browser when it runs in
 Tokens are kept in the OS keychain, under the token URL, the client ID and the scope, so they last between sends and runs. Reqlite renews a token 30 seconds before it expires, with the refresh token when there is one. If the server answers 401 to a stored token, Reqlite renews it and sends once more. Tokens are never written to the request file, and history shows them as `{{oauth_token}}`, also in response bodies and headers that echo them.
 
 In the app, Form and Multipart are written one per line as `name: value`. A multipart file part is `name: @path`, or `name: @path;type=image/png`.
+
+### GraphQL
+
+```toml
+version = 2
+name = "User"
+method = "POST"
+url = "{{base}}/graphql"
+
+[body]
+type = "graphql"
+query = "query ($id: ID!) { user(id: $id) { name role } }"
+variables = '{"id": "{{user_id}}"}'
+```
+
+Placeholders work in the query and in the variables. The variables are checked as JSON after the placeholders are filled, so `{"id": {{user_id}}}` sends a number. Variables that are not JSON stop the send with exit code 3.
+
+```sh
+reqlite graphql schema user.toml --env envs/dev.toml
+```
+
+`reqlite graphql schema` asks the request's server for its schema by introspection, with the request's URL, headers and auth, and prints it as SDL: the root types first, then the others by name. In the app, the GraphQL body has a query editor, a variables editor, and a Schema button that shows the schema in the response pane. A server that refuses introspection gives its message, with exit code 1.
 
 ### Tests and captures
 
@@ -247,7 +270,7 @@ pbpaste | reqlite import curl -o users.toml   # a command copied from the browse
 reqlite export curl users.toml
 ```
 
-`-F` and `--form-string` become a multipart body, `--data-binary @file` a file body, and `--json` a JSON body. `-u user:password` becomes Basic auth with the password as `{{password}}`, so it is not written to a file you might commit; a warning says to put it in your environment's `.local.toml`. Export writes each body type and auth back as curl options. curl cannot sign in, so OAuth 2.0 auth exports as `-H 'Authorization: Bearer {{oauth_token}}'` for you to fill.
+`-F` and `--form-string` become a multipart body, `--data-binary @file` a file body, and `--json` a JSON body. `-u user:password` becomes Basic auth with the password as `{{password}}`, so it is not written to a file you might commit; a warning says to put it in your environment's `.local.toml`. Export writes each body type and auth back as curl options. A GraphQL body becomes its JSON, with `--json`. curl cannot sign in, so OAuth 2.0 auth exports as `-H 'Authorization: Bearer {{oauth_token}}'` for you to fill.
 
 Import never drops an option silently. Anything it cannot map prints a warning, for example `-k`, or a `-d @file` body. A header that holds a literal token also gets a warning, so you can move the token to a secret. Import refuses to replace an existing file unless you pass `--force`.
 
@@ -257,7 +280,7 @@ Import never drops an option silently. Anything it cannot map prints a warning, 
 reqlite import postman Shop.postman_collection.json -o shop/
 ```
 
-Each folder becomes a directory and each request a file. `{{placeholders}}` carry over unchanged. Auth set on a folder or the collection is copied into each request that inherits it, as an `[auth]` table: bearer, basic and API key. A literal token or password becomes a `{{placeholder}}` with a warning. URL-encoded and form-data bodies, including file fields, and file bodies carry over. Reqlite runs no scripts, so every pre-request and test script prints a warning that names its request. Disabled headers, parameters and form fields, saved example responses and collection variables also print warnings.
+Each folder becomes a directory and each request a file. `{{placeholders}}` carry over unchanged. Auth set on a folder or the collection is copied into each request that inherits it, as an `[auth]` table: bearer, basic and API key. A literal token or password becomes a `{{placeholder}}` with a warning. URL-encoded and form-data bodies, including file fields, file bodies, and GraphQL bodies with their variables carry over. Reqlite runs no scripts, so every pre-request and test script prints a warning that names its request. Disabled headers, parameters and form fields, saved example responses and collection variables also print warnings.
 
 ### History
 
