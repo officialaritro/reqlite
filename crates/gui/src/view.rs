@@ -233,10 +233,13 @@ fn empty(workspace: bool) -> Element<'static, Msg> {
 }
 
 fn request_bar(doc: &Doc) -> Element<'_, Msg> {
-    let action = if doc.running() {
-        button(label("Cancel", "Esc")).on_press(Msg::Cancel)
-    } else {
-        button(label("Send", &format!("{MOD}↵"))).on_press(Msg::Send)
+    let action = match (doc.running(), doc.live.is_some()) {
+        (true, true) => button(label("Disconnect", "Esc")).on_press(Msg::Cancel),
+        (true, false) => button(label("Cancel", "Esc")).on_press(Msg::Cancel),
+        (false, _) if doc.opens_stream() => {
+            button(label("Connect", &format!("{MOD}↵"))).on_press(Msg::Send)
+        }
+        (false, _) => button(label("Send", &format!("{MOD}↵"))).on_press(Msg::Send),
     };
     let action = action.style(style::action(doc.motion.running.interpolate(
         0.0,
@@ -573,8 +576,85 @@ fn auth_editor(doc: &Doc) -> Element<'_, Msg> {
     .into()
 }
 
+/// A connection's log, newest at the bottom, and for a WebSocket a message box.
+fn live_pane<'a>(doc: &'a Doc, live: &'a crate::doc::Live) -> container::Container<'a, Msg> {
+    use reqlite_gui::live::Dir;
+    let state = match (live.open, doc.running()) {
+        (true, _) => pill("Connected", style::status_color(200)),
+        (false, true) => text("Connecting…").size(13).color(style::MUTED).into(),
+        (false, false) => pill("Closed", style::MUTED),
+    };
+    let mut count = format!("{} messages", live.log.len());
+    if live.log.dropped() > 0 {
+        count.push_str(&format!(", {} older ones not kept", live.log.dropped()));
+    }
+    let header = row![
+        state,
+        text(count).size(12).color(style::FAINT),
+        Space::new().width(Length::Fill)
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .height(28);
+    let rows = live.log.entries().map(|e| {
+        let (mark, color) = match e.dir {
+            Dir::In => ("←", style::JSON_KEY),
+            Dir::Out => ("→", style::status_color(200)),
+            Dir::Info => ("·", style::FAINT),
+        };
+        let mut line = row![
+            text(format!("{:>8.3}s", e.at.as_secs_f64()))
+                .size(12)
+                .font(style::MONO)
+                .color(style::FAINT),
+            text(mark).size(13).color(color).width(14),
+        ]
+        .spacing(8);
+        if let Some(name) = &e.name {
+            line = line.push(text(name).size(12).font(style::MONO).color(style::ACCENT));
+        }
+        let body = text(&e.text).size(13).font(style::MONO);
+        line.push(if e.dir == Dir::Info {
+            body.color(style::MUTED)
+        } else {
+            body
+        })
+        .into()
+    });
+    let log = scrollable(column(rows).spacing(4).width(Length::Fill))
+        .anchor_bottom()
+        .spacing(4)
+        .width(Length::Fill)
+        .height(Length::Fill);
+    let mut col = column![header, divider(), log].spacing(8);
+    if live.websocket {
+        let can_send = live.open && !live.message.is_empty();
+        col = col.push(
+            row![
+                text_input("Message, text or JSON", &live.message)
+                    .on_input(Msg::LiveMessage)
+                    .on_submit(Msg::LiveSend)
+                    .font(style::MONO)
+                    .size(13)
+                    .padding([8, 10])
+                    .style(style::input),
+                button(text("Send").size(13))
+                    .padding([7, 14])
+                    .on_press_maybe(can_send.then_some(Msg::LiveSend))
+                    .style(style::neutral),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+    }
+    panel(col)
+}
+
 fn response_pane(doc: &Doc) -> container::Container<'_, Msg> {
     use crate::doc::ResponseTab;
+    if let Some(live) = &doc.live {
+        return live_pane(doc, live);
+    }
     let mut header = row![status(doc), Space::new().width(Length::Fill)]
         .spacing(10)
         .align_y(Alignment::Center)

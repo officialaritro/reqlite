@@ -218,6 +218,20 @@ reqlite graphql schema user.toml --env envs/dev.toml
 
 `reqlite graphql schema` asks the request's server for its schema by introspection, with the request's URL, headers and auth, and prints it as SDL: the root types first, then the others by name. In the app, the GraphQL body has a query editor, a variables editor, and a Schema button that shows the schema in the response pane. A server that refuses introspection gives its message, with exit code 1.
 
+### WebSocket and server-sent events
+
+A request file with a `ws://` or `wss://` URL is a WebSocket. A request with the header `Accept: text/event-stream` reads server-sent events (SSE). Headers, query, auth and placeholders work as for any request.
+
+```sh
+reqlite listen chat.toml --send '{"type": "hello"}'   # then type more lines to send them
+reqlite listen events.toml --count 10                 # stop after 10 events
+reqlite listen events.toml --for 60                   # stop after 60 seconds
+```
+
+`reqlite listen` prints each message as it comes, with its time from the connect: `<` from the server, `>` sent, `-` about the connection. An SSE event shows its name in brackets. Each line typed on stdin goes out as a WebSocket text message, and the end of stdin closes nothing. The session ends when the server closes it, at `--count` or `--for`, or with Ctrl+C. It exits with code 0 when the connection ended normally and 1 when it failed. `reqlite send` and `reqlite run` do not open these connections; `send` names `reqlite listen` instead.
+
+In the app, Send becomes Connect for these requests. The response pane shows the log, newest at the bottom, and for a WebSocket a box to send text or JSON messages. Esc or Disconnect closes the connection and keeps the log. The log keeps the newest 500 messages and at most 2 MB, cuts a message over 16 KB, and counts what it dropped, so a session that runs for hours uses the same memory as a short one. Connections are not saved to history.
+
 ### Tests and captures
 
 A request can check its response and pass values to the requests after it. This needs `version = 3`. There is no script runtime: each check is one line.
@@ -313,7 +327,7 @@ A send that passes a limit exits with code 1, and the message names the limits t
 | Code | Meaning |
 |---|---|
 | 0 | The request completed, whatever the HTTP status, and every check passed |
-| 1 | The request did not complete (connect, timeout, transport, or an OAuth 2.0 sign-in), or the OS keychain failed |
+| 1 | The request did not complete (connect, timeout, transport, or an OAuth 2.0 sign-in), a WebSocket or event stream failed, or the OS keychain failed |
 | 2 | Wrong command-line usage |
 | 3 | A request or environment file is unreadable or invalid, a placeholder has no value or a secret cannot be read, or a body file is missing |
 | 4 | A check failed, or, in `reqlite run`, a request did not complete |

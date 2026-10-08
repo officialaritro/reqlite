@@ -1,6 +1,7 @@
 //! The logic behind `reqlite-gui` that needs no window.
 
 pub mod draft;
+pub mod live;
 pub mod present;
 pub mod recent;
 

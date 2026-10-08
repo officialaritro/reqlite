@@ -115,6 +115,12 @@ enum Msg {
     ClientAuth(reqlite_format::ClientAuth),
     /// A send waits for an OAuth 2.0 sign-in. The text says what to do.
     SignIn(String),
+    /// Something happened on a tab's WebSocket or SSE connection.
+    Live(DocId, reqlite_engine::stream::Timed),
+    /// The WebSocket message being typed.
+    LiveMessage(String),
+    /// Send the typed WebSocket message.
+    LiveSend,
     FocusUrl,
     Select(usize),
     NextTab,
@@ -505,6 +511,11 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
         Msg::Side(m) => return sidebar::update(app, m),
         Msg::PasteCurl(command) => import_curl(app, &command),
         Msg::SignIn(what) => app.notice = Some(what),
+        Msg::Live(id, t) => {
+            if let Some(doc) = app.by_id(id) {
+                live_event(doc, t, now);
+            }
+        }
         Msg::OpenFolder => {
             return Task::perform(
                 async {
@@ -577,8 +588,34 @@ fn edit(doc: &mut Doc, msg: Msg, now: Instant) {
         Msg::Cancel => {
             if let Send::Running(handle) = &doc.send {
                 handle.abort();
-                doc.send = Send::Cancelled;
                 doc.motion.running.go_mut(false, now);
+                doc.send = match &mut doc.live {
+                    // A connection keeps its log; closing it is not a failure.
+                    Some(live) => {
+                        live.info(live.started.elapsed(), "closed by you".into());
+                        live.open = false;
+                        live.tx = None;
+                        Send::Idle
+                    }
+                    None => Send::Cancelled,
+                };
+            }
+        }
+        Msg::LiveMessage(m) => {
+            if let Some(live) = &mut doc.live {
+                live.message = m;
+            }
+        }
+        Msg::LiveSend => {
+            if let Some(live) = doc
+                .live
+                .as_mut()
+                .filter(|l| l.open && !l.message.is_empty())
+            {
+                if let Some(tx) = &live.tx {
+                    // The Sent event logs it.
+                    tx.send(std::mem::take(&mut live.message)).ok();
+                }
             }
         }
         Msg::Scroll(lines) => doc.scroll(|top| top + lines),
@@ -638,6 +675,102 @@ fn import_curl(app: &mut App, command: &str) {
     }
 }
 
+/// Logs one event of a tab's connection.
+fn live_event(doc: &mut Doc, t: reqlite_engine::stream::Timed, now: Instant) {
+    use reqlite_engine::stream::Event;
+    use reqlite_gui::live::{Dir, Entry};
+    let Some(live) = &mut doc.live else { return };
+    let (dir, name, text) = match t.event {
+        Event::Open { status } => {
+            live.open = true;
+            (Dir::Info, None, format!("connected, status {status}"))
+        }
+        Event::Received { name, data } => (Dir::In, name, data),
+        Event::Sent { data } => (Dir::Out, None, data),
+        Event::Closed { reason } => {
+            live.open = false;
+            live.tx = None;
+            doc.send = Send::Idle;
+            doc.motion.running.go_mut(false, now);
+            (Dir::Info, None, reason)
+        }
+    };
+    live.log.push(Entry {
+        at: t.at,
+        dir,
+        name,
+        text,
+    });
+}
+
+/// Tells the window how to finish an OAuth 2.0 sign-in, and opens the browser.
+fn sign_in(
+    tell: mpsc::Sender<Msg>,
+) -> impl Fn(reqlite_engine::oauth::Prompt) + std::marker::Send + Sync {
+    move |p| {
+        let mut what = p.to_string();
+        if reqlite_engine::oauth::open_browser(p.url()).is_err() {
+            what.push_str(" (open it in a browser)");
+        }
+        // A full channel drops only the hint; the browser is already open.
+        tell.clone().try_send(Msg::SignIn(what)).ok();
+    }
+}
+
+/// Opens a WebSocket or SSE connection for `doc`. Its events come back as
+/// [`Msg::Live`], one by one.
+fn start_live(
+    doc: &mut Doc,
+    req: reqlite_engine::Resolved,
+    kind: reqlite_engine::stream::Kind,
+) -> Task<Msg> {
+    use iced::futures::StreamExt;
+    let websocket = kind == reqlite_engine::stream::Kind::WebSocket;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let message = doc.live.take().map(|l| l.message).unwrap_or_default();
+    doc.live = Some(doc::Live {
+        log: reqlite_gui::live::Log::default(),
+        tx: websocket.then_some(tx),
+        websocket,
+        open: false,
+        message,
+        started: Instant::now(),
+    });
+    doc.viewer = None;
+    doc.checks = None;
+    let id = doc.id;
+    let sending = iced::stream::channel(16, async move |mut out: mpsc::Sender<Msg>| {
+        let prompt = sign_in(out.clone());
+        let auth = reqlite_engine::oauth::Authorizer {
+            cache: &reqlite_secrets::KeychainTokens,
+            prompt: &prompt,
+            wait: std::time::Duration::from_secs(300),
+        };
+        // The engine reports events from a plain callback, so they pass
+        // through a queue the window reads at its own pace.
+        let (ev_tx, mut ev_rx) = mpsc::unbounded();
+        let session = reqlite_engine::stream::open(&req, Some(&auth), rx, move |t| {
+            ev_tx.unbounded_send(t).is_ok()
+        });
+        let forward = async {
+            while let Some(t) = ev_rx.next().await {
+                if out.send(Msg::Live(id, t)).await.is_err() {
+                    break;
+                }
+            }
+        };
+        // A failure is in the log already, as the reason of its Closed event.
+        let (ended, ()) = iced::futures::join!(session, forward);
+        ended.ok();
+    });
+    let (task, handle) = Task::run(sending, |m| m).abortable();
+    doc.send = Send::Running(handle);
+    let now = Instant::now();
+    doc.motion.since = now;
+    doc.motion.running.go_mut(true, now);
+    task
+}
+
 /// Sends the shown request, or with `schema`, its GraphQL introspection.
 fn start_send(app: &mut App, schema: bool) -> Task<Msg> {
     let (Some(client), env_path) = (app.client.clone(), app.env.clone()) else {
@@ -690,20 +823,16 @@ fn start_send(app: &mut App, schema: bool) -> Task<Msg> {
             return Task::none();
         }
     };
+    if let Some(kind) = reqlite_engine::stream::kind(&resolved).filter(|_| !schema) {
+        return start_live(doc, resolved, kind);
+    }
+    doc.live = None;
     let id = doc.id;
     let file = doc.file.as_ref().map(|p| p.display().to_string());
     let env = env_path.as_ref().map(|p| p.display().to_string());
     // A stream, so a sign-in prompt can reach the window while the send waits.
     let sending = iced::stream::channel(1, async move |mut out: mpsc::Sender<Msg>| {
-        let tell = out.clone();
-        let prompt = move |p: reqlite_engine::oauth::Prompt| {
-            let mut what = p.to_string();
-            if reqlite_engine::oauth::open_browser(p.url()).is_err() {
-                what.push_str(" (open it in a browser)");
-            }
-            // A full channel drops only the hint; the browser is already open.
-            tell.clone().try_send(Msg::SignIn(what)).ok();
-        };
+        let prompt = sign_in(out.clone());
         let done = if schema {
             run_schema(client, resolved, &prompt).await
         } else {
@@ -963,7 +1092,8 @@ fn subscription(app: &App) -> Subscription<Msg> {
         subs.push(window::frames().map(|_| Msg::FirstFrame));
     } else if app.docs.iter().any(|d| d.motion.animating(now)) {
         subs.push(window::frames().map(Msg::Tick));
-    } else if app.doc().is_some_and(Doc::running) && !app.reduced_motion {
+    } else if app.doc().is_some_and(|d| d.running() && d.live.is_none()) && !app.reduced_motion {
+        // An open connection may run for hours, so it does not pulse.
         subs.push(time::every(motion::PULSE).map(Msg::Tick));
     }
     if let Some(w) = &app.workspace {

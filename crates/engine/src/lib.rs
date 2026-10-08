@@ -8,9 +8,22 @@ pub mod check;
 pub mod graphql;
 pub mod oauth;
 mod resolve;
+pub mod stream;
 pub use resolve::{
     PartValue, Parts, ResolveError, Resolved, SendBody, SendPart, resolve, resolve_in,
 };
+
+/// An error and every cause under it, on one line.
+pub(crate) fn chain(err: &dyn std::error::Error) -> String {
+    let mut line = err.to_string();
+    let mut cause = err.source();
+    while let Some(c) = cause {
+        line.push_str(": ");
+        line.push_str(&c.to_string());
+        cause = c.source();
+    }
+    line
+}
 
 /// Bodies larger than this go to a temp file instead of memory.
 pub const SPILL_AT: usize = 1 << 20;
@@ -245,6 +258,39 @@ async fn send_once(
     req: &Resolved,
     bearer: Option<&str>,
 ) -> Result<Response, SendError> {
+    let builder = build(client, req, bearer).await?;
+    let start = Instant::now();
+    let mut resp = builder.send().await?;
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+        .collect();
+    let mut body = Store::Memory(Vec::new());
+    while let Some(chunk) = resp.chunk().await? {
+        // SHORTCUT: blocking file writes on the async task. Move to spawn_blocking
+        // if the GUI shows dropped frames while a large body downloads.
+        body = append(body, &chunk).map_err(SendError::Spill)?;
+    }
+    if let Store::File { file, .. } = &mut body {
+        file.flush().map_err(SendError::Spill)?;
+    }
+    Ok(Response {
+        status,
+        headers,
+        body: Body(body),
+        elapsed: start.elapsed(),
+        oauth_token: bearer.map(str::to_string),
+    })
+}
+
+/// The HTTP request for `req`, ready to send.
+async fn build(
+    client: &reqwest::Client,
+    req: &Resolved,
+    bearer: Option<&str>,
+) -> Result<reqwest::RequestBuilder, SendError> {
     let req = req.sent();
     let method = reqwest::Method::from_bytes(req.method.as_str().as_bytes()).map_err(|e| {
         SendError::Method {
@@ -293,31 +339,7 @@ async fn send_once(
             builder = builder.multipart(form);
         }
     }
-
-    let start = Instant::now();
-    let mut resp = builder.send().await?;
-    let status = resp.status().as_u16();
-    let headers = resp
-        .headers()
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
-        .collect();
-    let mut body = Store::Memory(Vec::new());
-    while let Some(chunk) = resp.chunk().await? {
-        // SHORTCUT: blocking file writes on the async task. Move to spawn_blocking
-        // if the GUI shows dropped frames while a large body downloads.
-        body = append(body, &chunk).map_err(SendError::Spill)?;
-    }
-    if let Store::File { file, .. } = &mut body {
-        file.flush().map_err(SendError::Spill)?;
-    }
-    Ok(Response {
-        status,
-        headers,
-        body: Body(body),
-        elapsed: start.elapsed(),
-        oauth_token: bearer.map(str::to_string),
-    })
+    Ok(builder)
 }
 
 /// A body file, opened for streaming, and its length.
