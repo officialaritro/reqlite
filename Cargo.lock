@@ -3503,6 +3503,7 @@ dependencies = [
  "reqlite-import",
  "reqlite-secrets",
  "reqlite-store",
+ "reqwest",
  "rpassword",
  "tempfile",
  "thiserror 2.0.21",
