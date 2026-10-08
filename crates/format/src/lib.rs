@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 mod body;
 mod env;
-pub use body::{Auth, Body, KeyIn, Part};
+pub use body::{Auth, Body, ClientAuth, Grant, KeyIn, OAuth2, Part};
 pub use env::{EnvError, Environment, Var, is_var_name, load_env, local_path, parse_env};
 
 /// The newest request file version this build reads and writes. Files use the
@@ -238,6 +238,21 @@ pub fn validate(req: &Request) -> Result<(), ParseError> {
         if let Auth::ApiKey { name, .. } = auth {
             if !is_token(name) {
                 return invalid(format!("invalid API key name {name:?}"));
+            }
+        }
+        if let Auth::Oauth2(o) = auth {
+            let empty = |v: &Option<String>| v.as_deref().is_none_or(|s| s.trim().is_empty());
+            if o.token_url.trim().is_empty() || o.client_id.trim().is_empty() {
+                return invalid("oauth2 needs token_url and client_id".to_string());
+            }
+            if o.grant == Grant::AuthorizationCode && empty(&o.auth_url) {
+                return invalid("the authorization_code grant needs auth_url".to_string());
+            }
+            if o.grant == Grant::DeviceCode && empty(&o.device_url) {
+                return invalid("the device_code grant needs device_url".to_string());
+            }
+            if o.grant == Grant::ClientCredentials && empty(&o.client_secret) {
+                return invalid("the client_credentials grant needs client_secret".to_string());
             }
         }
         if let Some(header) = auth.header() {
@@ -536,5 +551,41 @@ tag = ["a", "b"]
             "{V2}\n[headers]\nkey = \"h\"\n\n[auth]\ntype = \"api_key\"\nname = \"key\"\nvalue = \"v\"\nin = \"query\"\n"
         );
         assert!(parse(&text).is_ok());
+    }
+
+    #[test]
+    fn oauth2_reads_and_writes_back_the_same() {
+        for tail in [
+            "\n[auth]\ntype = \"oauth2\"\ngrant = \"client_credentials\"\ntoken_url = \"https://id/token\"\nclient_id = \"app\"\nclient_secret = \"{{secret}}\"\nscope = \"read write\"\n",
+            "\n[auth]\ntype = \"oauth2\"\ngrant = \"authorization_code\"\ntoken_url = \"https://id/token\"\nauth_url = \"https://id/authorize\"\nclient_id = \"app\"\nclient_auth = \"body\"\n",
+            "\n[auth]\ntype = \"oauth2\"\ngrant = \"device_code\"\ntoken_url = \"https://id/token\"\ndevice_url = \"https://id/device\"\nclient_id = \"app\"\n",
+        ] {
+            let text = format!("{V2}{tail}");
+            let req = parse(&text).unwrap_or_else(|e| panic!("{tail}: {e}"));
+            assert_eq!(to_string(&req).unwrap(), text, "{tail}");
+        }
+    }
+
+    #[test]
+    fn each_oauth2_grant_needs_its_own_fields() {
+        let base =
+            "\n[auth]\ntype = \"oauth2\"\ntoken_url = \"https://id/token\"\nclient_id = \"app\"\n";
+        for (extra, reason) in [
+            ("grant = \"authorization_code\"\n", "needs auth_url"),
+            ("grant = \"device_code\"\n", "needs device_url"),
+            ("grant = \"client_credentials\"\n", "needs client_secret"),
+            ("grant = \"password\"\n", "unknown variant"),
+        ] {
+            let err = parse(&format!("{V2}{base}{extra}")).unwrap_err();
+            let mut msg = err.to_string();
+            if let Some(source) = std::error::Error::source(&err) {
+                msg = format!("{msg}: {source}");
+            }
+            assert!(msg.contains(reason), "{extra} gave {msg}");
+        }
+        let clash = format!(
+            "{V2}\n[headers]\nAuthorization = \"x\"\n{base}grant = \"device_code\"\ndevice_url = \"https://id/d\"\n"
+        );
+        assert!(parse(&clash).unwrap_err().to_string().contains("set both"));
     }
 }

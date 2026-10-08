@@ -456,18 +456,21 @@ impl Entry {
     ) -> std::io::Result<Entry> {
         let outcome = match result {
             Ok(resp) => {
+                // Secrets from the environment, then the OAuth 2.0 token.
+                let hide = |bytes: &[u8]| resp.redact_token(&req.redact(bytes));
+                let token_len = resp.oauth_token.as_ref().map_or(0, String::len);
                 let mut prefix = Vec::new();
-                let keep = (BODY_CAP + req.longest_secret()) as u64;
+                let keep = (BODY_CAP + req.longest_secret().max(token_len)) as u64;
                 let reader = resp.body.reader()?;
                 std::io::Read::read_to_end(&mut std::io::Read::take(reader, keep), &mut prefix)?;
-                let mut body = req.redact(&prefix);
+                let mut body = hide(&prefix);
                 body.truncate(BODY_CAP);
                 Outcome::Response {
                     status: resp.status,
                     headers: resp
                         .headers
                         .iter()
-                        .map(|(k, v)| (k.clone(), req.redact(v)))
+                        .map(|(k, v)| (k.clone(), hide(v)))
                         .collect(),
                     body,
                     body_len: resp.body.len(),
@@ -701,6 +704,69 @@ mod tests {
         let raw = headers.iter().find(|(k, _)| k == "x-raw").unwrap();
         assert_eq!(raw.1, b"caf\xe9");
         assert_eq!(entry.request.headers[0].1, "Bearer {{token}}");
+    }
+
+    #[tokio::test]
+    async fn an_echoed_oauth_token_is_hidden_in_history() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(tokio::spawn(async move {
+            // First the token endpoint, then the API, which echoes the token.
+            for reply in [
+                br#"{"access_token":"tok-ABC123","expires_in":60}"#.to_vec(),
+                br#"{"seen":"Bearer tok-ABC123"}"#.to_vec(),
+            ] {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let _n = sock.read(&mut buf).await.unwrap();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Echo: Bearer tok-ABC123\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                );
+                sock.write_all(head.as_bytes()).await.unwrap();
+                sock.write_all(&reply).await.unwrap();
+            }
+        }));
+        let req = reqlite_format::parse(&format!(
+            "version = 2\nname = 't'\nurl = '{base}/api'\n[auth]\ntype = 'oauth2'\ngrant = 'client_credentials'\ntoken_url = '{base}/token'\nclient_id = 'app'\nclient_secret = 'cs'\n"
+        ))
+        .unwrap();
+        let resolved =
+            reqlite_engine::resolve(&req, &reqlite_format::Environment::default()).unwrap();
+
+        struct Nothing;
+        impl reqlite_engine::oauth::TokenCache for Nothing {
+            fn get(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn put(&self, _: &str, _: &str) {}
+        }
+        let auth = reqlite_engine::oauth::Authorizer {
+            cache: &Nothing,
+            prompt: &|_| {},
+            wait: std::time::Duration::from_secs(5),
+        };
+        let client = reqlite_engine::client().unwrap();
+        let resp = reqlite_engine::send_with(&client, &resolved, Some(&auth))
+            .await
+            .unwrap();
+        let entry = Entry::from_send(None, None, &resolved, Ok(&resp)).unwrap();
+        let stored = format!("{entry:?}");
+        assert!(!stored.contains("tok-ABC123"), "{stored}");
+        let Outcome::Response { headers, body, .. } = &entry.outcome else {
+            panic!("expected a response")
+        };
+        assert_eq!(body, br#"{"seen":"Bearer {{oauth_token}}"}"#);
+        let echo = headers.iter().find(|(k, _)| k == "x-echo").unwrap();
+        assert_eq!(echo.1, b"Bearer {{oauth_token}}");
+        assert_eq!(
+            entry.request.headers,
+            [(
+                "Authorization".to_string(),
+                "Bearer {{oauth_token}}".to_string()
+            )]
+        );
     }
 
     #[tokio::test]
