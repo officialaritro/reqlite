@@ -39,6 +39,11 @@ enum Command {
         #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
+    /// GraphQL helpers.
+    Graphql {
+        #[command(subcommand)]
+        action: GraphqlAction,
+    },
     /// List recent sends, newest first. Set REQLITE_DATA_DIR to move the history file.
     History {
         #[arg(long, short = 'n', default_value_t = 20)]
@@ -58,6 +63,19 @@ enum Command {
     Secret {
         #[command(subcommand)]
         action: SecretAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphqlAction {
+    /// Ask the server of a request file for its schema, and print it as SDL.
+    /// The URL, headers and auth come from the file.
+    Schema {
+        file: PathBuf,
+        #[arg(long, short)]
+        env: Option<PathBuf>,
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
     },
 }
 
@@ -126,6 +144,8 @@ enum Failure {
     Store(reqlite_store::StoreError),
     /// Assertions failed, or a request in a run did not complete. Exit 4.
     Checks(String),
+    /// The server answered, but not with what was asked for. Exit 1.
+    Answer(String),
 }
 
 impl Failure {
@@ -139,6 +159,9 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Send { file, env, timeout } => send(&file, env.as_deref(), timeout),
         Command::Run { dir, env, timeout } => run(&dir, env.as_deref(), timeout),
+        Command::Graphql {
+            action: GraphqlAction::Schema { file, env, timeout },
+        } => graphql_schema(&file, env.as_deref(), timeout),
         Command::History { limit } => history(limit),
         Command::Import {
             from:
@@ -187,6 +210,10 @@ fn main() -> ExitCode {
                 Failure::Checks(what) => {
                     eprintln!("{what}");
                     return ExitCode::from(4);
+                }
+                Failure::Answer(what) => {
+                    eprintln!("error: {what}");
+                    return ExitCode::from(1);
                 }
             };
             report(err);
@@ -563,6 +590,34 @@ fn run(dir: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<(), 
         return Err(Failure::Checks(summary));
     }
     writeln!(out, "{summary}").map_err(Failure::Output)
+}
+
+fn graphql_schema(
+    file: &Path,
+    env_path: Option<&Path>,
+    timeout: Option<u64>,
+) -> Result<(), Failure> {
+    let env = load_env(env_path)?;
+    let req = reqlite_engine::graphql::introspection(&read_request(file)?);
+    let dir = file.parent().unwrap_or(Path::new(""));
+    let req = reqlite_engine::resolve_in(&req, &env, dir).map_err(|source| {
+        Failure::input(InFile {
+            path: file.to_path_buf(),
+            source,
+        })
+    })?;
+    let resp = Sender::new(timeout)?.send(file, env_path, &req)?;
+    let mut body = Vec::new();
+    resp.body
+        .reader()
+        .and_then(|mut r| std::io::Read::read_to_end(&mut r, &mut body))
+        .map_err(Failure::Output)?;
+    let sdl = reqlite_engine::graphql::schema(&body)
+        .map_err(|e| Failure::Answer(format!("{e} (status {})", resp.status)))?;
+    let mut out = std::io::stdout().lock();
+    out.write_all(sdl.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(Failure::Output)
 }
 
 fn print_response(resp: &reqlite_engine::Response) -> Result<(), Failure> {

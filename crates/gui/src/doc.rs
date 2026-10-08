@@ -35,6 +35,7 @@ pub struct Doc {
     pub headers: text_editor::Content,
     pub query: text_editor::Content,
     pub body: text_editor::Content,
+    pub variables: text_editor::Content,
     pub body_kind: BodyKind,
     /// The path a File body sends.
     pub body_file: String,
@@ -146,6 +147,7 @@ impl Doc {
             headers: text_editor::Content::new(),
             query: text_editor::Content::new(),
             body: text_editor::Content::new(),
+            variables: text_editor::Content::new(),
             body_kind: BodyKind::default(),
             body_file: String::new(),
             auth: AuthDraft::default(),
@@ -205,6 +207,7 @@ impl Doc {
         self.headers = text_editor::Content::with_text(&d.headers);
         self.query = text_editor::Content::with_text(&d.query);
         self.body = text_editor::Content::with_text(&d.body);
+        self.variables = text_editor::Content::with_text(&d.variables);
         self.body_kind = d.body_kind;
         self.body_file.clone_from(&d.body_file);
         self.auth = d.auth.clone();
@@ -225,6 +228,7 @@ impl Doc {
             body: self.body.text(),
             body_kind: self.body_kind,
             body_file: self.body_file.clone(),
+            variables: self.variables.text(),
             auth: self.auth.clone(),
             tests: self.tests.text(),
         }

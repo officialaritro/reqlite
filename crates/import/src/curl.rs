@@ -609,6 +609,11 @@ pub fn export(req: &Request) -> String {
         Some(Body::Text(text)) => parts.push(format!("--data-raw {}", quote(text))),
         Some(Body::Json(text)) if !has_type => parts.push(format!("--json {}", quote(text))),
         Some(Body::Json(text)) => parts.push(format!("--data-raw {}", quote(text))),
+        Some(Body::Graphql { query, variables }) => {
+            let json = reqlite_format::graphql_json(query, variables.as_deref());
+            let flag = if has_type { "--data-raw" } else { "--json" };
+            parts.push(format!("{flag} {}", quote(&json)));
+        }
         Some(Body::Form(fields)) => {
             for (name, value) in fields.pairs() {
                 parts.push(format!(
