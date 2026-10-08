@@ -142,6 +142,8 @@ pub enum ResolveError {
     InvalidName { name: String, field: String },
     #[error("header {name:?} has a control character after substitution")]
     HeaderValue { name: String },
+    #[error("the GraphQL variables are not JSON: {reason}")]
+    GraphqlVariables { reason: String },
 }
 
 /// `name=value` in `application/x-www-form-urlencoded`: unreserved bytes stay,
@@ -251,6 +253,27 @@ pub fn resolve_in(req: &Request, env: &Environment, dir: &Path) -> Result<Resolv
             add_type("application/json");
             let (v, v_r) = fill(t, "body")?;
             (Some(SendBody::Text(v)), Some(SendBody::Text(v_r)))
+        }
+        Some(Body::Graphql { query, variables }) => {
+            add_type("application/json");
+            let (q, q_r) = fill(query, "GraphQL query")?;
+            let (v, v_r) = match variables {
+                Some(text) => {
+                    let (v, v_r) = fill(text, "GraphQL variables")?;
+                    (Some(v), Some(v_r))
+                }
+                None => (None, None),
+            };
+            if let Some(v) = v.as_deref().filter(|v| !v.trim().is_empty()) {
+                serde_json::from_str::<serde_json::Value>(v).map_err(|e| {
+                    ResolveError::GraphqlVariables {
+                        reason: e.to_string(),
+                    }
+                })?;
+            }
+            let sent = reqlite_format::graphql_json(&q, v.as_deref());
+            let shown = reqlite_format::graphql_json(&q_r, v_r.as_deref());
+            (Some(SendBody::Text(sent)), Some(SendBody::Text(shown)))
         }
         Some(Body::Form(fields)) => {
             add_type("application/x-www-form-urlencoded");
@@ -594,6 +617,40 @@ mod tests {
             "version = 2\nname = 't'\nurl = 'http://a'\n{extra}"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn a_graphql_body_sends_json_and_hides_secrets() {
+        let r = resolve(
+            &req2("[body]\ntype = 'graphql'\nquery = \"{ me(key: \\\"{{token}}\\\") { id } }\"\nvariables = '{\"base\": \"{{base}}\"}'\n"),
+            &env(),
+        )
+        .unwrap();
+        let text = |b: &Option<SendBody>| match b {
+            Some(SendBody::Text(t)) => t.clone(),
+            other => panic!("{other:?}"),
+        };
+        let sent: serde_json::Value = serde_json::from_str(&text(&r.sent().body)).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({"query": "{ me(key: \"s3cret\") { id } }", "variables": {"base": "http://api"}})
+        );
+        assert!(text(&r.redacted().body).contains("{{token}}"));
+        assert!(!text(&r.redacted().body).contains("s3cret"));
+        assert!(
+            r.redacted()
+                .headers
+                .contains(&("Content-Type".into(), "application/json".into()))
+        );
+
+        let bad = resolve(
+            &req2("[body]\ntype = 'graphql'\nquery = '{ a }'\nvariables = '{id: 1}'\n"),
+            &env(),
+        );
+        assert!(
+            matches!(bad, Err(ResolveError::GraphqlVariables { .. })),
+            "{bad:?}"
+        );
     }
 
     #[test]

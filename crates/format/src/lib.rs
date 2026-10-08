@@ -12,7 +12,7 @@ mod body;
 mod check;
 mod env;
 pub mod workspace;
-pub use body::{Auth, Body, ClientAuth, Grant, KeyIn, OAuth2, Part};
+pub use body::{Auth, Body, ClientAuth, Grant, KeyIn, OAuth2, Part, graphql_json};
 pub use check::{Assert, JsonPath, Op, Source, Step, Subject};
 pub use env::{EnvError, Environment, Var, is_var_name, load_env, local_path, parse_env};
 
@@ -255,6 +255,9 @@ pub fn validate(req: &Request) -> Result<(), ParseError> {
         }
         Some(Body::File { path }) if path.trim().is_empty() => {
             return invalid("the body file path is empty".to_string());
+        }
+        Some(Body::Graphql { query, .. }) if query.trim().is_empty() => {
+            return invalid("the GraphQL query is empty".to_string());
         }
         _ => {}
     }
@@ -575,6 +578,39 @@ tag = ["a", "b"]
             "{V2}\n[headers]\nkey = \"h\"\n\n[auth]\ntype = \"api_key\"\nname = \"key\"\nvalue = \"v\"\nin = \"query\"\n"
         );
         assert!(parse(&text).is_ok());
+    }
+
+    #[test]
+    fn a_graphql_body_reads_and_writes_back_the_same() {
+        let text = r#"version = 2
+name = "user"
+method = "POST"
+url = "http://h/graphql"
+
+[body]
+type = "graphql"
+query = "query ($id: ID!) { user(id: $id) { name } }"
+variables = '{"id": "{{id}}"}'
+"#;
+        let req = parse(text).unwrap();
+        assert!(matches!(
+            &req.body,
+            Some(Body::Graphql {
+                variables: Some(_),
+                ..
+            })
+        ));
+        assert_eq!(to_string(&req).unwrap(), text);
+        let empty = text.replace(
+            "query = \"query ($id: ID!) { user(id: $id) { name } }\"",
+            "query = \" \"",
+        );
+        assert!(
+            parse(&empty)
+                .unwrap_err()
+                .to_string()
+                .contains("GraphQL query is empty")
+        );
     }
 
     #[test]

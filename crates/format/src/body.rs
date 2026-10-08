@@ -4,7 +4,7 @@
 //!
 //! ```toml
 //! [body]
-//! type = "json"            # "text", "json", "form", "multipart" or "file"
+//! type = "json"            # "text", "json", "form", "multipart", "file" or "graphql"
 //! text = '{"name": "ada"}'
 //! ```
 //!
@@ -27,6 +27,12 @@ pub enum Body {
     Multipart(Vec<Part>),
     /// One file, sent as the whole body.
     File { path: String },
+    /// A GraphQL operation, sent as the JSON `{"query": ..., "variables": ...}`.
+    /// `variables` is JSON text, checked once its placeholders are filled.
+    Graphql {
+        query: String,
+        variables: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +69,11 @@ enum Table {
     File {
         path: String,
     },
+    Graphql {
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variables: Option<String>,
+    },
 }
 
 impl Serialize for Body {
@@ -78,6 +89,10 @@ impl Serialize for Body {
                 parts: parts.clone(),
             },
             Body::File { path } => Table::File { path: path.clone() },
+            Body::Graphql { query, variables } => Table::Graphql {
+                query: query.clone(),
+                variables: variables.clone(),
+            },
         };
         table.serialize(s)
     }
@@ -102,6 +117,7 @@ impl<'de> Deserialize<'de> for Body {
                     Table::Form { fields } => Body::Form(fields),
                     Table::Multipart { parts } => Body::Multipart(parts),
                     Table::File { path } => Body::File { path },
+                    Table::Graphql { query, variables } => Body::Graphql { query, variables },
                 })
             }
         }
@@ -202,6 +218,30 @@ pub enum KeyIn {
     #[default]
     Header,
     Query,
+}
+
+/// The JSON a GraphQL body sends. `variables` goes in as written, so its
+/// JSON is checked by the caller; empty variables are left out.
+pub fn graphql_json(query: &str, variables: Option<&str>) -> String {
+    let mut out = String::from("{\"query\":\"");
+    for c in query.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    if let Some(v) = variables.map(str::trim).filter(|v| !v.is_empty()) {
+        out.push_str(",\"variables\":");
+        out.push_str(v);
+    }
+    out.push('}');
+    out
 }
 
 impl Auth {

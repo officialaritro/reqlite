@@ -5,6 +5,7 @@ use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
 pub mod check;
+pub mod graphql;
 pub mod oauth;
 mod resolve;
 pub use resolve::{

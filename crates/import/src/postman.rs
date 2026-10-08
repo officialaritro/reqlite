@@ -420,18 +420,16 @@ fn request_of(
                 (!parts.is_empty()).then_some(ReqBody::Multipart(parts))
             }
             "graphql" => {
-                if !has_header(&headers, "Content-Type") {
-                    headers.append("Content-Type", "application/json");
-                }
                 let g = b.graphql.as_ref();
                 let query = g.map_or(String::new(), |g| g.query.clone());
-                let vars = g.map_or(Value::Null, |g| match &g.variables {
-                    Value::String(s) => serde_json::from_str(s).unwrap_or(Value::String(s.clone())),
-                    v => v.clone(),
+                let variables = g.and_then(|g| match &g.variables {
+                    Value::Null => None,
+                    Value::String(s) if s.trim().is_empty() => None,
+                    Value::String(s) => Some(s.clone()),
+                    v => Some(v.to_string()),
                 });
-                Some(ReqBody::Text(
-                    serde_json::json!({ "query": query, "variables": vars }).to_string(),
-                ))
+                // An empty query sends no body.
+                (!query.trim().is_empty()).then_some(ReqBody::Graphql { query, variables })
             }
             "file" => match b
                 .file
@@ -731,21 +729,20 @@ mod tests {
     }
 
     #[test]
-    fn graphql_bodies_become_json() {
+    fn graphql_bodies_stay_graphql() {
         let c = import(r#"{"info": {"name": "g", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
             "item": [{"name": "Q", "request": {"method": "POST", "url": "http://h/graphql",
               "body": {"mode": "graphql", "graphql": {"query": "{ me { id } }", "variables": "{\"a\": 1}"}}}}]}"#)
         .unwrap();
         let req = &c.files[0].1;
-        let Some(ReqBody::Text(text)) = &req.body else {
-            panic!("{:?}", req.body)
-        };
-        let body: Value = serde_json::from_str(text).unwrap();
         assert_eq!(
-            body,
-            serde_json::json!({"query": "{ me { id } }", "variables": {"a": 1}})
+            req.body,
+            Some(ReqBody::Graphql {
+                query: "{ me { id } }".into(),
+                variables: Some("{\"a\": 1}".into())
+            })
         );
-        assert_eq!(req.headers.get("Content-Type"), ["application/json"]);
+        assert!(req.headers.get("Content-Type").is_empty());
     }
 
     fn one(request: &str) -> (Request, Vec<String>) {
