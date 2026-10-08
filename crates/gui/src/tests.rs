@@ -860,6 +860,84 @@ fn a_graphql_body_has_a_variables_editor_and_a_schema_button() {
 }
 
 #[test]
+fn a_websocket_tab_connects_logs_and_sends() {
+    use reqlite_engine::stream::{Event, Timed};
+    let mut a = app(Some(
+        "version = 1\nname = \"chat\"\nurl = \"ws://127.0.0.1:9/chat\"\n",
+    ));
+    let id = a.docs[0].id;
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("Connect").is_ok());
+    drop(ui);
+
+    // The state a Connect leaves, with the engine's events fed in by hand.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    a.docs[0].live = Some(doc::Live {
+        log: reqlite_gui::live::Log::default(),
+        tx: Some(tx),
+        websocket: true,
+        open: false,
+        message: String::new(),
+        started: Instant::now(),
+    });
+    let at = |ms| Duration::from_millis(ms);
+    for (ms, event) in [
+        (5, Event::Open { status: 101 }),
+        (
+            9,
+            Event::Received {
+                name: None,
+                data: "welcome".into(),
+            },
+        ),
+    ] {
+        drop(update(&mut a, Msg::Live(id, Timed { at: at(ms), event })));
+    }
+    drop(update(&mut a, Msg::LiveMessage("{\"a\": 1}".into())));
+    drop(update(&mut a, Msg::LiveSend));
+    assert_eq!(rx.try_recv().unwrap(), "{\"a\": 1}");
+    assert_eq!(
+        a.docs[0].live.as_ref().unwrap().message,
+        "",
+        "the box empties"
+    );
+    drop(update(
+        &mut a,
+        Msg::Live(
+            id,
+            Timed {
+                at: at(12),
+                event: Event::Sent {
+                    data: "{\"a\": 1}".into(),
+                },
+            },
+        ),
+    ));
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("Connected").is_ok() && ui.find("welcome").is_ok());
+    assert!(ui.find("3 messages").is_ok());
+    drop(ui);
+
+    drop(update(
+        &mut a,
+        Msg::Live(
+            id,
+            Timed {
+                at: at(20),
+                event: Event::Closed {
+                    reason: "closed by the server: 1000 done".into(),
+                },
+            },
+        ),
+    ));
+    let live = a.docs[0].live.as_ref().unwrap();
+    assert!(!live.open && live.tx.is_none());
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("Closed").is_ok() && ui.find("closed by the server: 1000 done").is_ok());
+    assert!(ui.find("Connect").is_ok(), "it can connect again");
+}
+
+#[test]
 fn a_captured_value_fills_the_next_send() {
     let mut a = app(Some(
         "version = 1\nname = \"user\"\nurl = \"http://127.0.0.1:9/users/{{id}}\"\n",

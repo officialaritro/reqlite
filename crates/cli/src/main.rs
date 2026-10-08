@@ -39,6 +39,23 @@ enum Command {
         #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
+    /// Open a WebSocket (a ws:// or wss:// URL) or an SSE stream (a request
+    /// with `Accept: text/event-stream`) and print each message as it comes,
+    /// with its time. Each line typed on stdin is sent as a WebSocket message.
+    Listen {
+        file: PathBuf,
+        #[arg(long, short)]
+        env: Option<PathBuf>,
+        /// Send this WebSocket message once connected. Repeat for more.
+        #[arg(long, value_name = "MESSAGE")]
+        send: Vec<String>,
+        /// Close after SECS.
+        #[arg(long = "for", value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        seconds: Option<u64>,
+        /// Close after N messages from the server.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        count: Option<u64>,
+    },
     /// GraphQL helpers.
     Graphql {
         #[command(subcommand)]
@@ -159,6 +176,13 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Send { file, env, timeout } => send(&file, env.as_deref(), timeout),
         Command::Run { dir, env, timeout } => run(&dir, env.as_deref(), timeout),
+        Command::Listen {
+            file,
+            env,
+            send,
+            seconds,
+            count,
+        } => listen(&file, env.as_deref(), send, seconds, count),
         Command::Graphql {
             action: GraphqlAction::Schema { file, env, timeout },
         } => graphql_schema(&file, env.as_deref(), timeout),
@@ -518,9 +542,20 @@ fn print_checks(
     Ok(())
 }
 
+/// A WebSocket or SSE request cannot be sent once: say which command opens it.
+fn plain_only(req: &reqlite_engine::Resolved) -> Result<(), Failure> {
+    match reqlite_engine::stream::kind(req) {
+        None => Ok(()),
+        Some(_) => Err(Failure::Answer(
+            "this request opens a WebSocket or an event stream; use `reqlite listen`".into(),
+        )),
+    }
+}
+
 fn send(file: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<(), Failure> {
     let env = load_env(env_path)?;
     let req = prepare(file, &env)?;
+    plain_only(&req)?;
     let resp = Sender::new(timeout)?.send(file, env_path, &req)?;
     print_response(&resp)?;
     let checked = reqlite_engine::check::check(&req, &resp);
@@ -548,6 +583,7 @@ fn run(dir: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<(), 
     for file in &files {
         let label = file.strip_prefix(dir).unwrap_or(file).display().to_string();
         let sent = prepare(file, &env).and_then(|req| {
+            plain_only(&req)?;
             let resp = sender.send(file, env_path, &req)?;
             Ok((req, resp))
         });
@@ -560,6 +596,7 @@ fn run(dir: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<(), 
                     Failure::Send(e) => chain(e),
                     Failure::Timeout(e, limits) => format!("{} ({limits})", chain(e)),
                     Failure::Output(e) => chain(e),
+                    Failure::Answer(why) => why.clone(),
                     _ => return Err(failure),
                 };
                 writeln!(out, "{label}  FAIL  {why}").map_err(Failure::Output)?;
@@ -590,6 +627,81 @@ fn run(dir: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<(), 
         return Err(Failure::Checks(summary));
     }
     writeln!(out, "{summary}").map_err(Failure::Output)
+}
+
+fn listen(
+    file: &Path,
+    env_path: Option<&Path>,
+    messages: Vec<String>,
+    seconds: Option<u64>,
+    count: Option<u64>,
+) -> Result<(), Failure> {
+    use reqlite_engine::stream::Event;
+    let env = load_env(env_path)?;
+    let req = prepare(file, &env)?;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    for m in messages {
+        tx.send(m).ok();
+    }
+    // Lines typed on stdin go out as they come. The end of stdin closes
+    // nothing, so a run with no input keeps listening.
+    let typed = tx.clone();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines().map_while(Result::ok) {
+            if typed.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let auth = reqlite_engine::oauth::Authorizer {
+        cache: &reqlite_secrets::KeychainTokens,
+        prompt: &sign_in_prompt,
+        wait: std::time::Duration::from_secs(300),
+    };
+    let mut out = std::io::stdout().lock();
+    let mut received = 0;
+    let print = |out: &mut std::io::StdoutLock, at: std::time::Duration, mark: &str, text: &str| {
+        let pad = " ".repeat(11);
+        let text = text.replace('\n', &format!("\n{pad}"));
+        writeln!(out, "{:>8.3}s {mark} {text}", at.as_secs_f64()).and_then(|()| out.flush())
+    };
+    let session = reqlite_engine::stream::open(&req, Some(&auth), rx, |t| {
+        let line = match &t.event {
+            Event::Open { status } => format!("open, status {status}"),
+            Event::Received {
+                name: Some(n),
+                data,
+            } => format!("[{n}] {data}"),
+            Event::Received { name: None, data } | Event::Sent { data } => data.clone(),
+            Event::Closed { reason } => reason.clone(),
+        };
+        let mark = match &t.event {
+            Event::Received { .. } => "<",
+            Event::Sent { .. } => ">",
+            _ => "-",
+        };
+        if matches!(t.event, Event::Received { .. }) {
+            received += 1;
+        }
+        // A closed stdout ends the session.
+        print(&mut out, t.at, mark, &line).is_ok() && count.is_none_or(|n| received < n)
+    });
+    let rt = runtime()?;
+    let result = match seconds {
+        None => rt.block_on(session),
+        // The timer needs the runtime, so it is made inside it.
+        Some(s) => match rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(s), session).await
+        }) {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                eprintln!("closed after {s} s");
+                Ok(())
+            }
+        },
+    };
+    drop(tx);
+    result.map_err(Failure::Answer)
 }
 
 fn graphql_schema(

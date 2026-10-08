@@ -50,6 +50,8 @@ pub struct Doc {
     /// The last response's headers, decoded for display.
     pub response_headers: Vec<(String, String)>,
     pub response_tab: ResponseTab,
+    /// The WebSocket or SSE connection of the last Connect, with its log.
+    pub live: Option<Live>,
     /// The last response's assertion and capture results.
     pub checks: Option<reqlite_engine::check::Checked>,
     /// Why the file could not be opened. Shown for as long as the tab lives.
@@ -59,6 +61,30 @@ pub struct Doc {
     /// The file name for the tab and the title.
     pub label: String,
     pub motion: Motion,
+}
+
+pub struct Live {
+    pub log: reqlite_gui::live::Log,
+    /// Takes WebSocket messages to send. `None` for SSE, and once closed.
+    pub tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    pub websocket: bool,
+    /// The handshake finished and the connection has not closed.
+    pub open: bool,
+    /// The message being typed.
+    pub message: String,
+    /// When Connect was pressed: log times count from here.
+    pub started: std::time::Instant,
+}
+
+impl Live {
+    pub fn info(&mut self, at: Duration, text: String) {
+        self.log.push(reqlite_gui::live::Entry {
+            at,
+            dir: reqlite_gui::live::Dir::Info,
+            name: None,
+            text,
+        });
+    }
 }
 
 pub enum Send {
@@ -160,6 +186,7 @@ impl Doc {
             response_headers: Vec::new(),
             response_tab: ResponseTab::Body,
             checks: None,
+            live: None,
             open_error: None,
             conflict: false,
             motion: Motion::new(reduced_motion),
@@ -252,6 +279,19 @@ impl Doc {
     /// True when closing the tab would lose typing.
     pub fn unsaved(&self) -> bool {
         self.dirty && self.file.is_some()
+    }
+
+    /// True when Send opens a connection: a WebSocket URL, or a request for
+    /// an event stream.
+    pub fn opens_stream(&self) -> bool {
+        let url = self.url.trim_start().to_ascii_lowercase();
+        url.starts_with("ws://")
+            || url.starts_with("wss://")
+            || self.headers.text().lines().any(|l| {
+                l.split_once(':').is_some_and(|(k, v)| {
+                    k.trim().eq_ignore_ascii_case("accept") && v.contains("text/event-stream")
+                })
+            })
     }
 
     pub fn running(&self) -> bool {
