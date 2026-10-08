@@ -594,6 +594,8 @@ pub fn export(req: &Request) -> String {
             value,
             location: KeyIn::Header,
         }) => parts.push(header(name, value)),
+        // curl cannot sign in, so the token is left for the user to fill.
+        Some(Auth::Oauth2(_)) => parts.push(header("Authorization", "Bearer {{oauth_token}}")),
         _ => {}
     }
     let has_type = req
@@ -807,6 +809,18 @@ mod tests {
             import("curl -F a=1 -d b=2 http://h/"),
             Err(CurlError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn oauth2_exports_as_a_bearer_placeholder() {
+        let req = reqlite_format::parse(
+            "version = 2\nname = \"x\"\nmethod = \"GET\"\nurl = \"http://h/\"\n\n[auth]\ntype = \"oauth2\"\ngrant = \"device_code\"\ntoken_url = \"https://id/t\"\ndevice_url = \"https://id/d\"\nclient_id = \"app\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            export(&req),
+            "curl \\\n  'http://h/' \\\n  -H 'Authorization: Bearer {{oauth_token}}'"
+        );
     }
 
     #[test]

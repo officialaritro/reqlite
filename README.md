@@ -162,8 +162,36 @@ File paths are relative to the request file. Files are read when the request is 
 | `bearer` | `token` | `Authorization: Bearer <token>` |
 | `basic` | `username`, `password` | `Authorization: Basic <base64 of username:password>` |
 | `api_key` | `name`, `value`, `in = "header"` (the default) or `"query"` | The key as a header, or in the query |
+| `oauth2` | See [OAuth 2.0](#oauth-20) | `Authorization: Bearer <token>`, with the token fetched by Reqlite |
 
 Put secrets in placeholders, such as `password = "{{password}}"`. History hides them like any other secret, including a Basic auth value that a server echoes back. If `[auth]` would set a header that `[headers]` also sets, the file is refused, so one never quietly wins over the other.
+
+#### OAuth 2.0
+
+Reqlite gets the access token itself, with one of three grants:
+
+```toml
+[auth]
+type = "oauth2"
+grant = "client_credentials"        # or "authorization_code", or "device_code"
+token_url = "https://id.example.com/oauth/token"
+client_id = "my-app"
+client_secret = "{{client_secret}}" # required for client_credentials; optional for the others
+scope = "read write"                # optional
+# auth_url = "https://id.example.com/authorize"     # authorization_code only
+# device_url = "https://id.example.com/device/code" # device_code only
+# client_auth = "body"              # send the client ID and secret as form fields; the default is a Basic header
+```
+
+| `grant` | What you do |
+|---|---|
+| `client_credentials` | Nothing. Reqlite signs in with the client ID and secret. |
+| `authorization_code` | Sign in in your browser. Reqlite uses PKCE and waits for the redirect on `http://127.0.0.1:<port>/callback`, so register `http://127.0.0.1` as a redirect URI with your provider. |
+| `device_code` | Open the page Reqlite shows and enter the code. |
+
+The CLI prints the sign-in step to stderr, and opens the browser when it runs in a terminal. The app opens the browser and shows the step in the status bar. Reqlite waits up to 5 minutes for a sign-in. Press Esc in the app to stop waiting.
+
+Tokens are kept in the OS keychain, under the token URL, the client ID and the scope, so they last between sends and runs. Reqlite renews a token 30 seconds before it expires, with the refresh token when there is one. If the server answers 401 to a stored token, Reqlite renews it and sends once more. Tokens are never written to the request file, and history shows them as `{{oauth_token}}`, also in response bodies and headers that echo them.
 
 In the app, Form and Multipart are written one per line as `name: value`. A multipart file part is `name: @path`, or `name: @path;type=image/png`.
 
@@ -175,7 +203,7 @@ pbpaste | reqlite import curl -o users.toml   # a command copied from the browse
 reqlite export curl users.toml
 ```
 
-`-F` and `--form-string` become a multipart body, `--data-binary @file` a file body, and `--json` a JSON body. `-u user:password` becomes Basic auth with the password as `{{password}}`, so it is not written to a file you might commit; a warning says to put it in your environment's `.local.toml`. Export writes each body type and auth back as curl options.
+`-F` and `--form-string` become a multipart body, `--data-binary @file` a file body, and `--json` a JSON body. `-u user:password` becomes Basic auth with the password as `{{password}}`, so it is not written to a file you might commit; a warning says to put it in your environment's `.local.toml`. Export writes each body type and auth back as curl options. curl cannot sign in, so OAuth 2.0 auth exports as `-H 'Authorization: Bearer {{oauth_token}}'` for you to fill.
 
 Import never drops an option silently. Anything it cannot map prints a warning, for example `-k`, or a `-d @file` body. A header that holds a literal token also gets a warning, so you can move the token to a secret. Import refuses to replace an existing file unless you pass `--force`.
 
@@ -218,7 +246,7 @@ A send that passes a limit exits with code 1, and the message names the limits t
 | Code | Meaning |
 |---|---|
 | 0 | The request completed, whatever the HTTP status |
-| 1 | The request did not complete (connect, timeout, transport), or the OS keychain failed |
+| 1 | The request did not complete (connect, timeout, transport, or an OAuth 2.0 sign-in), or the OS keychain failed |
 | 2 | Wrong command-line usage |
 | 3 | A request or environment file is unreadable or invalid, a placeholder has no value or a secret cannot be read, or a body file is missing |
 
