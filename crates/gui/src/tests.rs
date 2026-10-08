@@ -269,6 +269,7 @@ fn a_result_goes_to_the_tab_that_sent_it() {
     drop(update(&mut a, Msg::Select(1)));
     let done = Finished {
         result: Err("connection refused".into()),
+        checked: None,
         opened: None,
         warning: None,
     };
@@ -819,6 +820,7 @@ fn the_headers_tab_lists_the_response_headers_in_order() {
     let id = a.docs[0].id;
     let doc = Document::build_with(&b"<a>1</a>"[..], Some("text/xml")).unwrap();
     let done = Finished {
+        checked: None,
         result: Ok(Loaded {
             doc: Arc::new(doc),
             summary: Summary {
@@ -842,6 +844,64 @@ fn the_headers_tab_lists_the_response_headers_in_order() {
     drop(update(&mut a, Msg::ResponseTab(doc::ResponseTab::Headers)));
     let mut ui = simulator(view::view(&a));
     assert!(ui.find("x-trace").is_ok() && ui.find("abc").is_ok());
+}
+
+#[test]
+fn a_captured_value_fills_the_next_send() {
+    let mut a = app(Some(
+        "version = 1\nname = \"user\"\nurl = \"http://127.0.0.1:9/users/{{id}}\"\n",
+    ));
+    drop(update(&mut a, Msg::Send));
+    let Send::Finished(Err(e)) = &a.docs[0].send else {
+        panic!("sent without a value for id")
+    };
+    assert!(e.contains("id"), "{e}");
+    a.captured.insert("id".into(), "7".into());
+    a.docs[0].send = Send::Idle;
+    drop(update(&mut a, Msg::Send));
+    assert!(a.docs[0].running(), "the captured id fills the URL");
+}
+
+#[test]
+fn the_tests_tab_shows_each_check_and_captures_are_kept() {
+    use reqlite_engine::check::{Checked, Outcome};
+    let mut a = app(Some(FILE));
+    let id = a.docs[0].id;
+    let line = |text: &str, pass: bool, detail: &str| Outcome {
+        text: text.into(),
+        pass,
+        detail: detail.into(),
+    };
+    let done = Finished {
+        checked: Some(Checked {
+            outcomes: vec![
+                line("status == 201", false, "got 200"),
+                line("capture id = json $.id", true, ""),
+            ],
+            captured: vec![("id".into(), "42".into())],
+        }),
+        result: Ok(Loaded {
+            doc: Arc::new(Document::build_with(&b"{}"[..], None).unwrap()),
+            summary: Summary {
+                status: 200,
+                elapsed: Duration::ZERO,
+                bytes: 2,
+            },
+            headers: Vec::new(),
+        }),
+        opened: None,
+        warning: None,
+    };
+    drop(update(&mut a, Msg::Sent(id, Box::new(done))));
+    assert_eq!(a.captured.get("id").map(String::as_str), Some("42"));
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("Tests 1/2").is_ok());
+    assert!(ui.find("got 200").is_err(), "the body shows first");
+    drop(ui);
+    drop(update(&mut a, Msg::ResponseTab(doc::ResponseTab::Tests)));
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("status == 201").is_ok() && ui.find("got 200").is_ok());
+    assert!(ui.find("capture id = json $.id").is_ok());
 }
 
 #[test]

@@ -323,6 +323,7 @@ fn request_pane(doc: &Doc) -> container::Container<'_, Msg> {
         tab(Section::Headers, "Headers", count(doc.counts.headers)),
         tab(Section::Body, "Body", dot(doc.counts.body)),
         tab(Section::Auth, "Auth", dot(doc.counts.auth)),
+        tab(Section::Tests, "Tests", count(doc.counts.tests)),
     ]
     .spacing(4);
     let editor = |content, placeholder, on: fn(text_editor::Action) -> Msg| {
@@ -341,6 +342,12 @@ fn request_pane(doc: &Doc) -> container::Container<'_, Msg> {
         Section::Headers => editor(&doc.headers, "Name: value, one per line", Msg::Headers).into(),
         Section::Body => body_editor(doc, editor),
         Section::Auth => auth_editor(doc),
+        Section::Tests => editor(
+            &doc.tests,
+            "One check per line, such as\nstatus == 200\njson $.id exists\ncapture id = json $.id",
+            Msg::Tests,
+        )
+        .into(),
     };
     panel(column![sections, content].spacing(8))
 }
@@ -566,21 +573,33 @@ fn response_pane(doc: &Doc) -> container::Container<'_, Msg> {
             ResponseTab::Headers,
             format!("Headers {}", doc.response_headers.len()),
         ));
+        if let Some(c) = doc.checks.as_ref().filter(|c| !c.outcomes.is_empty()) {
+            let passed = c.outcomes.len() - c.failed();
+            header = header.push(tab(
+                ResponseTab::Tests,
+                format!("Tests {passed}/{}", c.outcomes.len()),
+            ));
+        }
     }
     if let (Some(v), ResponseTab::Body) = (shown, doc.response_tab) {
-        header = header.push(
-            text(format!(
-                "line {} of {}",
-                v.top + 1,
-                v.doc.line_count().max(1)
-            ))
+        // Short, so it fits next to three response tabs.
+        let at = text(format!("{}/{}", v.top + 1, v.doc.line_count().max(1)))
             .size(12)
-            .color(style::FAINT),
-        );
+            .font(style::MONO)
+            .color(style::FAINT);
+        let tip = container(text("Top line shown / lines").size(12))
+            .padding([3, 8])
+            .style(container::rounded_box);
+        header = header.push(iced::widget::tooltip(
+            at,
+            tip,
+            iced::widget::tooltip::Position::Bottom,
+        ));
     }
     let body: Element<'_, Msg> = match (&doc.send, shown) {
         (Send::Finished(Err(e)), _) => message(e, style::DANGER),
         (_, Some(_)) if doc.response_tab == ResponseTab::Headers => headers(&doc.response_headers),
+        (_, Some(_)) if doc.response_tab == ResponseTab::Tests => checks(doc.checks.as_ref()),
         (_, Some(v)) => viewer(v, doc.motion.reveal.interpolate(0.0, 1.0, doc.motion.now)),
         (Send::Running(_), None) => message("Sending…", pulse(doc)),
         (Send::Cancelled, None) => message("Cancelled.", style::MUTED),
@@ -607,6 +626,35 @@ fn headers(list: &[(String, String)]) -> Element<'_, Msg> {
         .into()
     });
     scrollable(column(rows).spacing(4))
+        .spacing(4)
+        .height(Length::Fill)
+        .into()
+}
+
+/// One row per assertion and capture: a mark, the line, and why it failed.
+fn checks(checked: Option<&reqlite_engine::check::Checked>) -> Element<'_, Msg> {
+    let rows = checked.into_iter().flat_map(|c| &c.outcomes).map(|o| {
+        let (mark, color) = if o.pass {
+            ("✓", style::status_color(200))
+        } else {
+            ("✕", style::DANGER)
+        };
+        let mut line = row![
+            text(mark).size(13).color(color).width(16),
+            text(&o.text).size(13).font(style::MONO),
+        ]
+        .spacing(8);
+        if !o.pass {
+            line = line.push(
+                text(&o.detail)
+                    .size(13)
+                    .font(style::MONO)
+                    .color(style::MUTED),
+            );
+        }
+        line.into()
+    });
+    scrollable(column(rows).spacing(6))
         .spacing(4)
         .height(Length::Fill)
         .into()
@@ -797,7 +845,7 @@ fn status_bar(app: &App) -> Element<'_, Msg> {
     let right = match &app.notice {
         Some(n) => text(n).size(12).color(style::WARNING),
         None => text(format!(
-            "{MOD}↵ send · {MOD}S save · {MOD}L URL · {MOD}1–4 sections · {MOD}N new · {MOD}Y history · Ctrl+Tab next tab · Esc cancel"
+            "{MOD}↵ send · {MOD}S save · {MOD}L URL · {MOD}1–5 sections · {MOD}N new · {MOD}Y history · Ctrl+Tab next tab · Esc cancel"
         ))
         .size(12)
         .color(style::FAINT),
