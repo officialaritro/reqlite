@@ -95,7 +95,24 @@ secrets = ["token"]
 base = "http://localhost:3000"
 ```
 
-Secret values never go in that file. Put them in `envs/dev.local.toml` next to it. The repo's `.gitignore` already ignores `*.local.toml`.
+Secret values never go in that file. Keep them in the OS keychain (macOS Keychain, Windows Credential Manager, or the Secret Service on Linux), or in `envs/dev.local.toml` next to the file. The repo's `.gitignore` already ignores `*.local.toml`.
+
+```sh
+reqlite secret set --env envs/dev.toml token      # asks for the value without showing it
+printf %s "$TOKEN" | reqlite secret set --env envs/dev.toml token   # or reads it from a pipe
+reqlite secret delete --env envs/dev.toml token
+```
+
+`secret set` stores only names the environment lists in `secrets`. Each value is stored for that environment file's full path, so `dev.toml` in two projects never share a value. If you move a project folder, set its secrets again.
+
+To find a secret's value, Reqlite looks in this order:
+
+1. the environment's `.local.toml` file;
+2. the OS keychain.
+
+Both the CLI and the desktop app use this order. A secret with no value in either place stops the send and names both ways to set it. If the keychain fails to answer, for example because it is locked, the send stops with that reason. That happens only when the request uses the secret.
+
+Or use the local file:
 
 ```toml
 # envs/dev.local.toml (not committed)
@@ -201,9 +218,9 @@ A send that passes a limit exits with code 1, and the message names the limits t
 | Code | Meaning |
 |---|---|
 | 0 | The request completed, whatever the HTTP status |
-| 1 | The request did not complete (connect, timeout, transport) |
+| 1 | The request did not complete (connect, timeout, transport), or the OS keychain failed |
 | 2 | Wrong command-line usage |
-| 3 | A request or environment file is unreadable or invalid, a placeholder has no value, or a body file is missing |
+| 3 | A request or environment file is unreadable or invalid, a placeholder has no value or a secret cannot be read, or a body file is missing |
 
 ## Layout
 
