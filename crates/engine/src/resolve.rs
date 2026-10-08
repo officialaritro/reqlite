@@ -105,9 +105,15 @@ pub enum ResolveError {
     #[error("{{{{{name}}}}} in {field} is not defined in the environment")]
     Undefined { name: String, field: String },
     #[error(
-        "secret {{{{{name}}}}} in {field} has no value; set it in the environment's .local.toml file"
+        "secret {{{{{name}}}}} in {field} has no value; set it with `reqlite secret set` or in the environment's .local.toml file"
     )]
     MissingSecret { name: String, field: String },
+    #[error("secret {{{{{name}}}}} in {field} cannot be read: {reason}")]
+    SecretUnavailable {
+        name: String,
+        field: String,
+        reason: String,
+    },
     #[error("{{{{ in {field} is not closed with }}}}")]
     Unclosed { field: String },
     #[error("invalid variable name {name:?} in {field}")]
@@ -380,6 +386,13 @@ fn fill(
                 shown.push_str(name);
                 shown.push_str("}}");
             }
+            Some(Var::Unavailable(reason)) => {
+                return Err(ResolveError::SecretUnavailable {
+                    name: name.into(),
+                    field: field.into(),
+                    reason: reason.clone(),
+                });
+            }
             Some(Var::MissingSecret) => {
                 return Err(ResolveError::MissingSecret {
                     name: name.into(),
@@ -643,5 +656,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(key.sent().headers, [("X-Key".into(), "s3cret".into())]);
+    }
+
+    #[test]
+    fn a_secret_that_cannot_be_read_fails_only_where_it_is_used() {
+        let mut env = env();
+        env.supply("unset", Err("the keychain is locked".into()));
+        let err = resolve(&req("url = 'http://a'\nbody = '{{unset}}'\n"), &env).unwrap_err();
+        assert_eq!(
+            err,
+            ResolveError::SecretUnavailable {
+                name: "unset".into(),
+                field: "body".into(),
+                reason: "the keychain is locked".into(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "secret {{unset}} in body cannot be read: the keychain is locked"
+        );
+        assert!(
+            resolve(&req("url = '{{base}}'\n"), &env).is_ok(),
+            "a request that does not use it still resolves"
+        );
+    }
+
+    #[test]
+    fn a_secret_with_no_value_names_both_ways_to_set_it() {
+        let err = resolve(&req("url = 'http://a'\nbody = '{{unset}}'\n"), &env()).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("reqlite secret set") && text.contains(".local.toml"),
+            "{text}"
+        );
     }
 }
