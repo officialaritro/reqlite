@@ -74,7 +74,7 @@ pub fn check(req: &Resolved, resp: &Response) -> Checked {
                 .and_then(|j| json_check(get(j, path.steps()), a.op, &a.value)),
         };
         out.outcomes
-            .push(outcome(shown.clone(), result.map_err(&hide)));
+            .push(outcome(shown.clone(), result.map_err(hide)));
     }
     for (name, source) in req.capture() {
         let value = match source {
