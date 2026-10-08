@@ -8,7 +8,7 @@ use iced::widget::{
     Space, button, column, container, mouse_area, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Element, Length, Padding, Task};
-use reqlite_gui::workspace::{self, Kind, Node};
+use reqlite_format::workspace::{self, Kind, Node};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 

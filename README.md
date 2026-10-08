@@ -42,7 +42,7 @@ The status bar picks the environment: "No environment", or any `envs/*.toml` in 
 
 The History panel lists recent sends, newest first, from every request or only the open one. Choosing an entry opens it in a new tab with what was sent and the stored response. That tab has no file, so a Save never writes the values that were resolved for the send over a request file. Secrets stay as `{{name}}`, as stored. History keeps the first 256 KB of each response.
 
-In each tab, the request is on the left and the response is on the right. When the area right of the sidebar is narrower than 680 px, the response moves under the request. The request has four sections, Query, Headers, Body and Auth, and each shows what it holds. The Body section picks the body type, and the Auth section the auth type (see [Bodies and auth](#bodies-and-auth)). The response shows the status, the time and the size, with two tabs: the body with line numbers, and the headers. JSON, XML and HTML bodies are re-indented and coloured.
+In each tab, the request is on the left and the response is on the right. When the area right of the sidebar is narrower than 680 px, the response moves under the request. The request has five sections, Query, Headers, Body, Auth and Tests, and each shows what it holds. The Body section picks the body type, and the Auth section the auth type (see [Bodies and auth](#bodies-and-auth)). The Tests section holds the request's checks, one per line (see [Tests and captures](#tests-and-captures)). The response shows the status, the time and the size, with up to three tabs: the body with line numbers, the headers, and, when the request has checks, the result of each one. The number at the right of the body, such as `1/4`, is the top line shown and the line count. JSON, XML and HTML bodies are re-indented and coloured.
 
 | Action | How |
 |---|---|
@@ -51,7 +51,7 @@ In each tab, the request is on the left and the response is on the right. When t
 | Save | Cmd+S or Ctrl+S, or the Save button. Enabled only when the form differs from the file. |
 | Go to the URL | Cmd+L or Ctrl+L |
 | Import a cURL command | Paste it into the URL field (Cmd+V or Ctrl+V). It fills the method, URL, headers, query, body and auth of the shown request, and the status bar lists anything it could not map. A command that cannot be read changes nothing. Other pasted text goes into the field as before. |
-| Switch sections | Cmd+1, 2, 3, 4 or Ctrl+1, 2, 3, 4 for Query, Headers, Body, Auth |
+| Switch sections | Cmd+1 to 5 or Ctrl+1 to 5 for Query, Headers, Body, Auth, Tests |
 | Open a folder | Cmd+O or Ctrl+O, Open… above the sidebar, or Open folder… in an empty window |
 | New request | Cmd+N or Ctrl+N, or + Request in the sidebar |
 | Next tab | Ctrl+Tab |
@@ -130,7 +130,7 @@ An undefined placeholder stops the send and names the variable.
 
 ### Bodies and auth
 
-A body written as a string is sent as it is, and the file stays at `version = 1`. Other body types and auth need `version = 2`. Reqlite writes the lowest version a request needs, so files that use nothing new do not change.
+A body written as a string is sent as it is, and the file stays at `version = 1`. Other body types and auth need `version = 2`, and checks and captures `version = 3`. Reqlite writes the lowest version a request needs, so files that use nothing new do not change.
 
 ```toml
 version = 2
@@ -195,6 +195,50 @@ Tokens are kept in the OS keychain, under the token URL, the client ID and the s
 
 In the app, Form and Multipart are written one per line as `name: value`. A multipart file part is `name: @path`, or `name: @path;type=image/png`.
 
+### Tests and captures
+
+A request can check its response and pass values to the requests after it. This needs `version = 3`. There is no script runtime: each check is one line.
+
+```toml
+version = 3
+name = "Create user"
+method = "POST"
+url = "{{base}}/users"
+assert = [
+  "status == 201",
+  "header Content-Type contains json",
+  "json $.name == \"ada\"",
+  "json $.roles contains admin",
+  "time < 500",
+]
+
+[capture]
+user_id = "json $.id"           # later requests use {{user_id}}
+token = "header X-Token"
+```
+
+A check is a subject, an operator and, for most operators, a value:
+
+| Subject | Operators | Compares |
+|---|---|---|
+| `status` | `==`, `!=`, `<`, `>` | The status code |
+| `header NAME` | `==`, `!=`, `contains`, `exists` | Each value of the header. The name is not case-sensitive. |
+| `json PATH` | `==`, `!=`, `contains`, `exists`, `<`, `>` | The value at the path. `contains` looks in a string, an array, or an object's keys. |
+| `body` | `contains` | The raw body |
+| `time` | `<`, `>` | The response time in milliseconds |
+
+A value is a JSON literal, such as `42`, `true` or `"ada"`, or plain text. `42` and `42.0` are equal. A value may use `{{placeholders}}`. A path starts at `$` and has `.key`, `["key with spaces"]` and `[0]` steps. A capture takes `json PATH` or `header NAME`.
+
+```sh
+reqlite run api/ --env api/envs/dev.toml
+```
+
+`reqlite run` sends every request file in a folder, in the order the app's sidebar shows them: folders first, then files, each by name. Prefix names with numbers, such as `1 login.toml`, to set the order. Captured values fill placeholders in the requests after the one that captured them. A captured name that the environment declares secret stays secret, so history hides it. Other captured values are stored in history as sent. The run prints one line per check and goes on after a failure. It exits with code 4 when a check fails or a request does not complete, so CI can use it.
+
+`reqlite send` also runs the request's checks, prints them to stderr, and exits with code 4 when one fails. In the app, the Tests tab of the response lists each check with what came back. Values captured in the app fill the sends after them until the app quits.
+
+Postman test scripts are not imported: each one prints a warning. cURL export leaves the checks out.
+
 ### cURL import and export
 
 ```sh
@@ -245,10 +289,11 @@ A send that passes a limit exits with code 1, and the message names the limits t
 
 | Code | Meaning |
 |---|---|
-| 0 | The request completed, whatever the HTTP status |
+| 0 | The request completed, whatever the HTTP status, and every check passed |
 | 1 | The request did not complete (connect, timeout, transport, or an OAuth 2.0 sign-in), or the OS keychain failed |
 | 2 | Wrong command-line usage |
 | 3 | A request or environment file is unreadable or invalid, a placeholder has no value or a secret cannot be read, or a body file is missing |
+| 4 | A check failed, or, in `reqlite run`, a request did not complete |
 
 ## Layout
 

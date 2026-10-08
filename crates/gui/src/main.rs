@@ -75,6 +75,9 @@ struct App {
     reduced_motion: bool,
     /// Where `last-workspace.txt` lives. `None` in tests.
     data_dir: Option<PathBuf>,
+    /// Values captured from responses, for the sends after them. Kept until
+    /// the app quits.
+    captured: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -84,6 +87,7 @@ enum Msg {
     Headers(text_editor::Action),
     Query(text_editor::Action),
     Body(text_editor::Action),
+    Tests(text_editor::Action),
     Send,
     Cancel,
     Sent(DocId, Box<Finished>),
@@ -184,6 +188,7 @@ struct Loaded {
 #[derive(Clone)]
 struct Finished {
     result: Result<Loaded, String>,
+    checked: Option<reqlite_engine::check::Checked>,
     /// Set when this send opened the history database.
     opened: Option<reqlite_store::Store>,
     warning: Option<String>,
@@ -237,6 +242,7 @@ fn boot(
         exit_after_first_frame: std::env::var_os("REQLITE_GUI_EXIT_ON_FIRST_FRAME").is_some(),
         reduced_motion,
         data_dir,
+        captured: Default::default(),
     };
     match start {
         // Started from Finder or the Dock: the last workspace, or the
@@ -376,9 +382,13 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
         Msg::Sent(id, done) => {
             let Finished {
                 result,
+                checked,
                 opened,
                 warning,
             } = *done;
+            if let Some(c) = &checked {
+                app.captured.extend(c.captured.iter().cloned());
+            }
             if opened.is_some() {
                 app.history = opened;
             }
@@ -386,6 +396,7 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
             let refresh = app.left_panel() == Some(Panel::History);
             if let Some(doc) = app.by_id(id) {
                 doc.motion.running.go_mut(false, now);
+                doc.checks = checked;
                 match result {
                     Ok(loaded) => {
                         doc.motion.reveal(now);
@@ -557,6 +568,7 @@ fn edit(doc: &mut Doc, msg: Msg, now: Instant) {
         Msg::Headers(a) => doc.headers.perform(a),
         Msg::Query(a) => doc.query.perform(a),
         Msg::Body(a) => doc.body.perform(a),
+        Msg::Tests(a) => doc.tests.perform(a),
         Msg::Cancel => {
             if let Send::Running(handle) = &doc.send {
                 handle.abort();
@@ -627,6 +639,7 @@ fn start_send(app: &mut App) -> Task<Msg> {
     };
     let history = app.history.clone();
     let history_tried = app.history_tried;
+    let captured = app.captured.clone();
     let Some(doc) = app.doc_mut() else {
         return Task::none();
     };
@@ -651,7 +664,13 @@ fn start_send(app: &mut App) -> Task<Msg> {
         Some(path) => {
             reqlite_secrets::load_env(path, &reqlite_secrets::Keychain).map_err(|e| chain(&e))
         }
-    };
+    }
+    .map(|mut env| {
+        for (name, value) in &captured {
+            env.capture(name, value.clone());
+        }
+        env
+    });
     let resolved = match env
         .and_then(|env| reqlite_engine::resolve_in(&req, &env, &dir).map_err(|e| e.to_string()))
     {
@@ -736,8 +755,13 @@ async fn run_send(
             warning = Some(format!("this send was not saved to history: {e}"));
         }
     }
+    let checked = result
+        .as_ref()
+        .ok()
+        .map(|resp| reqlite_engine::check::check(&req, resp));
     Finished {
         result: show(result).await,
+        checked,
         opened,
         warning,
     }
@@ -829,6 +853,7 @@ fn shortcut(key: &Key, modifiers: Modifiers) -> Option<Msg> {
         Key::Character("2") => Some(Msg::Section(Section::Headers)),
         Key::Character("3") => Some(Msg::Section(Section::Body)),
         Key::Character("4") => Some(Msg::Section(Section::Auth)),
+        Key::Character("5") => Some(Msg::Section(Section::Tests)),
         Key::Character("n") => Some(Msg::New),
         Key::Character("o") => Some(Msg::OpenFolder),
         Key::Character("w") => Some(Msg::CloseActive),

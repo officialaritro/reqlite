@@ -39,6 +39,7 @@ pub struct Doc {
     /// The path a File body sends.
     pub body_file: String,
     pub auth: AuthDraft,
+    pub tests: text_editor::Content,
     pub section: Section,
     /// Derived from the fields and `saved`, refreshed after each change.
     pub dirty: bool,
@@ -48,6 +49,8 @@ pub struct Doc {
     /// The last response's headers, decoded for display.
     pub response_headers: Vec<(String, String)>,
     pub response_tab: ResponseTab,
+    /// The last response's assertion and capture results.
+    pub checks: Option<reqlite_engine::check::Checked>,
     /// Why the file could not be opened. Shown for as long as the tab lives.
     pub open_error: Option<String>,
     /// The last save found the file changed on disk. The next Save overwrites.
@@ -78,13 +81,15 @@ pub enum Section {
     Headers,
     Body,
     Auth,
+    Tests,
 }
 
-/// The two views of a response.
+/// The views of a response.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ResponseTab {
     Body,
     Headers,
+    Tests,
 }
 
 /// What each section holds, shown on its tab.
@@ -94,6 +99,7 @@ pub struct Counts {
     pub headers: usize,
     pub body: bool,
     pub auth: bool,
+    pub tests: usize,
 }
 
 pub struct Viewer {
@@ -143,6 +149,7 @@ impl Doc {
             body_kind: BodyKind::default(),
             body_file: String::new(),
             auth: AuthDraft::default(),
+            tests: text_editor::Content::new(),
             section: Section::Query,
             dirty: false,
             counts: Counts::default(),
@@ -150,6 +157,7 @@ impl Doc {
             viewer: None,
             response_headers: Vec::new(),
             response_tab: ResponseTab::Body,
+            checks: None,
             open_error: None,
             conflict: false,
             motion: Motion::new(reduced_motion),
@@ -200,6 +208,7 @@ impl Doc {
         self.body_kind = d.body_kind;
         self.body_file.clone_from(&d.body_file);
         self.auth = d.auth.clone();
+        self.tests = text_editor::Content::with_text(&d.tests);
         if !self.methods.contains(&self.method) {
             self.methods.push(self.method.clone());
         }
@@ -217,6 +226,7 @@ impl Doc {
             body_kind: self.body_kind,
             body_file: self.body_file.clone(),
             auth: self.auth.clone(),
+            tests: self.tests.text(),
         }
     }
 
@@ -231,6 +241,7 @@ impl Doc {
                 _ => !d.body.is_empty(),
             },
             auth: d.auth.kind != reqlite_gui::draft::AuthKind::None,
+            tests: d.tests.lines().filter(|l| !l.trim().is_empty()).count(),
         };
     }
 

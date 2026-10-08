@@ -27,6 +27,18 @@ enum Command {
         #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
+    /// Send every request file under DIR, in the order the app lists them,
+    /// and check each response against its `assert` lines. Values from
+    /// `[capture]` fill placeholders in the requests after it.
+    Run {
+        dir: PathBuf,
+        /// Environment file that fills `{{var}}` placeholders.
+        #[arg(long, short)]
+        env: Option<PathBuf>,
+        /// Stop a send that takes longer than SECS.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
+    },
     /// List recent sends, newest first. Set REQLITE_DATA_DIR to move the history file.
     History {
         #[arg(long, short = 'n', default_value_t = 20)]
@@ -112,6 +124,8 @@ enum Failure {
     Keychain(KeychainError),
     /// History could not be read. Exit 1.
     Store(reqlite_store::StoreError),
+    /// Assertions failed, or a request in a run did not complete. Exit 4.
+    Checks(String),
 }
 
 impl Failure {
@@ -124,6 +138,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Send { file, env, timeout } => send(&file, env.as_deref(), timeout),
+        Command::Run { dir, env, timeout } => run(&dir, env.as_deref(), timeout),
         Command::History { limit } => history(limit),
         Command::Import {
             from:
@@ -169,6 +184,10 @@ fn main() -> ExitCode {
                 Failure::Output(e) => (1, e),
                 Failure::Store(e) => (1, e),
                 Failure::Keychain(e) => (1, e),
+                Failure::Checks(what) => {
+                    eprintln!("{what}");
+                    return ExitCode::from(4);
+                }
             };
             report(err);
             ExitCode::from(code)
@@ -371,59 +390,182 @@ fn read_request(file: &Path) -> Result<reqlite_format::Request, Failure> {
     })
 }
 
-fn send(file: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<(), Failure> {
-    let req = read_request(file)?;
-    let env = match env_path {
+fn load_env(env_path: Option<&Path>) -> Result<reqlite_format::Environment, Failure> {
+    match env_path {
         Some(path) => {
-            reqlite_secrets::load_env(path, &reqlite_secrets::Keychain).map_err(Failure::input)?
+            reqlite_secrets::load_env(path, &reqlite_secrets::Keychain).map_err(Failure::input)
         }
-        None => reqlite_format::Environment::default(),
-    };
+        None => Ok(reqlite_format::Environment::default()),
+    }
+}
+
+/// Reads a request file and fills its placeholders.
+fn prepare(
+    file: &Path,
+    env: &reqlite_format::Environment,
+) -> Result<reqlite_engine::Resolved, Failure> {
+    let req = read_request(file)?;
     // Body files are relative to the request file.
     let dir = file.parent().unwrap_or(Path::new(""));
-    let req = reqlite_engine::resolve_in(&req, &env, dir).map_err(|source| {
+    reqlite_engine::resolve_in(&req, env, dir).map_err(|source| {
         Failure::input(InFile {
             path: file.to_path_buf(),
             source,
         })
-    })?;
+    })
+}
 
-    let limits = reqlite_engine::Timeouts {
-        total: timeout.map(std::time::Duration::from_secs),
-        ..reqlite_engine::Timeouts::default()
-    };
-    let rt = runtime()?;
-    let history = open_history();
-    let resp = rt.block_on(async {
-        let client =
-            reqlite_engine::client_with(limits).map_err(reqlite_engine::SendError::from)?;
+/// What every send needs, made once per command.
+struct Sender {
+    rt: tokio::runtime::Runtime,
+    client: reqwest::Client,
+    history: Option<reqlite_store::Store>,
+    limits: reqlite_engine::Timeouts,
+}
+
+impl Sender {
+    fn new(timeout: Option<u64>) -> Result<Sender, Failure> {
+        let limits = reqlite_engine::Timeouts {
+            total: timeout.map(std::time::Duration::from_secs),
+            ..reqlite_engine::Timeouts::default()
+        };
+        let client = reqlite_engine::client_with(limits)
+            .map_err(|e| Failure::Send(reqlite_engine::SendError::from(e)))?;
+        Ok(Sender {
+            rt: runtime()?,
+            client,
+            history: open_history(),
+            limits,
+        })
+    }
+
+    /// Sends `req` and records it in history.
+    fn send(
+        &self,
+        file: &Path,
+        env_path: Option<&Path>,
+        req: &reqlite_engine::Resolved,
+    ) -> Result<reqlite_engine::Response, Failure> {
         let auth = reqlite_engine::oauth::Authorizer {
             cache: &reqlite_secrets::KeychainTokens,
             prompt: &sign_in_prompt,
             wait: std::time::Duration::from_secs(300),
         };
-        reqlite_engine::send_with(&client, &req, Some(&auth)).await
-    });
+        let resp = self
+            .rt
+            .block_on(reqlite_engine::send_with(&self.client, req, Some(&auth)));
+        if let Some(store) = &self.history {
+            let entry = reqlite_store::Entry::from_send(
+                Some(file.display().to_string()),
+                env_path.map(|p| p.display().to_string()),
+                req,
+                resp.as_ref(),
+            )
+            .map_err(Failure::Output)?;
+            if let Err(e) = self.rt.block_on(store.record(entry)) {
+                eprintln!("warning: this send was not saved to history: {}", chain(&e));
+            }
+        }
+        let limits = self.limits;
+        resp.map_err(|e| match e {
+            reqlite_engine::SendError::Timeout(_) => Failure::Timeout(e, limits),
+            // A missing body file is a problem with the input, like a bad request file.
+            e @ reqlite_engine::SendError::BodyFile { .. } => Failure::input(e),
+            e => Failure::Send(e),
+        })
+    }
+}
 
-    if let Some(store) = &history {
-        let entry = reqlite_store::Entry::from_send(
-            Some(file.display().to_string()),
-            env_path.map(|p| p.display().to_string()),
-            &req,
-            resp.as_ref(),
-        )
-        .map_err(Failure::Output)?;
-        if let Err(e) = rt.block_on(store.record(entry)) {
-            eprintln!("warning: this send was not saved to history: {}", chain(&e));
+/// One line per assertion and capture.
+fn print_checks(
+    out: &mut dyn Write,
+    checked: &reqlite_engine::check::Checked,
+) -> std::io::Result<()> {
+    for o in &checked.outcomes {
+        if o.pass {
+            writeln!(out, "  pass  {}", o.text)?;
+        } else {
+            writeln!(out, "  FAIL  {}  ({})", o.text, o.detail)?;
         }
     }
-    let resp = resp.map_err(|e| match e {
-        reqlite_engine::SendError::Timeout(_) => Failure::Timeout(e, limits),
-        // A missing body file is a problem with the input, like a bad request file.
-        e @ reqlite_engine::SendError::BodyFile { .. } => Failure::input(e),
-        e => Failure::Send(e),
-    })?;
+    Ok(())
+}
 
+fn send(file: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<(), Failure> {
+    let env = load_env(env_path)?;
+    let req = prepare(file, &env)?;
+    let resp = Sender::new(timeout)?.send(file, env_path, &req)?;
+    print_response(&resp)?;
+    let checked = reqlite_engine::check::check(&req, &resp);
+    print_checks(&mut std::io::stderr().lock(), &checked).map_err(Failure::Output)?;
+    match checked.failed() {
+        0 => Ok(()),
+        n => Err(Failure::Checks(format!(
+            "{n} of {} checks failed",
+            checked.outcomes.len()
+        ))),
+    }
+}
+
+fn run(dir: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<(), Failure> {
+    let files = reqlite_format::workspace::requests(dir).map_err(|source| {
+        Failure::input(ReadError {
+            path: dir.to_path_buf(),
+            source,
+        })
+    })?;
+    let mut env = load_env(env_path)?;
+    let sender = Sender::new(timeout)?;
+    let mut out = std::io::stdout().lock();
+    let (mut checks, mut failed, mut broken) = (0, 0, 0);
+    for file in &files {
+        let label = file.strip_prefix(dir).unwrap_or(file).display().to_string();
+        let sent = prepare(file, &env).and_then(|req| {
+            let resp = sender.send(file, env_path, &req)?;
+            Ok((req, resp))
+        });
+        let (req, resp) = match sent {
+            Ok(done) => done,
+            Err(failure) => {
+                broken += 1;
+                let why = match &failure {
+                    Failure::Input(e) => chain(e.as_ref()),
+                    Failure::Send(e) => chain(e),
+                    Failure::Timeout(e, limits) => format!("{} ({limits})", chain(e)),
+                    Failure::Output(e) => chain(e),
+                    _ => return Err(failure),
+                };
+                writeln!(out, "{label}  FAIL  {why}").map_err(Failure::Output)?;
+                continue;
+            }
+        };
+        let checked = reqlite_engine::check::check(&req, &resp);
+        writeln!(
+            out,
+            "{label}  {} · {} ms",
+            resp.status,
+            resp.elapsed.as_millis()
+        )
+        .and_then(|()| print_checks(&mut out, &checked))
+        .map_err(Failure::Output)?;
+        checks += checked.outcomes.len();
+        failed += checked.failed();
+        for (name, value) in checked.captured {
+            env.capture(&name, value);
+        }
+    }
+    let summary = format!(
+        "{} requests, {} did not complete; {checks} checks, {failed} failed",
+        files.len(),
+        broken
+    );
+    if failed + broken > 0 {
+        return Err(Failure::Checks(summary));
+    }
+    writeln!(out, "{summary}").map_err(Failure::Output)
+}
+
+fn print_response(resp: &reqlite_engine::Response) -> Result<(), Failure> {
     eprintln!(
         "{} · {} ms · {} bytes",
         resp.status,

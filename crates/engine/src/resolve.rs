@@ -1,7 +1,9 @@
 //! Fills `{{var}}` placeholders from an [`Environment`]. Pure: no IO, no clock.
 
 use crate::oauth::OAuthConfig;
-use reqlite_format::{Auth, Body, Environment, KeyIn, Method, Request, Var, is_var_name};
+use reqlite_format::{
+    Assert, Auth, Body, Environment, KeyIn, Method, Request, Source, Var, is_var_name,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -71,6 +73,10 @@ pub struct Resolved {
     oauth: Option<OAuthConfig>,
     /// Secret values this request uses, longest first, with their names.
     secrets: Vec<(String, String)>,
+    /// Each assertion with its value filled, and its text to show, where
+    /// secrets stay `{{name}}`.
+    asserts: Vec<(Assert, String)>,
+    capture: BTreeMap<String, Source>,
 }
 
 impl Resolved {
@@ -99,6 +105,14 @@ impl Resolved {
 
     pub(crate) fn oauth(&self) -> Option<&OAuthConfig> {
         self.oauth.as_ref()
+    }
+
+    pub(crate) fn asserts(&self) -> &[(Assert, String)] {
+        &self.asserts
+    }
+
+    pub(crate) fn capture(&self) -> &BTreeMap<String, Source> {
+        &self.capture
     }
 }
 
@@ -352,6 +366,21 @@ pub fn resolve_in(req: &Request, env: &Environment, dir: &Path) -> Result<Resolv
             target.1.push((name.clone(), v_r));
         }
     }
+    let mut asserts = Vec::new();
+    for a in &req.assert {
+        let (v, v_r) = fill(&a.value, "assert")?;
+        let shown = Assert {
+            value: v_r,
+            ..a.clone()
+        };
+        asserts.push((
+            Assert {
+                value: v,
+                ..a.clone()
+            },
+            shown.to_string(),
+        ));
+    }
     for (name, value) in &headers.0 {
         if value.chars().any(|c| c.is_control() && c != '\t') {
             return Err(ResolveError::HeaderValue { name: name.clone() });
@@ -366,6 +395,8 @@ pub fn resolve_in(req: &Request, env: &Environment, dir: &Path) -> Result<Resolv
     Ok(Resolved {
         oauth,
         secrets,
+        asserts,
+        capture: req.capture.clone(),
         sent: Parts {
             method: req.method.clone(),
             url,

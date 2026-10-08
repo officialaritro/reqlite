@@ -74,6 +74,22 @@ impl Environment {
             Err(reason) => *var = Var::Unavailable(reason),
         }
     }
+
+    /// Sets a value captured from a response. It replaces any value the files
+    /// gave. A name the environment declares secret stays secret, so history
+    /// hides it.
+    pub fn capture(&mut self, name: &str, value: String) {
+        let secret = matches!(
+            self.vars.get(name),
+            Some(Var::Secret(_) | Var::MissingSecret | Var::Unavailable(_))
+        );
+        let var = if secret {
+            Var::Secret(value)
+        } else {
+            Var::Plain(value)
+        };
+        self.vars.insert(name.to_string(), var);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -221,6 +237,17 @@ mod tests {
         assert_eq!(e.get("base"), Some(&Var::Plain("http://a".into())));
         assert_eq!(e.get("user"), Some(&Var::Plain("me".into())));
         assert_eq!(e.get("token"), Some(&Var::Secret("s3cret".into())));
+    }
+
+    #[test]
+    fn a_captured_value_replaces_the_file_and_keeps_a_secret_secret() {
+        let mut e = env("version = 1\nsecrets = ['token']\n[vars]\nid = '1'\n", None).unwrap();
+        e.capture("id", "42".into());
+        e.capture("token", "t0k".into());
+        e.capture("new", "x".into());
+        assert_eq!(e.get("id"), Some(&Var::Plain("42".into())));
+        assert_eq!(e.get("token"), Some(&Var::Secret("t0k".into())));
+        assert_eq!(e.get("new"), Some(&Var::Plain("x".into())));
     }
 
     #[test]
