@@ -30,8 +30,12 @@ struct LocalFile {
 pub enum Var {
     Plain(String),
     Secret(String),
-    /// Declared secret in the shared file, with no value in the local file.
+    /// Declared secret in the shared file, with no value in the local file,
+    /// nor anywhere else that was asked.
     MissingSecret,
+    /// Declared secret whose store failed to answer, with the reason. It is
+    /// not the same as "no value": the value may exist, but cannot be read.
+    Unavailable(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -42,6 +46,33 @@ pub struct Environment {
 impl Environment {
     pub fn get(&self, name: &str) -> Option<&Var> {
         self.vars.get(name)
+    }
+
+    /// Declared secrets that no file gave a value.
+    pub fn missing_secrets(&self) -> Vec<String> {
+        self.vars
+            .iter()
+            .filter(|(_, v)| **v == Var::MissingSecret)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Fills a missing secret from another source, such as the OS keychain.
+    /// `Ok(None)` means that source has no entry either. A secret that already
+    /// has a value, or a name that is not a missing secret, is left alone, so a
+    /// local file always wins.
+    pub fn supply(&mut self, name: &str, found: Result<Option<String>, String>) {
+        let Some(var) = self.vars.get_mut(name) else {
+            return;
+        };
+        if *var != Var::MissingSecret {
+            return;
+        }
+        match found {
+            Ok(Some(value)) => *var = Var::Secret(value),
+            Ok(None) => {}
+            Err(reason) => *var = Var::Unavailable(reason),
+        }
     }
 }
 
@@ -246,5 +277,43 @@ mod tests {
             load_env(&shared).unwrap().get("token"),
             Some(&Var::Secret("t".into()))
         );
+    }
+
+    #[test]
+    fn another_source_fills_only_missing_secrets() {
+        let mut env = parse_env(
+            Path::new("dev.toml"),
+            "version = 1\nsecrets = ['a', 'b', 'c', 'd']\n[vars]\nbase = 'x'\n",
+            Some("version = 1\n[vars]\na = 'local'\n"),
+        )
+        .unwrap();
+        assert_eq!(env.missing_secrets(), ["b", "c", "d"]);
+
+        env.supply("a", Ok(Some("keychain".into())));
+        env.supply("b", Ok(Some("from keychain".into())));
+        env.supply("c", Ok(None));
+        env.supply("d", Err("the keychain is locked".into()));
+        env.supply("base", Ok(Some("nope".into())));
+        env.supply("unknown", Ok(Some("nope".into())));
+
+        assert_eq!(
+            env.get("a"),
+            Some(&Var::Secret("local".into())),
+            "the local file wins"
+        );
+        assert_eq!(env.get("b"), Some(&Var::Secret("from keychain".into())));
+        assert_eq!(
+            env.get("c"),
+            Some(&Var::MissingSecret),
+            "no entry stays missing"
+        );
+        assert_eq!(
+            env.get("d"),
+            Some(&Var::Unavailable("the keychain is locked".into())),
+            "a failure is kept apart from no entry"
+        );
+        assert_eq!(env.get("base"), Some(&Var::Plain("x".into())));
+        assert_eq!(env.get("unknown"), None);
+        assert_eq!(env.missing_secrets(), ["c"]);
     }
 }

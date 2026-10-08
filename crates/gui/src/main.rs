@@ -628,7 +628,9 @@ fn start_send(app: &mut App) -> Task<Msg> {
     };
     let env = match &env_path {
         None => Ok(reqlite_format::Environment::default()),
-        Some(path) => reqlite_format::load_env(path).map_err(|e| chain(&e)),
+        Some(path) => {
+            reqlite_secrets::load_env(path, &reqlite_secrets::Keychain).map_err(|e| chain(&e))
+        }
     };
     let resolved = match env
         .and_then(|env| reqlite_engine::resolve_in(&req, &env, &dir).map_err(|e| e.to_string()))

@@ -42,6 +42,29 @@ enum Command {
         #[command(subcommand)]
         to: ExportTo,
     },
+    /// Keep an environment's secret in the OS keychain, out of every file.
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretAction {
+    /// Store a value. It is read from stdin, or typed without being shown.
+    /// A value in the environment's .local.toml file still comes first.
+    Set {
+        /// The environment file that declares the secret.
+        #[arg(long, short)]
+        env: PathBuf,
+        name: String,
+    },
+    /// Remove a stored value.
+    Delete {
+        #[arg(long, short)]
+        env: PathBuf,
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -85,6 +108,8 @@ enum Failure {
     Timeout(reqlite_engine::SendError, reqlite_engine::Timeouts),
     /// Writing the response out failed. Exit 1.
     Output(std::io::Error),
+    /// The OS keychain failed to answer. Exit 1.
+    Keychain(KeychainError),
     /// History could not be read. Exit 1.
     Store(reqlite_store::StoreError),
 }
@@ -119,6 +144,13 @@ fn main() -> ExitCode {
         Command::Export {
             to: ExportTo::Curl { file },
         } => export_curl(&file),
+        Command::Secret {
+            action: SecretAction::Set { env, name },
+        } => read_secret(&name)
+            .and_then(|value| secret_set(&env, &name, &value, &reqlite_secrets::Keychain)),
+        Command::Secret {
+            action: SecretAction::Delete { env, name },
+        } => secret_delete(&env, &name, &reqlite_secrets::Keychain),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -136,6 +168,7 @@ fn main() -> ExitCode {
                 }
                 Failure::Output(e) => (1, e),
                 Failure::Store(e) => (1, e),
+                Failure::Keychain(e) => (1, e),
             };
             report(err);
             ExitCode::from(code)
@@ -204,6 +237,108 @@ struct CreateDirError {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[error("the OS keychain failed: {0}")]
+struct KeychainError(String);
+
+#[derive(Debug, thiserror::Error)]
+enum SecretInput {
+    #[error("{name} is not a secret in {path}; add it to `secrets` there first")]
+    NotDeclared { path: PathBuf, name: String },
+    #[error("the value is empty")]
+    Empty,
+    #[error("cannot read the value")]
+    Read(#[source] std::io::Error),
+}
+
+/// Typed without being shown in a terminal, or read whole from a pipe. One
+/// line ending is dropped, so `echo VALUE |` works.
+fn read_secret(name: &str) -> Result<String, Failure> {
+    use std::io::{IsTerminal, Read};
+    let value = if std::io::stdin().is_terminal() {
+        rpassword::prompt_password(format!("Value for {{{{{name}}}}}: "))
+            .map_err(|e| Failure::input(SecretInput::Read(e)))?
+    } else {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| Failure::input(SecretInput::Read(e)))?;
+        let trimmed = text.strip_suffix('\n').unwrap_or(&text);
+        trimmed.strip_suffix('\r').unwrap_or(trimmed).to_string()
+    };
+    Ok(value)
+}
+
+/// The keychain account for `name`, once the environment is known to declare it.
+fn declared(env: &Path, name: &str) -> Result<String, Failure> {
+    let parsed = reqlite_format::load_env(env).map_err(Failure::input)?;
+    let declared = matches!(
+        parsed.get(name),
+        Some(reqlite_format::Var::Secret(_) | reqlite_format::Var::MissingSecret)
+    );
+    if !declared {
+        return Err(Failure::input(SecretInput::NotDeclared {
+            path: env.to_path_buf(),
+            name: name.to_string(),
+        }));
+    }
+    reqlite_secrets::account(env, name).map_err(|e| Failure::input(SecretInput::Read(e)))
+}
+
+fn secret_set(
+    env: &Path,
+    name: &str,
+    value: &str,
+    store: &impl reqlite_secrets::Store,
+) -> Result<(), Failure> {
+    if value.is_empty() {
+        return Err(Failure::input(SecretInput::Empty));
+    }
+    let account = declared(env, name)?;
+    store
+        .set(&account, value)
+        .map_err(|e| Failure::Keychain(KeychainError(e)))?;
+    eprintln!(
+        "stored {{{{{name}}}}} for {} in the OS keychain",
+        env.display()
+    );
+    let local = reqlite_format::local_path(env);
+    let shadowed = reqlite_format::load_env(env)
+        .ok()
+        .and_then(|e| e.get(name).cloned())
+        .is_some_and(|v| matches!(v, reqlite_format::Var::Secret(_)));
+    if shadowed {
+        eprintln!(
+            "note: {} also sets {name}, and that value comes first",
+            local.display()
+        );
+    }
+    Ok(())
+}
+
+fn secret_delete(
+    env: &Path,
+    name: &str,
+    store: &impl reqlite_secrets::Store,
+) -> Result<(), Failure> {
+    let account = declared(env, name)?;
+    let removed = store
+        .delete(&account)
+        .map_err(|e| Failure::Keychain(KeychainError(e)))?;
+    if removed {
+        eprintln!(
+            "removed {{{{{name}}}}} for {} from the OS keychain",
+            env.display()
+        );
+    } else {
+        eprintln!(
+            "the OS keychain held no {{{{{name}}}}} for {}",
+            env.display()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
 #[error("{path}")]
 struct InFile<E: Error + 'static> {
     path: PathBuf,
@@ -229,7 +364,9 @@ fn read_request(file: &Path) -> Result<reqlite_format::Request, Failure> {
 fn send(file: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<(), Failure> {
     let req = read_request(file)?;
     let env = match env_path {
-        Some(path) => reqlite_format::load_env(path).map_err(Failure::input)?,
+        Some(path) => {
+            reqlite_secrets::load_env(path, &reqlite_secrets::Keychain).map_err(Failure::input)?
+        }
         None => reqlite_format::Environment::default(),
     };
     // Body files are relative to the request file.
@@ -427,4 +564,102 @@ fn import_postman(collection: &Path, out: &Path, force: bool) -> Result<(), Fail
         out.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Memory(RefCell<BTreeMap<String, String>>);
+
+    impl reqlite_secrets::Store for Memory {
+        fn get(&self, account: &str) -> Result<Option<String>, String> {
+            Ok(self.0.borrow().get(account).cloned())
+        }
+        fn set(&self, account: &str, value: &str) -> Result<(), String> {
+            self.0.borrow_mut().insert(account.into(), value.into());
+            Ok(())
+        }
+        fn delete(&self, account: &str) -> Result<bool, String> {
+            Ok(self.0.borrow_mut().remove(account).is_some())
+        }
+    }
+
+    struct Broken;
+
+    impl reqlite_secrets::Store for Broken {
+        fn get(&self, _: &str) -> Result<Option<String>, String> {
+            Err("locked".into())
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("locked".into())
+        }
+        fn delete(&self, _: &str) -> Result<bool, String> {
+            Err("locked".into())
+        }
+    }
+
+    fn env() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dev.toml");
+        std::fs::write(
+            &path,
+            "version = 1\nsecrets = ['token']\n[vars]\nbase = 'x'\n",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    fn code(f: &Failure) -> u8 {
+        match f {
+            Failure::Input(_) => 3,
+            Failure::Keychain(_) => 1,
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn a_stored_secret_is_used_by_the_next_send_and_can_be_removed() {
+        let (_dir, path) = env();
+        let store = Memory::default();
+        assert!(secret_set(&path, "token", "s3cret", &store).is_ok());
+        let loaded = reqlite_secrets::load_env(&path, &store).unwrap();
+        assert_eq!(
+            loaded.get("token"),
+            Some(&reqlite_format::Var::Secret("s3cret".into()))
+        );
+        assert!(secret_delete(&path, "token", &store).is_ok());
+        let loaded = reqlite_secrets::load_env(&path, &store).unwrap();
+        assert_eq!(
+            loaded.get("token"),
+            Some(&reqlite_format::Var::MissingSecret)
+        );
+        assert!(
+            secret_delete(&path, "token", &store).is_ok(),
+            "deleting again is not an error"
+        );
+    }
+
+    #[test]
+    fn only_a_declared_secret_with_a_value_is_stored() {
+        let (_dir, path) = env();
+        let store = Memory::default();
+        for (name, value) in [("base", "v"), ("nope", "v"), ("token", "")] {
+            let err = secret_set(&path, name, value, &store).unwrap_err();
+            assert_eq!(code(&err), 3, "{name}");
+        }
+        assert!(store.0.borrow().is_empty(), "nothing was stored");
+    }
+
+    #[test]
+    fn a_failing_keychain_is_its_own_error() {
+        let (_dir, path) = env();
+        let err = secret_set(&path, "token", "v", &Broken).unwrap_err();
+        assert_eq!(code(&err), 1);
+        let Failure::Keychain(e) = err else { panic!() };
+        assert_eq!(e.to_string(), "the OS keychain failed: locked");
+    }
 }
