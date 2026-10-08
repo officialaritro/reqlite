@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
+pub mod check;
 pub mod oauth;
 mod resolve;
 pub use resolve::{

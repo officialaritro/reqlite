@@ -3,7 +3,6 @@
 pub mod draft;
 pub mod present;
 pub mod recent;
-pub mod workspace;
 
 /// An error and every cause under it, on one line.
 pub fn chain(err: &dyn std::error::Error) -> String {

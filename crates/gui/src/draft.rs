@@ -1,7 +1,9 @@
 //! The form being edited and how it maps to a request file. No iced types live
 //! here, so every rule is a plain unit test.
 
-use reqlite_format::{Auth, Body, ClientAuth, Grant, KeyIn, Method, OAuth2, Params, Part, Request};
+use reqlite_format::{
+    Assert, Auth, Body, ClientAuth, Grant, KeyIn, Method, OAuth2, Params, Part, Request, Source,
+};
 
 /// The text of each field, as the user typed it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -20,6 +22,9 @@ pub struct Draft {
     /// The file a File body sends, relative to the request file.
     pub body_file: String,
     pub auth: AuthDraft,
+    /// One assertion per line, such as `status == 200`, and one capture per
+    /// line as `capture NAME = json PATH`.
+    pub tests: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -136,6 +141,12 @@ impl Draft {
                 (d.body_kind, d.body_file) = (BodyKind::File, path.clone())
             }
         }
+        for a in &req.assert {
+            d.tests.push_str(&format!("{a}\n"));
+        }
+        for (name, source) in &req.capture {
+            d.tests.push_str(&format!("capture {name} = {source}\n"));
+        }
         if let Some(auth) = &req.auth {
             let a = &mut d.auth;
             match auth {
@@ -177,10 +188,29 @@ impl Draft {
             query: from_lines(&self.query, "query")?,
             body: self.body()?,
             auth: self.auth()?,
+            assert: Vec::new(),
+            capture: Default::default(),
         };
+        self.tests(&mut req)?;
         req.version = reqlite_format::needed_version(&req);
         reqlite_format::validate(&req).map_err(|e| e.to_string())?;
         Ok(req)
+    }
+
+    fn tests(&self, req: &mut Request) -> Result<(), String> {
+        for line in self.tests.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            match line.strip_prefix("capture ") {
+                Some(rest) => {
+                    let Some((name, source)) = rest.split_once('=') else {
+                        return Err(format!("{line:?}: a capture is capture NAME = SOURCE"));
+                    };
+                    let source = Source::try_from(source.trim().to_string())?;
+                    req.capture.insert(name.trim().to_string(), source);
+                }
+                None => req.assert.push(Assert::try_from(line.to_string())?),
+            }
+        }
+        Ok(())
     }
 
     fn body(&self) -> Result<Option<Body>, String> {
@@ -487,6 +517,29 @@ redirect = "http://x/y"
         d.body_kind = BodyKind::File;
         assert_eq!(d.to_request().unwrap().body, None, "no file chosen yet");
         assert_eq!(d.body, "{\"a\": 1}", "the text is still there");
+    }
+
+    #[test]
+    fn tests_come_back_through_the_form_one_per_line() {
+        let file = "version = 3\nname = \"x\"\nmethod = \"GET\"\nurl = \"http://a\"\nassert = [\"status == 200\", \"json $.id exists\"]\n\n[capture]\nid = \"json $.id\"\n";
+        let req = reqlite_format::parse(file).unwrap();
+        let draft = Draft::from_request(&req);
+        assert_eq!(
+            draft.tests,
+            "status == 200\njson $.id exists\ncapture id = json $.id\n"
+        );
+        assert_eq!(draft.to_request().unwrap(), req);
+        assert!(!draft.differs_from(Some(file)));
+
+        let mut d = draft.clone();
+        d.tests = "status is 200\n".into();
+        assert!(d.to_request().unwrap_err().contains("is not an operator"));
+        d.tests = "capture id json $.id\n".into();
+        assert!(
+            d.to_request()
+                .unwrap_err()
+                .contains("capture NAME = SOURCE")
+        );
     }
 
     #[test]

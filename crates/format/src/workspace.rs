@@ -1,5 +1,5 @@
 //! A workspace is a folder of request files. This module reads its tree and
-//! its environments. No iced types, so every rule is a plain test.
+//! its environments, for the app and for `reqlite run`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -66,6 +66,22 @@ fn read(dir: &Path, top: bool, left: &mut usize) -> io::Result<Vec<Node>> {
     }
     folders.extend(requests);
     Ok(folders)
+}
+
+/// Every request file under `root`, in the order the sidebar shows them:
+/// depth first, folders before requests, each group by name.
+pub fn requests(root: &Path) -> io::Result<Vec<PathBuf>> {
+    fn walk(nodes: Vec<Node>, out: &mut Vec<PathBuf>) {
+        for n in nodes {
+            match n.kind {
+                Kind::Folder(children) => walk(children, out),
+                Kind::Request => out.push(n.path),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(scan(root)?, &mut out);
+    Ok(out)
 }
 
 /// `get.toml` is the request `get`. `get.local.toml` holds secrets, not a request.
@@ -167,6 +183,26 @@ mod tests {
             ]
         );
         assert_eq!(nodes[3].path, dir.path().join("hello.toml"));
+    }
+
+    #[test]
+    fn a_run_takes_the_requests_in_sidebar_order() {
+        let dir = tree();
+        let rel: Vec<_> = requests(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|p| p.strip_prefix(dir.path()).unwrap().to_path_buf())
+            .collect();
+        let want: Vec<PathBuf> = [
+            "users/admin/ban.toml",
+            "users/get.toml",
+            "hello.toml",
+            "Users list.toml",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(rel, want);
     }
 
     #[test]
