@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
+pub mod oauth;
 mod resolve;
 pub use resolve::{
     PartValue, Parts, ResolveError, Resolved, SendBody, SendPart, resolve, resolve_in,
@@ -12,13 +13,38 @@ pub use resolve::{
 /// Bodies larger than this go to a temp file instead of memory.
 pub const SPILL_AT: usize = 1 << 20;
 
-#[derive(Debug)]
 pub struct Response {
     pub status: u16,
     /// Values stay as received. Decode only for display.
     pub headers: Vec<(String, Vec<u8>)>,
     pub body: Body,
     pub elapsed: Duration,
+    /// The OAuth 2.0 access token the request carried, so anything stored
+    /// from the response can hide it. Never stored itself.
+    pub oauth_token: Option<String>,
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("body", &self.body)
+            .field("elapsed", &self.elapsed)
+            .field("oauth_token", &self.oauth_token.as_ref().map(|_| "hidden"))
+            .finish()
+    }
+}
+
+impl Response {
+    /// Replaces the OAuth 2.0 token in `bytes` with `{{oauth_token}}`. Use it
+    /// after [`Resolved::redact`] on anything stored from this response.
+    pub fn redact_token(&self, bytes: &[u8]) -> Vec<u8> {
+        match &self.oauth_token {
+            Some(t) if !t.is_empty() => resolve::replace(bytes, t.as_bytes(), b"{{oauth_token}}"),
+            _ => bytes.to_vec(),
+        }
+    }
 }
 
 /// A response body, held once: in memory when small, in a temp file when large.
@@ -96,6 +122,16 @@ pub enum SendError {
     },
     #[error("invalid content type {content_type:?} for part {part:?}")]
     PartType { part: String, content_type: String },
+    /// Boxed: the sign-in errors carry the server's answer, which would make
+    /// every `SendError` large.
+    #[error("OAuth 2.0 sign-in failed")]
+    OAuth(#[source] Box<oauth::OAuthError>),
+}
+
+impl From<oauth::OAuthError> for SendError {
+    fn from(e: oauth::OAuthError) -> Self {
+        SendError::OAuth(Box::new(e))
+    }
 }
 
 impl From<reqwest::Error> for SendError {
@@ -177,7 +213,36 @@ pub fn client_with(limits: Timeouts) -> Result<reqwest::Client, reqwest::Error> 
     builder.build()
 }
 
+/// Sends a request whose auth is not OAuth 2.0.
 pub async fn send(client: &reqwest::Client, req: &Resolved) -> Result<Response, SendError> {
+    send_with(client, req, None).await
+}
+
+/// Sends a request. One with OAuth 2.0 auth gets its token from `auth` first,
+/// and after a 401 with a cached token, gets a new one and is sent once more.
+pub async fn send_with(
+    client: &reqwest::Client,
+    req: &Resolved,
+    auth: Option<&oauth::Authorizer<'_>>,
+) -> Result<Response, SendError> {
+    let Some(cfg) = req.oauth() else {
+        return send_once(client, req, None).await;
+    };
+    let auth = auth.ok_or(oauth::OAuthError::NoAuthorizer)?;
+    let (token, fresh) = oauth::token(client, cfg, auth).await?;
+    let resp = send_once(client, req, Some(&token.access_token)).await?;
+    if resp.status != 401 || fresh {
+        return Ok(resp);
+    }
+    let token = oauth::renew(client, cfg, auth, Some(&token)).await?;
+    send_once(client, req, Some(&token.access_token)).await
+}
+
+async fn send_once(
+    client: &reqwest::Client,
+    req: &Resolved,
+    bearer: Option<&str>,
+) -> Result<Response, SendError> {
     let req = req.sent();
     let method = reqwest::Method::from_bytes(req.method.as_str().as_bytes()).map_err(|e| {
         SendError::Method {
@@ -188,6 +253,9 @@ pub async fn send(client: &reqwest::Client, req: &Resolved) -> Result<Response, 
     let mut builder = client.request(method, &req.url).query(&req.query);
     for (k, v) in &req.headers {
         builder = builder.header(k, v);
+    }
+    if let Some(token) = bearer {
+        builder = builder.bearer_auth(token);
     }
     match &req.body {
         None => {}
@@ -246,6 +314,7 @@ pub async fn send(client: &reqwest::Client, req: &Resolved) -> Result<Response, 
         headers,
         body: Body(body),
         elapsed: start.elapsed(),
+        oauth_token: bearer.map(str::to_string),
     })
 }
 

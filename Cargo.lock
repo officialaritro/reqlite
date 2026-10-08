@@ -3513,8 +3513,12 @@ dependencies = [
 name = "reqlite-engine"
 version = "0.0.1"
 dependencies = [
+ "getrandom 0.3.4",
  "reqlite-format",
  "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -3565,6 +3569,7 @@ name = "reqlite-secrets"
 version = "0.0.1"
 dependencies = [
  "keyring",
+ "reqlite-engine",
  "reqlite-format",
  "tempfile",
 ]

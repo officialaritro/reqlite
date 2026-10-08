@@ -125,6 +125,75 @@ pub enum Auth {
         #[serde(rename = "in", default)]
         location: KeyIn,
     },
+    /// `Authorization: Bearer <token>`, with the token fetched, cached in the
+    /// OS keychain and refreshed by Reqlite.
+    Oauth2(OAuth2),
+}
+
+/// An OAuth 2.0 client. Every field may use `{{placeholders}}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuth2 {
+    pub grant: Grant,
+    pub token_url: String,
+    /// The authorization endpoint, for the `authorization_code` grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_url: Option<String>,
+    /// The device authorization endpoint, for the `device_code` grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_url: Option<String>,
+    pub client_id: String,
+    /// Left out for a public client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// How the client proves itself to the token endpoint.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub client_auth: ClientAuth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Grant {
+    #[default]
+    ClientCredentials,
+    /// With PKCE and a redirect to a loopback port on this machine.
+    AuthorizationCode,
+    /// RFC 8628: the user enters a code on another page.
+    DeviceCode,
+}
+
+impl Grant {
+    pub const ALL: [Grant; 3] = [
+        Grant::ClientCredentials,
+        Grant::AuthorizationCode,
+        Grant::DeviceCode,
+    ];
+}
+
+impl fmt::Display for Grant {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Grant::ClientCredentials => "Client credentials",
+            Grant::AuthorizationCode => "Authorization code",
+            Grant::DeviceCode => "Device code",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuth {
+    /// HTTP Basic with the client ID and secret, as RFC 6749 prefers.
+    #[default]
+    Basic,
+    /// The client ID and secret as form fields in the body.
+    Body,
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -139,7 +208,7 @@ impl Auth {
     /// The header this auth sets, if it sets one.
     pub fn header(&self) -> Option<&str> {
         match self {
-            Auth::Bearer { .. } | Auth::Basic { .. } => Some("Authorization"),
+            Auth::Bearer { .. } | Auth::Basic { .. } | Auth::Oauth2(_) => Some("Authorization"),
             Auth::ApiKey {
                 name,
                 location: KeyIn::Header,

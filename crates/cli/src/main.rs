@@ -240,6 +240,16 @@ struct CreateDirError {
 #[error("the OS keychain failed: {0}")]
 struct KeychainError(String);
 
+/// Tells the user how to finish an OAuth 2.0 sign-in. The browser opens only
+/// when a person is at the terminal, so scripts and CI never start one.
+fn sign_in_prompt(p: reqlite_engine::oauth::Prompt) {
+    use std::io::IsTerminal;
+    eprintln!("{p}");
+    if std::io::stderr().is_terminal() && reqlite_engine::oauth::open_browser(p.url()).is_err() {
+        eprintln!("(could not open a browser; open the address above yourself)");
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum SecretInput {
     #[error("{name} is not a secret in {path}; add it to `secrets` there first")]
@@ -387,7 +397,12 @@ fn send(file: &Path, env_path: Option<&Path>, timeout: Option<u64>) -> Result<()
     let resp = rt.block_on(async {
         let client =
             reqlite_engine::client_with(limits).map_err(reqlite_engine::SendError::from)?;
-        reqlite_engine::send(&client, &req).await
+        let auth = reqlite_engine::oauth::Authorizer {
+            cache: &reqlite_secrets::KeychainTokens,
+            prompt: &sign_in_prompt,
+            wait: std::time::Duration::from_secs(300),
+        };
+        reqlite_engine::send_with(&client, &req, Some(&auth)).await
     });
 
     if let Some(store) = &history {

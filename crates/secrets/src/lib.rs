@@ -53,6 +53,23 @@ impl Store for Keychain {
     }
 }
 
+/// OAuth 2.0 tokens in the OS keychain, under the same service. The account is
+/// the client's cache key (token URL, client ID and scope), so tokens persist
+/// across sends and runs. A keychain that fails behaves as empty: the token is
+/// fetched again, and not kept.
+pub struct KeychainTokens;
+
+impl reqlite_engine::oauth::TokenCache for KeychainTokens {
+    fn get(&self, key: &str) -> Option<String> {
+        Keychain.get(key).ok().flatten()
+    }
+
+    fn put(&self, key: &str, value: &str) {
+        // Not keeping a token only means the next send fetches a new one.
+        Keychain.set(key, value).ok();
+    }
+}
+
 fn entry(account: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(SERVICE, account).map_err(|e| e.to_string())
 }

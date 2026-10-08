@@ -1,5 +1,6 @@
 //! Fills `{{var}}` placeholders from an [`Environment`]. Pure: no IO, no clock.
 
+use crate::oauth::OAuthConfig;
 use reqlite_format::{Auth, Body, Environment, KeyIn, Method, Request, Var, is_var_name};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -65,6 +66,9 @@ impl SendBody {
 pub struct Resolved {
     sent: Parts,
     redacted: Parts,
+    /// The OAuth 2.0 client, when the request's auth is `oauth2`. Its token is
+    /// fetched at send time.
+    oauth: Option<OAuthConfig>,
     /// Secret values this request uses, longest first, with their names.
     secrets: Vec<(String, String)>,
 }
@@ -91,6 +95,10 @@ impl Resolved {
 
     pub(crate) fn sent(&self) -> &Parts {
         &self.sent
+    }
+
+    pub(crate) fn oauth(&self) -> Option<&OAuthConfig> {
+        self.oauth.as_ref()
     }
 }
 
@@ -167,7 +175,7 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-fn replace(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
+pub(crate) fn replace(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(haystack.len());
     let mut i = 0;
     while i < haystack.len() {
@@ -278,8 +286,33 @@ pub fn resolve_in(req: &Request, env: &Environment, dir: &Path) -> Result<Resolv
         }
     };
     let mut extra_secret = None;
+    let mut oauth = None;
     match &req.auth {
         None => {}
+        Some(Auth::Oauth2(o)) => {
+            let mut sent = |text: &str, field: &str| fill(text, field).map(|(v, _)| v);
+            let opt =
+                |v: &Option<String>,
+                 field: &str,
+                 sent: &mut dyn FnMut(&str, &str) -> Result<String, ResolveError>| {
+                    v.as_deref().map(|t| sent(t, field)).transpose()
+                };
+            let config = OAuthConfig {
+                grant: o.grant,
+                token_url: sent(&o.token_url, "oauth2 token_url")?,
+                auth_url: opt(&o.auth_url, "oauth2 auth_url", &mut sent)?,
+                device_url: opt(&o.device_url, "oauth2 device_url", &mut sent)?,
+                client_id: sent(&o.client_id, "oauth2 client_id")?,
+                client_secret: opt(&o.client_secret, "oauth2 client_secret", &mut sent)?,
+                scope: opt(&o.scope, "oauth2 scope", &mut sent)?,
+                client_auth: o.client_auth,
+            };
+            // The token itself is added at send time. History shows this.
+            headers
+                .1
+                .push(("Authorization".into(), "Bearer {{oauth_token}}".into()));
+            oauth = Some(config);
+        }
         Some(Auth::Bearer { token }) => {
             let (v, v_r) = fill(token, "auth token")?;
             headers
@@ -331,6 +364,7 @@ pub fn resolve_in(req: &Request, env: &Environment, dir: &Path) -> Result<Resolv
         .collect();
     secrets.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
     Ok(Resolved {
+        oauth,
         secrets,
         sent: Parts {
             method: req.method.clone(),
