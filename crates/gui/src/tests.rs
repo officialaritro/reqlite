@@ -938,6 +938,36 @@ fn a_websocket_tab_connects_logs_and_sends() {
 }
 
 #[test]
+fn a_grpc_answer_shows_its_grpc_status() {
+    let mut a = app(Some(
+        "version = 4\nname = \"g\"\nurl = \"http://h:1\"\n\n[grpc]\nmethod = \"t.S/Get\"\n",
+    ));
+    let id = a.docs[0].id;
+    let done = Finished {
+        checked: None,
+        result: Ok(Loaded {
+            doc: Arc::new(Document::build_with(&b"{}"[..], None).unwrap()),
+            summary: Summary {
+                status: 200,
+                elapsed: Duration::ZERO,
+                bytes: 2,
+            },
+            headers: vec![("grpc-status".into(), "5".into())],
+        }),
+        opened: None,
+        warning: None,
+    };
+    drop(update(&mut a, Msg::Sent(id, Box::new(done))));
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("5 NOT_FOUND").is_ok());
+    assert!(
+        ui.find("gRPC").is_ok() && ui.find("GET").is_err(),
+        "no method choice"
+    );
+    assert!(ui.find("200 OK").is_err());
+}
+
+#[test]
 fn a_captured_value_fills_the_next_send() {
     let mut a = app(Some(
         "version = 1\nname = \"user\"\nurl = \"http://127.0.0.1:9/users/{{id}}\"\n",

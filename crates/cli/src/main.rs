@@ -520,8 +520,11 @@ impl Sender {
         let limits = self.limits;
         resp.map_err(|e| match e {
             reqlite_engine::SendError::Timeout(_) => Failure::Timeout(e, limits),
-            // A missing body file is a problem with the input, like a bad request file.
-            e @ reqlite_engine::SendError::BodyFile { .. } => Failure::input(e),
+            // A missing body file, a .proto file that does not compile and a
+            // message that does not fit are problems with the input.
+            e @ (reqlite_engine::SendError::BodyFile { .. }
+            | reqlite_engine::SendError::Proto { .. }
+            | reqlite_engine::SendError::GrpcMessage(_)) => Failure::input(e),
             e => Failure::Send(e),
         })
     }
@@ -840,6 +843,11 @@ fn import_curl(command: Option<String>, out: Option<&Path>, force: bool) -> Resu
 
 fn export_curl(file: &Path) -> Result<(), Failure> {
     let req = read_request(file)?;
+    if req.grpc.is_some() {
+        return Err(Failure::input(std::io::Error::other(
+            "curl cannot make gRPC calls, so a [grpc] request has no curl form",
+        )));
+    }
     let mut out = std::io::stdout().lock();
     writeln!(out, "{}", reqlite_import::curl::export(&req)).map_err(Failure::Output)
 }

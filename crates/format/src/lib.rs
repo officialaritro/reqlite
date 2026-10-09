@@ -11,14 +11,16 @@ use std::path::{Path, PathBuf};
 mod body;
 mod check;
 mod env;
+mod grpc;
 pub mod workspace;
 pub use body::{Auth, Body, ClientAuth, Grant, KeyIn, OAuth2, Part, graphql_json};
 pub use check::{Assert, JsonPath, Op, Source, Step, Subject};
 pub use env::{EnvError, Environment, Var, is_var_name, load_env, local_path, parse_env};
+pub use grpc::Grpc;
 
 /// The newest request file version this build reads and writes. Files use the
 /// lowest version that holds them: see [`needed_version`].
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,14 +42,21 @@ pub struct Request {
     pub body: Option<Body>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
+    /// A gRPC call instead of an HTTP request. The URL names the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc: Option<Grpc>,
     /// Response values that become variables for the requests after this one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub capture: BTreeMap<String, Source>,
 }
 
 /// Version 1 holds a request whose body is plain text and that has no auth.
-/// Other bodies and auth need version 2, and assertions or captures version 3.
+/// Other bodies and auth need version 2, assertions or captures version 3, and
+/// gRPC version 4.
 pub fn needed_version(req: &Request) -> u32 {
+    if req.grpc.is_some() {
+        return 4;
+    }
     if !req.assert.is_empty() || !req.capture.is_empty() {
         return 3;
     }
@@ -186,6 +195,9 @@ pub fn parse(text: &str) -> Result<Request, ParseError> {
         return Err(ParseError::UnsupportedVersion { found: req.version });
     }
     match needed_version(&req) {
+        4 if req.version < 4 => {
+            return Err(ParseError::Invalid("[grpc] needs version = 4".to_string()));
+        }
         3 if req.version < 3 => {
             return Err(ParseError::Invalid(
                 "assert and [capture] need version = 3".to_string(),
@@ -208,6 +220,20 @@ pub fn validate(req: &Request) -> Result<(), ParseError> {
     let invalid = |msg: String| Err(ParseError::Invalid(msg));
     if req.url.trim().is_empty() {
         return invalid("url is empty".to_string());
+    }
+    if let Some(g) = &req.grpc {
+        if g.parts().is_none() {
+            return invalid(format!(
+                "gRPC method {:?} is not package.Service/Method",
+                g.method
+            ));
+        }
+        if req.body.is_some() {
+            return invalid("a gRPC call has no [body]; its message is in [grpc]".to_string());
+        }
+        if !req.query.is_empty() {
+            return invalid("a gRPC call has no [query]".to_string());
+        }
     }
     if let Some(name) = req.capture.keys().find(|n| !is_var_name(n)) {
         return invalid(format!("capture name {name:?} is not a variable name"));
@@ -393,8 +419,8 @@ tag = ["a", "b"]
 
     #[test]
     fn rejects_unknown_version() {
-        let err = parse(&MIN.replace("version = 1", "version = 4")).unwrap_err();
-        assert!(matches!(err, ParseError::UnsupportedVersion { found: 4 }));
+        let err = parse(&MIN.replace("version = 1", "version = 5")).unwrap_err();
+        assert!(matches!(err, ParseError::UnsupportedVersion { found: 5 }));
     }
 
     #[test]
@@ -578,6 +604,51 @@ tag = ["a", "b"]
             "{V2}\n[headers]\nkey = \"h\"\n\n[auth]\ntype = \"api_key\"\nname = \"key\"\nvalue = \"v\"\nin = \"query\"\n"
         );
         assert!(parse(&text).is_ok());
+    }
+
+    #[test]
+    fn a_grpc_call_reads_and_writes_back_the_same() {
+        let text = r#"version = 4
+name = "Get user"
+method = "GET"
+url = "http://localhost:50051"
+
+[headers]
+x-team = "a"
+
+[grpc]
+method = "users.v1.Users/GetUser"
+proto = "protos/users.proto"
+message = '{"id": "{{id}}"}'
+"#;
+        let req = parse(text).unwrap();
+        assert_eq!(
+            req.grpc.as_ref().unwrap().parts(),
+            Some(("users.v1.Users", "GetUser"))
+        );
+        assert_eq!(to_string(&req).unwrap(), text);
+        for (bad, why) in [
+            (
+                text.replace("version = 4", "version = 3"),
+                "needs version = 4",
+            ),
+            (
+                text.replace("users.v1.Users/GetUser", "GetUser"),
+                "is not package.Service/Method",
+            ),
+            (
+                text.replace("users.v1.Users/GetUser", "a/b/c"),
+                "is not package.Service/Method",
+            ),
+            (format!("{text}\n[query]\na = \"1\"\n"), "has no [query]"),
+            (
+                format!("{text}\n[body]\ntype = \"json\"\ntext = \"{{}}\"\n"),
+                "has no [body]",
+            ),
+        ] {
+            let err = parse(&bad).unwrap_err().to_string();
+            assert!(err.contains(why), "{why}: {err}");
+        }
     }
 
     #[test]

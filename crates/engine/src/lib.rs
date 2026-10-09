@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 pub mod check;
 pub mod graphql;
+pub mod grpc;
 pub mod oauth;
 mod resolve;
 pub mod stream;
@@ -139,6 +140,15 @@ pub enum SendError {
     PartType { part: String, content_type: String },
     /// Boxed: the sign-in errors carry the server's answer, which would make
     /// every `SendError` large.
+    #[error("gRPC: {0}")]
+    Grpc(String),
+    #[error("cannot read {path}: {reason}")]
+    Proto {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+    #[error("the gRPC message is not valid {0}")]
+    GrpcMessage(String),
     #[error("OAuth 2.0 sign-in failed")]
     OAuth(#[source] Box<oauth::OAuthError>),
 }
@@ -241,10 +251,16 @@ pub async fn send_with(
     auth: Option<&oauth::Authorizer<'_>>,
 ) -> Result<Response, SendError> {
     let Some(cfg) = req.oauth() else {
+        if req.is_grpc() {
+            return grpc::unary(req, None).await;
+        }
         return send_once(client, req, None).await;
     };
     let auth = auth.ok_or(oauth::OAuthError::NoAuthorizer)?;
     let (token, fresh) = oauth::token(client, cfg, auth).await?;
+    if req.is_grpc() {
+        return grpc::unary(req, Some(&token.access_token)).await;
+    }
     let resp = send_once(client, req, Some(&token.access_token)).await?;
     if resp.status != 401 || fresh {
         return Ok(resp);

@@ -310,7 +310,7 @@ async fn websocket(
 }
 
 /// TLS that trusts what the OS trusts, as for every send.
-fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
+pub(crate) fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let verifier = rustls_platform_verifier::Verifier::new(provider.clone())
         .map_err(|e| format!("cannot load the OS certificates: {e}"))?;

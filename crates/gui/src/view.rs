@@ -250,14 +250,24 @@ fn request_bar(doc: &Doc) -> Element<'_, Msg> {
         .padding([8, 14])
         .on_press_maybe(doc.unsaved().then_some(Msg::Save))
         .style(style::neutral);
-    row![
+    // A gRPC call always POSTs, so its method is not a choice.
+    let method: Element<'_, Msg> = if doc.body_kind == reqlite_gui::draft::BodyKind::Grpc {
+        container(text("gRPC").size(13).font(style::MONO).color(style::ACCENT))
+            .padding([8, 12])
+            .width(110)
+            .into()
+    } else {
         pick_list(&doc.methods[..], Some(&doc.method), Msg::Method)
             .font(style::MONO)
             .text_size(13)
             .padding([8, 12])
             .width(110)
             .style(style::method_picker(style::method_color(&doc.method)))
-            .menu_style(style::method_menu),
+            .menu_style(style::method_menu)
+            .into()
+    };
+    row![
+        method,
         crate::guard::guard(
             text_input("https://", &doc.url)
                 .id(URL)
@@ -423,6 +433,22 @@ fn body_editor<'a, E: Into<Element<'a, Msg>>>(
         ]
         .spacing(6)
         .into(),
+        K::Grpc => column![
+            field(
+                "Method, such as users.v1.Users/GetUser",
+                &doc.grpc_method,
+                Msg::GrpcMethod
+            ),
+            field(
+                "path/to/service.proto, or empty to ask the server",
+                &doc.grpc_proto,
+                Msg::GrpcProto
+            ),
+            note("Message, as JSON"),
+            editor(&doc.body, "{\"id\": \"{{user_id}}\"}", Msg::Body).into(),
+        ]
+        .spacing(6)
+        .into(),
         K::File => column![
             field(
                 "path/to/file, from the request file's folder",
@@ -441,6 +467,7 @@ fn body_editor<'a, E: Into<Element<'a, Msg>>>(
         K::Multipart => "@ marks a file part, read when the request is sent.",
         K::File => "",
         K::Graphql => "Sent as a JSON POST. Schema shows the server's types.",
+        K::Grpc => "A unary gRPC call to the URL's server, http:// or https://.",
     };
     column![
         row![kind, note(hint)]
@@ -655,10 +682,9 @@ fn response_pane(doc: &Doc) -> container::Container<'_, Msg> {
     if let Some(live) = &doc.live {
         return live_pane(doc, live);
     }
-    let mut header = row![status(doc), Space::new().width(Length::Fill)]
-        .spacing(10)
-        .align_y(Alignment::Center)
-        .height(28);
+    // The status, then the tabs. A long status, such as "407 Proxy
+    // Authentication Required", moves the tabs to a second line.
+    let mut tabs = row![].spacing(10).align_y(Alignment::Center);
     let shown = doc.shown();
     if shown.is_some() {
         let tab = |t: ResponseTab, name: String| {
@@ -668,13 +694,13 @@ fn response_pane(doc: &Doc) -> container::Container<'_, Msg> {
                 .on_press(Msg::ResponseTab(t))
                 .style(move |th, st| style::tab(th, st, active))
         };
-        header = header.push(tab(ResponseTab::Body, "Body".into())).push(tab(
+        tabs = tabs.push(tab(ResponseTab::Body, "Body".into())).push(tab(
             ResponseTab::Headers,
             format!("Headers {}", doc.response_headers.len()),
         ));
         if let Some(c) = doc.checks.as_ref().filter(|c| !c.outcomes.is_empty()) {
             let passed = c.outcomes.len() - c.failed();
-            header = header.push(tab(
+            tabs = tabs.push(tab(
                 ResponseTab::Tests,
                 format!("Tests {passed}/{}", c.outcomes.len()),
             ));
@@ -689,12 +715,19 @@ fn response_pane(doc: &Doc) -> container::Container<'_, Msg> {
         let tip = container(text("Top line shown / lines").size(12))
             .padding([3, 8])
             .style(container::rounded_box);
-        header = header.push(iced::widget::tooltip(
+        tabs = tabs.push(iced::widget::tooltip(
             at,
             tip,
             iced::widget::tooltip::Position::Bottom,
         ));
     }
+    let header = row![
+        container(status(doc)).height(28).center_y(28),
+        container(tabs).height(28).center_y(28),
+    ]
+    .spacing(16)
+    .wrap()
+    .vertical_spacing(4);
     let body: Element<'_, Msg> = match (&doc.send, shown) {
         (Send::Finished(Err(e)), _) => message(e, style::DANGER),
         (_, Some(_)) if doc.response_tab == ResponseTab::Headers => headers(&doc.response_headers),
@@ -781,7 +814,14 @@ fn status(doc: &Doc) -> Element<'_, Msg> {
         Send::Cancelled => text("Cancelled").size(13).color(style::MUTED).into(),
         Send::Finished(Err(_)) => pill("Error", style::DANGER),
         Send::Finished(Ok(s)) => row![
-            pill(&s.status_line(), style::status_color(s.status)),
+            match grpc_status(&doc.response_headers) {
+                // A gRPC answer is HTTP 200 whatever happened; its own status says.
+                Some(code) => pill(
+                    &format!("{code} {}", reqlite_engine::grpc::status_name(code)),
+                    style::status_color(if code == 0 { 200 } else { 500 }),
+                ),
+                None => pill(&s.status_line(), style::status_color(s.status)),
+            },
             text(format!("{} ms", s.elapsed.as_millis()))
                 .size(12)
                 .font(style::MONO)
@@ -795,6 +835,15 @@ fn status(doc: &Doc) -> Element<'_, Msg> {
         .align_y(Alignment::Center)
         .into(),
     }
+}
+
+/// The `grpc-status` of a gRPC answer.
+fn grpc_status(headers: &[(String, String)]) -> Option<i32> {
+    headers
+        .iter()
+        .rev()
+        .find(|(k, _)| k.eq_ignore_ascii_case("grpc-status"))
+        .and_then(|(_, v)| v.trim().parse().ok())
 }
 
 fn pill(caption: &str, color: Color) -> Element<'static, Msg> {

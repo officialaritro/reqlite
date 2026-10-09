@@ -36,6 +36,8 @@ pub struct Doc {
     pub query: text_editor::Content,
     pub body: text_editor::Content,
     pub variables: text_editor::Content,
+    pub grpc_method: String,
+    pub grpc_proto: String,
     pub body_kind: BodyKind,
     /// The path a File body sends.
     pub body_file: String,
@@ -174,6 +176,8 @@ impl Doc {
             query: text_editor::Content::new(),
             body: text_editor::Content::new(),
             variables: text_editor::Content::new(),
+            grpc_method: String::new(),
+            grpc_proto: String::new(),
             body_kind: BodyKind::default(),
             body_file: String::new(),
             auth: AuthDraft::default(),
@@ -235,6 +239,8 @@ impl Doc {
         self.query = text_editor::Content::with_text(&d.query);
         self.body = text_editor::Content::with_text(&d.body);
         self.variables = text_editor::Content::with_text(&d.variables);
+        self.grpc_method.clone_from(&d.grpc_method);
+        self.grpc_proto.clone_from(&d.grpc_proto);
         self.body_kind = d.body_kind;
         self.body_file.clone_from(&d.body_file);
         self.auth = d.auth.clone();
@@ -256,6 +262,8 @@ impl Doc {
             body_kind: self.body_kind,
             body_file: self.body_file.clone(),
             variables: self.variables.text(),
+            grpc_method: self.grpc_method.clone(),
+            grpc_proto: self.grpc_proto.clone(),
             auth: self.auth.clone(),
             tests: self.tests.text(),
         }
@@ -269,6 +277,7 @@ impl Doc {
             headers: entries(&d.headers),
             body: match d.body_kind {
                 BodyKind::File => !d.body_file.trim().is_empty(),
+                BodyKind::Grpc => true,
                 _ => !d.body.is_empty(),
             },
             auth: d.auth.kind != reqlite_gui::draft::AuthKind::None,
