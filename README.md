@@ -2,25 +2,44 @@
 
 A lean, local-first API client written in Rust. No account, no cloud, no telemetry.
 
-**Status:** early alpha. The CLI works. The desktop app opens a folder of request files, edits, saves and sends them in tabs, and reopens past sends from history.
+**Status:** v0.1, early alpha. The CLI works. The desktop app opens a folder of request files, edits, saves and sends them in tabs, and reopens past sends from history.
 
-## Try it
+## Install
+
+Download the file for your system from the [latest release](https://github.com/officialaritro/reqlite/releases/latest). `SHA256SUMS` there lists each file's checksum.
+
+| System | File | What to do |
+|---|---|---|
+| macOS (Apple silicon or Intel) | `reqlite-X.Y.Z-macos-universal.dmg` | Open it and drag Reqlite to Applications. |
+| | `reqlite-X.Y.Z-macos-universal.tar.gz` | The `reqlite` and `reqlite-gui` commands. Put them on your `PATH`. |
+| Linux x86_64 | `reqlite-X.Y.Z-linux-x86_64.tar.gz` | The `reqlite` and `reqlite-gui` commands. Put them on your `PATH`. |
+| Windows x86_64 | `reqlite-X.Y.Z-windows-x86_64.zip` | `reqlite.exe` and `reqlite-gui.exe`. Unzip them anywhere. |
+
+The builds are not signed yet; signing is planned for v0.3. So the first start needs one extra step:
+
+- **macOS** blocks the app the first time, because Apple has not notarized it. Open System Settings, then Privacy & Security, and choose Open Anyway. Or run `xattr -dr com.apple.quarantine /Applications/Reqlite.app` once. A command from the `.tar.gz` needs the same: `xattr -d com.apple.quarantine reqlite reqlite-gui`.
+- **Windows** SmartScreen warns about an unknown publisher. Choose More info, then Run anyway.
+
+### Build from source
+
+With a Rust toolchain (1.85 or newer):
 
 ```sh
 cargo run -p reqlite -- send examples/hello.toml        # the CLI
 cargo run --release -p reqlite-gui -- examples            # the desktop app on a folder
+scripts/macos-app.sh                                      # macOS: target/macos/Reqlite.app and Reqlite.dmg
+```
+
+`scripts/package.py --target TARGET` builds the release archives for one platform into `dist/` and checks that each binary prints the version. A tag `vX.Y.Z` that matches the workspace version builds every platform in CI and makes a draft release.
+
+## Try it
+
+```sh
+reqlite send examples/hello.toml
+reqlite-gui examples
 ```
 
 ### The desktop app
-
-#### Install on macOS
-
-```sh
-scripts/macos-app.sh     # builds target/macos/Reqlite.app and target/macos/Reqlite.dmg
-open target/macos/Reqlite.dmg
-```
-
-Drag Reqlite to Applications. Run the script again to get a newer build. The app is signed ad-hoc, which is enough on the Mac that built it. Sharing it with other Macs needs a Developer ID signature and Apple notarization, which are not set up yet.
 
 #### Use
 
