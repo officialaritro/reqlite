@@ -1,7 +1,11 @@
 #!/bin/sh
-# Builds Reqlite.app and Reqlite.dmg in target/macos/, for use on this Mac.
+# Builds Reqlite.app and a DMG that installs it.
 #
-# Usage: scripts/macos-app.sh
+# Usage: scripts/macos-app.sh [BINARY DMG]
+#
+# With no arguments it builds reqlite-gui for this Mac and writes
+# target/macos/Reqlite.app and target/macos/Reqlite.dmg. scripts/package.py
+# passes a prebuilt (universal) binary and the DMG's path instead.
 #
 # The app is signed ad-hoc. That is enough on the Mac that built it. To share
 # it, the app needs a Developer ID signature and Apple notarization.
@@ -12,11 +16,18 @@ version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
 out=target/macos
 app="$out/Reqlite.app"
 
-cargo build --release -p reqlite-gui
+if [ $# -eq 2 ]; then
+    binary=$1
+    dmg=$2
+else
+    cargo build --release -p reqlite-gui
+    binary=target/release/reqlite-gui
+    dmg="$out/Reqlite.dmg"
+fi
 
 rm -rf "$out"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp target/release/reqlite-gui "$app/Contents/MacOS/reqlite-gui"
+cp "$binary" "$app/Contents/MacOS/reqlite-gui"
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -40,7 +51,7 @@ stage="$out/dmg"
 mkdir -p "$stage"
 cp -R "$app" "$stage/"
 ln -s /Applications "$stage/Applications"
-hdiutil create -quiet -volname Reqlite -srcfolder "$stage" -ov -format UDZO "$out/Reqlite.dmg"
+hdiutil create -quiet -volname Reqlite -srcfolder "$stage" -ov -format UDZO "$dmg"
 rm -rf "$stage"
 
-echo "built $app and $out/Reqlite.dmg ($version)"
+echo "built $app and $dmg ($version)"
