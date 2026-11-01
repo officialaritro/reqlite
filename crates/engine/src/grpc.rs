@@ -4,24 +4,34 @@
 //! from the server by reflection. A call is a POST to `/Service/Method` with
 //! each message framed as one flag byte, a 4-byte length and the bytes; the
 //! outcome is in the `grpc-status` trailer.
+//!
+//! [`send`] makes a call of any kind and collects it: a JSON array in the
+//! message sends several messages to a client-streaming method, and a
+//! server-streaming answer comes back as a JSON array. [`live`] runs a call as
+//! a session: messages go out as they are typed and show as they arrive.
 
 use crate::resolve::GrpcCall;
+use crate::stream::Event;
 use crate::{Body, Resolved, Response, SendBody, SendError, Store};
 use bytes::{Bytes, BytesMut};
-use http_body_util::{BodyExt, Full};
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use prost::Message;
 use prost_reflect::{DescriptorPool, DynamicMessage, MethodDescriptor, SerializeOptions};
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 /// How long a connect may take, and the longest quiet time in an answer.
 const CONNECT: Duration = Duration::from_secs(10);
 const IDLE: Duration = Duration::from_secs(30);
 
-type Http = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+type Http = Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, Infallible>>;
 
 /// An HTTP/2 client: TLS for `https://`, plain HTTP/2 for `http://`.
 fn client() -> Result<Http, SendError> {
@@ -39,26 +49,16 @@ fn client() -> Result<Http, SendError> {
         .build(https))
 }
 
-/// The answer to one call: its messages, and its headers and trailers.
-struct Answer {
-    http_status: u16,
-    headers: Vec<(String, Vec<u8>)>,
-    messages: Vec<Bytes>,
-    status: i32,
-    message: String,
-}
-
-/// Sends `messages` to `url` and reads the whole answer.
-async fn call(
+/// Starts a call: sends the headers and `body`, and waits for the answer's
+/// headers. `wait` bounds that wait; a live session passes `None`, as a
+/// server may hold its headers until it has something to say.
+async fn exchange(
     http: &Http,
     url: &str,
     metadata: &[(String, String)],
-    messages: &[Vec<u8>],
-) -> Result<Answer, SendError> {
-    let mut body = BytesMut::new();
-    for m in messages {
-        body.extend_from_slice(&frame(m));
-    }
+    body: BoxBody<Bytes, Infallible>,
+    wait: Option<Duration>,
+) -> Result<(u16, Vec<(String, Vec<u8>)>, Incoming), SendError> {
     let mut builder = http::Request::post(url)
         .header("content-type", "application/grpc")
         .header("te", "trailers")
@@ -68,28 +68,67 @@ async fn call(
         builder = builder.header(k.to_ascii_lowercase(), v);
     }
     let request = builder
-        .body(Full::new(body.freeze()))
+        .body(body)
         .map_err(|e| SendError::Grpc(format!("bad request: {e}")))?;
-    let wait = |what: &str| SendError::Grpc(format!("no {what} within {} s", IDLE.as_secs()));
-    let resp = tokio::time::timeout(IDLE, http.request(request))
-        .await
-        .map_err(|_elapsed| wait("answer"))?
-        .map_err(|e| SendError::Grpc(format!("cannot reach {url}: {}", crate::chain(&e))))?;
-    let http_status = resp.status().as_u16();
-    let mut headers: Vec<(String, Vec<u8>)> = resp
+    let reached = |r: Result<http::Response<Incoming>, _>| {
+        r.map_err(|e: hyper_util::client::legacy::Error| {
+            SendError::Grpc(format!("cannot reach {url}: {}", crate::chain(&e)))
+        })
+    };
+    let resp = match wait {
+        Some(limit) => reached(
+            tokio::time::timeout(limit, http.request(request))
+                .await
+                .map_err(|_elapsed| no_within("answer"))?,
+        )?,
+        None => reached(http.request(request).await)?,
+    };
+    let headers = resp
         .headers()
         .iter()
         .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
         .collect();
-    let mut body = resp.into_body();
-    let mut data = BytesMut::new();
-    while let Some(frame) = tokio::time::timeout(IDLE, body.frame())
-        .await
-        .map_err(|_elapsed| wait("data"))?
-    {
+    Ok((resp.status().as_u16(), headers, resp.into_body()))
+}
+
+fn no_within(what: &str) -> SendError {
+    SendError::Grpc(format!("no {what} within {} s", IDLE.as_secs()))
+}
+
+/// How a call ended: its `grpc-status` and `grpc-message`.
+struct Ending {
+    status: i32,
+    message: String,
+}
+
+/// Reads an answer's messages, each one as it is complete, until the
+/// trailers. `on_message` returns `false` to stop reading. The trailers are
+/// added to `headers`. `wait` bounds each quiet time.
+async fn read(
+    mut body: Incoming,
+    http_status: u16,
+    headers: &mut Vec<(String, Vec<u8>)>,
+    wait: Option<Duration>,
+    mut on_message: impl FnMut(Bytes) -> bool,
+) -> Result<Option<Ending>, SendError> {
+    let mut deframer = Deframer::default();
+    loop {
+        let next = match wait {
+            Some(limit) => tokio::time::timeout(limit, body.frame())
+                .await
+                .map_err(|_elapsed| no_within("data"))?,
+            None => body.frame().await,
+        };
+        let Some(frame) = next else { break };
         let frame = frame.map_err(|e| SendError::Grpc(format!("the answer broke off: {e}")))?;
         match frame.into_data() {
-            Ok(chunk) => data.extend_from_slice(&chunk),
+            Ok(chunk) => {
+                for message in deframer.push(&chunk)? {
+                    if !on_message(message) {
+                        return Ok(None);
+                    }
+                }
+            }
             Err(frame) => {
                 if let Ok(trailers) = frame.into_trailers() {
                     headers.extend(
@@ -101,6 +140,7 @@ async fn call(
             }
         }
     }
+    deframer.finish()?;
     let field = |name: &str| {
         headers
             .iter()
@@ -122,10 +162,46 @@ async fn call(
     let message = field("grpc-message")
         .map(|m| percent_decode(&m))
         .unwrap_or_default();
+    Ok(Some(Ending { status, message }))
+}
+
+/// The answer to one call: its messages, and its headers and trailers.
+struct Answer {
+    http_status: u16,
+    headers: Vec<(String, Vec<u8>)>,
+    messages: Vec<Bytes>,
+    status: i32,
+    message: String,
+}
+
+/// Sends `messages` to `url`, closes the sending side, and reads the whole
+/// answer.
+async fn call(
+    http: &Http,
+    url: &str,
+    metadata: &[(String, String)],
+    messages: &[Vec<u8>],
+) -> Result<Answer, SendError> {
+    let mut body = BytesMut::new();
+    for m in messages {
+        body.extend_from_slice(&frame(m));
+    }
+    let body = Full::new(body.freeze()).boxed();
+    let (http_status, mut headers, incoming) =
+        exchange(http, url, metadata, body, Some(IDLE)).await?;
+    let mut got = Vec::new();
+    let ending = read(incoming, http_status, &mut headers, Some(IDLE), |m| {
+        got.push(m);
+        true
+    })
+    .await?;
+    let Some(Ending { status, message }) = ending else {
+        return Err(SendError::Grpc("the answer stopped early".into()));
+    };
     Ok(Answer {
         http_status,
         headers,
-        messages: unframe(data.freeze())?,
+        messages: got,
         status,
         message,
     })
@@ -140,25 +216,42 @@ fn frame(message: &[u8]) -> Vec<u8> {
     out
 }
 
-fn unframe(mut data: Bytes) -> Result<Vec<Bytes>, SendError> {
-    let mut out = Vec::new();
-    while !data.is_empty() {
-        if data.len() < 5 {
-            return Err(SendError::Grpc("a message frame is cut short".into()));
+/// Cuts a byte stream into messages, wherever the chunks happen to break.
+#[derive(Default)]
+struct Deframer {
+    buf: BytesMut,
+}
+
+impl Deframer {
+    /// The messages `chunk` completes.
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, SendError> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while self.buf.len() >= 5 {
+            if self.buf[0] != 0 {
+                return Err(SendError::Grpc(
+                    "the server sent a compressed message, which Reqlite does not read".into(),
+                ));
+            }
+            let len =
+                u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
+            if self.buf.len() < 5 + len {
+                break;
+            }
+            let mut message = self.buf.split_to(5 + len);
+            out.push(message.split_off(5).freeze());
         }
-        if data[0] != 0 {
-            return Err(SendError::Grpc(
-                "the server sent a compressed message, which Reqlite does not read".into(),
-            ));
-        }
-        let len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
-        if data.len() < 5 + len {
-            return Err(SendError::Grpc("a message is cut short".into()));
-        }
-        out.push(data.slice(5..5 + len));
-        data = data.slice(5 + len..);
+        Ok(out)
     }
-    Ok(out)
+
+    /// Fails when the stream ended inside a message.
+    fn finish(&self) -> Result<(), SendError> {
+        match self.buf.len() {
+            0 => Ok(()),
+            1..5 => Err(SendError::Grpc("a message frame is cut short".into())),
+            _ => Err(SendError::Grpc("a message is cut short".into())),
+        }
+    }
 }
 
 /// `grpc-message` is percent-encoded.
@@ -364,10 +457,15 @@ async fn reflect(
     Ok(pool)
 }
 
-/// Makes a unary call. The response holds the answer message as JSON, and
-/// the headers and trailers, `grpc-status` among them. A call the server
-/// refuses is still a response: its body is the status as JSON.
-pub(crate) async fn unary(req: &Resolved, bearer: Option<&str>) -> Result<Response, SendError> {
+/// Where a call goes, and what goes with it.
+struct Target {
+    http: Http,
+    url: String,
+    metadata: Vec<(String, String)>,
+    method: MethodDescriptor,
+}
+
+async fn target(req: &Resolved, bearer: Option<&str>) -> Result<Target, SendError> {
     let Some(call) = req.grpc() else {
         return Err(SendError::Grpc("not a gRPC call".into()));
     };
@@ -381,66 +479,281 @@ pub(crate) async fn unary(req: &Resolved, bearer: Option<&str>) -> Result<Respon
     if let Some(t) = bearer {
         metadata.push(("authorization".into(), format!("Bearer {t}")));
     }
-    let start = Instant::now();
     let http = client()?;
     let method = method(&http, &base, call, &metadata).await?;
-    if method.is_client_streaming() || method.is_server_streaming() {
-        return Err(SendError::Grpc(format!(
-            "{} is a streaming method; Reqlite sends unary calls for now",
-            call.method
+    Ok(Target {
+        http,
+        url: sent.url.clone(),
+        metadata,
+        method,
+    })
+}
+
+/// The kind of a method, as people name it.
+fn kind(method: &MethodDescriptor) -> &'static str {
+    match (method.is_client_streaming(), method.is_server_streaming()) {
+        (false, false) => "unary",
+        (false, true) => "server streaming",
+        (true, false) => "client streaming",
+        (true, true) => "bidirectional streaming",
+    }
+}
+
+/// The messages a text holds. A client-streaming method takes a JSON array
+/// of them, or one message. Any other method takes one message. Empty text
+/// is one empty message, or none for a client-streaming method.
+fn messages_in(method: &MethodDescriptor, text: &str) -> Result<Vec<DynamicMessage>, SendError> {
+    let input = method.input();
+    let one = |text: &str| {
+        let mut de = serde_json::Deserializer::from_str(text);
+        DynamicMessage::deserialize(input.clone(), &mut de)
+            .and_then(|m| de.end().map(|()| m))
+            .map_err(|e| SendError::GrpcMessage(format!("{}: {e}", input.full_name())))
+    };
+    let text = text.trim();
+    if !text.starts_with('[') {
+        return match (text.is_empty(), method.is_client_streaming()) {
+            (true, true) => Ok(Vec::new()),
+            (true, false) => one("{}").map(|m| vec![m]),
+            (false, _) => one(text).map(|m| vec![m]),
+        };
+    }
+    if !method.is_client_streaming() {
+        return Err(SendError::GrpcMessage(format!(
+            "{} is {} and takes one message, not an array",
+            method.name(),
+            kind(method)
         )));
     }
-    let text = match &sent.body {
-        Some(SendBody::Text(t)) if !t.trim().is_empty() => t.as_str(),
-        _ => "{}",
-    };
-    let mut de = serde_json::Deserializer::from_str(text);
-    let message = DynamicMessage::deserialize(method.input(), &mut de)
-        .and_then(|m| de.end().map(|()| m))
-        .map_err(|e| SendError::GrpcMessage(format!("{}: {e}", method.input().full_name())))?;
-    let answer = call_once(&http, &sent.url, &metadata, &message).await?;
-    let json = if answer.status == 0 {
-        let Some(bytes) = answer.messages.first() else {
-            return Err(SendError::Grpc("the answer has no message".into()));
-        };
-        let out = DynamicMessage::decode(method.output(), bytes.as_ref())
-            .map_err(|e| SendError::Grpc(format!("bad answer message: {e}")))?;
-        to_json(&out)?
-    } else {
-        let error = serde_json::json!({
+    let items: Vec<serde_json::Value> = serde_json::from_str(text)
+        .map_err(|e| SendError::GrpcMessage(format!("the message array: {e}")))?;
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            DynamicMessage::deserialize(input.clone(), item).map_err(|e| {
+                SendError::GrpcMessage(format!("message {}: {}: {e}", i + 1, input.full_name()))
+            })
+        })
+        .collect()
+}
+
+fn body_text(req: &Resolved) -> &str {
+    match &req.sent().body {
+        Some(SendBody::Text(text)) => text.as_str(),
+        _ => "",
+    }
+}
+
+/// Makes a call of any kind and collects it. The response holds the answer
+/// as JSON: one message, or for a server-streaming method an array of all of
+/// them, and the headers and trailers, `grpc-status` among them. A call the
+/// server refuses is still a response: its body is the status as JSON, with
+/// any streamed messages that came before it.
+pub(crate) async fn send(req: &Resolved, bearer: Option<&str>) -> Result<Response, SendError> {
+    let start = Instant::now();
+    let t = target(req, bearer).await?;
+    let messages: Vec<Vec<u8>> = messages_in(&t.method, body_text(req))?
+        .iter()
+        .map(Message::encode_to_vec)
+        .collect();
+    let answer = call(&t.http, &t.url, &t.metadata, &messages).await?;
+    let decoded = answer
+        .messages
+        .iter()
+        .map(|bytes| {
+            DynamicMessage::decode(t.method.output(), bytes.as_ref())
+                .map_err(|e| SendError::Grpc(format!("bad answer message: {e}")))
+                .and_then(|m| to_value(&m))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let streams_back = t.method.is_server_streaming();
+    let json = if answer.status != 0 {
+        let mut error = serde_json::json!({
             "code": answer.status,
             "status": status_name(answer.status),
             "message": answer.message,
         });
-        serde_json::to_vec_pretty(&error).map_err(|e| SendError::Grpc(e.to_string()))?
+        if streams_back && !decoded.is_empty() {
+            error["messages"] = serde_json::Value::Array(decoded);
+        }
+        error
+    } else if streams_back {
+        serde_json::Value::Array(decoded)
+    } else {
+        let mut decoded = decoded.into_iter();
+        match (decoded.next(), decoded.next()) {
+            (Some(one), None) => one,
+            (None, _) => return Err(SendError::Grpc("the answer has no message".into())),
+            (Some(_), Some(_)) => {
+                return Err(SendError::Grpc(format!(
+                    "{} is {} but the server sent more than one message",
+                    t.method.name(),
+                    kind(&t.method)
+                )));
+            }
+        }
     };
+    let body = serde_json::to_vec_pretty(&json).map_err(|e| SendError::Grpc(e.to_string()))?;
     Ok(Response {
         status: answer.http_status,
         headers: answer.headers,
-        body: Body(Store::Memory(json)),
+        body: Body(Store::Memory(body)),
         elapsed: start.elapsed(),
         oauth_token: bearer.map(str::to_string),
     })
 }
 
-async fn call_once(
-    http: &Http,
-    url: &str,
-    metadata: &[(String, String)],
-    message: &DynamicMessage,
-) -> Result<Answer, SendError> {
-    call(http, url, metadata, &[message.encode_to_vec()]).await
+/// What the reader of a live call passes back.
+enum Heard {
+    Open(u16),
+    Message(Bytes),
+    End(Result<Ending, SendError>),
+}
+
+/// Runs a call of any kind as a session. The file's messages go first. Each
+/// text on `outgoing` holds more messages for a client-streaming method, one
+/// JSON message or an array. When `outgoing` closes, the sending side closes
+/// and the session goes on until the server ends the call: that is how a
+/// client says it has no more to send. A unary or server-streaming call
+/// closes its sending side after its one message. Returns why it ended.
+pub(crate) async fn live(
+    req: &Resolved,
+    bearer: Option<&str>,
+    outgoing: &mut mpsc::UnboundedReceiver<String>,
+    tell: &mut impl FnMut(Event) -> bool,
+) -> Result<String, String> {
+    const BY_YOU: &str = "closed by you";
+    let show = |e: SendError| crate::chain(&e);
+    let t = target(req, bearer).await.map_err(show)?;
+    let first = messages_in(&t.method, body_text(req)).map_err(show)?;
+    let (frames_tx, queued) = mpsc::unbounded_channel::<Bytes>();
+    let body = StreamBody::new(futures_util::stream::unfold(queued, async |mut rx| {
+        rx.recv()
+            .await
+            .map(|b| (Ok::<_, Infallible>(Frame::data(b)), rx))
+    }))
+    .boxed();
+    if !tell(Event::Note {
+        text: format!("{} is {}", t.method.name(), kind(&t.method)),
+    }) {
+        return Ok(BY_YOU.into());
+    }
+    let (method, output) = (t.method.clone(), t.method.output());
+    let (heard_tx, mut heard) = mpsc::unbounded_channel();
+    let reader = tokio::spawn(async move {
+        let (status, mut headers, incoming) =
+            match exchange(&t.http, &t.url, &t.metadata, body, None).await {
+                Ok(parts) => parts,
+                Err(e) => {
+                    heard_tx.send(Heard::End(Err(e))).ok();
+                    return;
+                }
+            };
+        heard_tx.send(Heard::Open(status)).ok();
+        let ended = read(incoming, status, &mut headers, None, |m| {
+            heard_tx.send(Heard::Message(m)).is_ok()
+        })
+        .await;
+        match ended {
+            Ok(Some(ending)) => heard_tx.send(Heard::End(Ok(ending))).ok(),
+            Ok(None) => None,
+            Err(e) => heard_tx.send(Heard::End(Err(e))).ok(),
+        };
+    });
+    // Leaving this function, for any reason, cancels the call.
+    let _stop = AbortOnDrop(reader);
+    let mut frames = Some(frames_tx);
+    // Queues `ms` on the sending side and logs each one.
+    let send_all = |ms: &[DynamicMessage],
+                    frames: &Option<mpsc::UnboundedSender<Bytes>>,
+                    tell: &mut dyn FnMut(Event) -> bool| {
+        for m in ms {
+            if let Some(f) = frames {
+                f.send(Bytes::from(frame(&m.encode_to_vec()))).ok();
+            }
+            let data = to_line(m).unwrap_or_else(|e| e.to_string());
+            if !tell(Event::Sent { data }) {
+                return false;
+            }
+        }
+        true
+    };
+    if !send_all(&first, &frames, tell) {
+        return Ok(BY_YOU.into());
+    }
+    if !method.is_client_streaming() {
+        frames = None;
+    }
+    let mut input_open = true;
+    loop {
+        let event = tokio::select! {
+            got = heard.recv() => match got {
+                Some(Heard::Open(status)) => Event::Open { status },
+                Some(Heard::Message(bytes)) => {
+                    let m = DynamicMessage::decode(output.clone(), bytes.as_ref())
+                        .map_err(|e| format!("bad answer message: {e}"))?;
+                    Event::Received { name: None, data: to_line(&m).map_err(show)? }
+                }
+                Some(Heard::End(Ok(Ending { status, message }))) => {
+                    let mut reason = format!("ended with status {status} {}", status_name(status));
+                    if !message.is_empty() {
+                        reason.push_str(&format!(": {message}"));
+                    }
+                    return Ok(reason);
+                }
+                Some(Heard::End(Err(e))) => return Err(show(e)),
+                None => return Err("the call stopped".into()),
+            },
+            typed = outgoing.recv(), if input_open => match typed {
+                None => {
+                    input_open = false;
+                    if frames.take().is_none() {
+                        continue;
+                    }
+                    Event::Note { text: "done sending".into() }
+                }
+                Some(_) if frames.is_none() => Event::Note {
+                    text: format!("not sent: {} takes no more messages", method.name()),
+                },
+                Some(text) => match messages_in(&method, &text) {
+                    Ok(ms) if ms.is_empty() => Event::Note { text: "not sent: no message".into() },
+                    Ok(ms) => {
+                        if !send_all(&ms, &frames, tell) {
+                            return Ok(BY_YOU.into());
+                        }
+                        continue;
+                    }
+                    Err(e) => Event::Note { text: format!("not sent: {}", show(e)) },
+                },
+            },
+        };
+        if !tell(event) {
+            return Ok(BY_YOU.into());
+        }
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A message as one line of JSON, for a log.
+fn to_line(message: &DynamicMessage) -> Result<String, SendError> {
+    serde_json::to_string(&to_value(message)?).map_err(|e| SendError::Grpc(e.to_string()))
 }
 
 /// A message in the protobuf JSON mapping, with fields at their default
 /// values shown too, so the reader sees every field.
-fn to_json(message: &DynamicMessage) -> Result<Vec<u8>, SendError> {
-    let mut out = serde_json::Serializer::pretty(Vec::new());
+fn to_value(message: &DynamicMessage) -> Result<serde_json::Value, SendError> {
     let options = SerializeOptions::new().skip_default_fields(false);
     message
-        .serialize_with_options(&mut out, &options)
-        .map_err(|e| SendError::Grpc(format!("cannot show the answer as JSON: {e}")))?;
-    Ok(out.into_inner())
+        .serialize_with_options(serde_json::value::Serializer, &options)
+        .map_err(|e| SendError::Grpc(format!("cannot show the answer as JSON: {e}")))
 }
 
 #[cfg(test)]
@@ -448,13 +761,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frames_carry_a_flag_and_a_length() {
+    fn frames_carry_a_flag_and_a_length_across_any_chunking() {
         let wire = [frame(b"ab"), frame(b""), frame(b"xyz")].concat();
         assert_eq!(&wire[..7], &[0, 0, 0, 0, 2, b'a', b'b']);
-        let back = unframe(Bytes::from(wire)).unwrap();
-        assert_eq!(back, [&b"ab"[..], b"", b"xyz"]);
-        assert!(unframe(Bytes::from_static(&[0, 0, 0, 0, 9, 1])).is_err());
-        assert!(unframe(Bytes::from_static(&[1, 0, 0, 0, 0])).is_err());
+        for cut in 0..=wire.len() {
+            let mut d = Deframer::default();
+            let mut back = d.push(&wire[..cut]).unwrap();
+            back.extend(d.push(&wire[cut..]).unwrap());
+            assert_eq!(back, [&b"ab"[..], b"", b"xyz"], "cut at {cut}");
+            d.finish().unwrap();
+        }
+        let mut d = Deframer::default();
+        assert!(d.push(&[0, 0, 0, 0, 9, 1]).unwrap().is_empty());
+        assert!(d.finish().is_err());
+        assert!(Deframer::default().push(&[1, 0, 0, 0, 0]).is_err());
     }
 
     #[test]

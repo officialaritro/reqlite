@@ -691,6 +691,7 @@ fn live_event(doc: &mut Doc, t: reqlite_engine::stream::Timed, now: Instant) {
         }
         Event::Received { name, data } => (Dir::In, name, data),
         Event::Sent { data } => (Dir::Out, None, data),
+        Event::Note { text } => (Dir::Info, None, text),
         Event::Closed { reason } => {
             live.open = false;
             live.tx = None;

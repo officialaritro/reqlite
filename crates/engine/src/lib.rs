@@ -147,7 +147,7 @@ pub enum SendError {
         path: std::path::PathBuf,
         reason: String,
     },
-    #[error("the gRPC message is not valid {0}")]
+    #[error("the gRPC message is not valid: {0}")]
     GrpcMessage(String),
     #[error("OAuth 2.0 sign-in failed")]
     OAuth(#[source] Box<oauth::OAuthError>),
@@ -252,14 +252,14 @@ pub async fn send_with(
 ) -> Result<Response, SendError> {
     let Some(cfg) = req.oauth() else {
         if req.is_grpc() {
-            return grpc::unary(req, None).await;
+            return grpc::send(req, None).await;
         }
         return send_once(client, req, None).await;
     };
     let auth = auth.ok_or(oauth::OAuthError::NoAuthorizer)?;
     let (token, fresh) = oauth::token(client, cfg, auth).await?;
     if req.is_grpc() {
-        return grpc::unary(req, Some(&token.access_token)).await;
+        return grpc::send(req, Some(&token.access_token)).await;
     }
     let resp = send_once(client, req, Some(&token.access_token)).await?;
     if resp.status != 401 || fresh {

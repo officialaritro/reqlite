@@ -676,7 +676,7 @@ fn listen(
                 data,
             } => format!("[{n}] {data}"),
             Event::Received { name: None, data } | Event::Sent { data } => data.clone(),
-            Event::Closed { reason } => reason.clone(),
+            Event::Closed { reason } | Event::Note { text: reason } => reason.clone(),
         };
         let mark = match &t.event {
             Event::Received { .. } => "<",
