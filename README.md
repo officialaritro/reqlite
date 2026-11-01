@@ -234,9 +234,32 @@ proto = "protos/users.proto"     # leave out to ask the server by reflection
 message = '{"id": "{{user_id}}"}'
 ```
 
-A `[grpc]` table makes the request a unary gRPC call to the URL's server. The message is JSON in the protobuf JSON mapping, and placeholders work in it. The `.proto` file is compiled when the call is made, with its imports looked up next to it; the well-known `google/protobuf` types are built in. Without `proto`, Reqlite asks the server for the schema by server reflection (v1, then v1alpha). Auth works as for HTTP: a bearer or OAuth 2.0 token goes as `authorization` metadata.
+A `[grpc]` table makes the request a gRPC call to the URL's server: unary, server streaming, client streaming or bidirectional, as the schema says. The message is JSON in the protobuf JSON mapping, and placeholders work in it. The `.proto` file is compiled when the call is made, with its imports looked up next to it; the well-known `google/protobuf` types are built in. Without `proto`, Reqlite asks the server for the schema by server reflection (v1, then v1alpha). Auth works as for HTTP: a bearer or OAuth 2.0 token goes as `authorization` metadata.
 
-The answer is JSON, with every field shown, also those at their default value. Its `grpc-status` and `grpc-message` are among the response headers, so a check reads `header grpc-status == 0`. A call the server refuses is still an answer: its body is `{"code": 5, "status": "NOT_FOUND", "message": "..."}`. A `.proto` file that does not compile, or a message with a field the schema lacks, exits with code 3. `reqlite send`, `reqlite run` and the app all make the call; in the app, the gRPC body type has the method, the `.proto` file and the message, and the status shows as `0 OK` or `5 NOT_FOUND`. cURL export refuses a gRPC call. A call stops after 30 s without an answer. Streaming methods come next.
+The answer is JSON, with every field shown, also those at their default value. Its `grpc-status` and `grpc-message` are among the response headers, so a check reads `header grpc-status == 0`. A call the server refuses is still an answer: its body is `{"code": 5, "status": "NOT_FOUND", "message": "..."}`. A `.proto` file that does not compile, or a message with a field the schema lacks, exits with code 3. `reqlite send`, `reqlite run` and the app all make the call; in the app, the gRPC body type has the method, the `.proto` file and the message, and the status shows as `0 OK` or `5 NOT_FOUND`. cURL export refuses a gRPC call. A call stops after 30 s without an answer.
+
+#### Streaming calls
+
+`reqlite send`, `reqlite run` and Send in the app collect a streaming call, so checks and captures work on it:
+
+| Method kind | `message` holds | The answer is |
+|---|---|---|
+| Unary | one message | one message |
+| Server streaming | one message | a JSON array of every message, once the server ends the call |
+| Client streaming | a JSON array of messages, or one message | one message |
+| Bidirectional | a JSON array of messages, or one message | a JSON array of every message |
+
+A check reads one message of a stream as `json $[0].text`. When the server ends a stream with an error, the body is the error, and the messages that came before it are under `messages`.
+
+To see a stream as it happens, use `reqlite listen`, or Stream in the app. The file's messages go first. For a client-streaming or bidirectional method, each line on stdin is one more JSON message, and the end of stdin (Ctrl+D) ends the sending side: the call goes on until the server ends it, which is how a client says it has no more to send.
+
+```sh
+reqlite listen watch.toml --for 60                   # a server stream, as it comes
+printf '{"name": "a"}\n{"name": "b"}\n' | reqlite listen collect.toml
+reqlite listen chat.toml                             # type JSON lines; Ctrl+D when done
+```
+
+The log starts with the method's kind and ends with the call's status, such as `ended with status 0 OK`. A typed message that does not fit the schema is not sent; the log says why, and the call goes on. In the app, the log has a box for JSON messages and a Done sending button, and messages can go before the server answers, as gRPC servers often hold their first answer until they have a message.
 
 ### WebSocket and server-sent events
 
@@ -248,7 +271,7 @@ reqlite listen events.toml --count 10                 # stop after 10 events
 reqlite listen events.toml --for 60                   # stop after 60 seconds
 ```
 
-`reqlite listen` prints each message as it comes, with its time from the connect: `<` from the server, `>` sent, `-` about the connection. An SSE event shows its name in brackets. Each line typed on stdin goes out as a WebSocket text message, and the end of stdin closes nothing. The session ends when the server closes it, at `--count` or `--for`, or with Ctrl+C. It exits with code 0 when the connection ended normally and 1 when it failed. `reqlite send` and `reqlite run` do not open these connections; `send` names `reqlite listen` instead.
+`reqlite listen` prints each message as it comes, with its time from the connect: `<` from the server, `>` sent, `-` about the connection. An SSE event shows its name in brackets. Each line typed on stdin goes out as a WebSocket text message, and the end of stdin closes nothing. `reqlite listen` also runs gRPC calls; see [Streaming calls](#streaming-calls). The session ends when the server closes it, at `--count` or `--for`, or with Ctrl+C. It exits with code 0 when the connection ended normally and 1 when it failed. `reqlite send` and `reqlite run` do not open these connections; `send` names `reqlite listen` instead.
 
 In the app, Send becomes Connect for these requests. The response pane shows the log, newest at the bottom, and for a WebSocket a box to send text or JSON messages. Esc or Disconnect closes the connection and keeps the log. The log keeps the newest 500 messages and at most 2 MB, cuts a message over 16 KB, and counts what it dropped, so a session that runs for hours uses the same memory as a short one. Connections are not saved to history.
 
