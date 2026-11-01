@@ -67,9 +67,14 @@ pub struct Doc {
 
 pub struct Live {
     pub log: reqlite_gui::live::Log,
-    /// Takes WebSocket messages to send. `None` for SSE, and once closed.
+    /// Takes messages to send. `None` for SSE, once closed, and for a gRPC
+    /// call once its sending side is done.
     pub tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    pub websocket: bool,
+    /// The log has a message box: a WebSocket, or a gRPC call.
+    pub input: bool,
+    /// A gRPC call: messages may go before the server answers, and Done
+    /// sending ends the sending side while the call goes on.
+    pub half_close: bool,
     /// The handshake finished and the connection has not closed.
     pub open: bool,
     /// The message being typed.
