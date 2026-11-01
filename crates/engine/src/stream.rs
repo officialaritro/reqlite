@@ -19,6 +19,9 @@ const CONNECT: Duration = Duration::from_secs(10);
 pub enum Kind {
     WebSocket,
     Sse,
+    /// A gRPC call run as a session, of any kind. [`kind`] never returns
+    /// it: a gRPC call is a plain send unless the caller asks for a session.
+    Grpc,
 }
 
 /// The kind of connection `req` opens, or `None` for a plain send.
@@ -44,6 +47,9 @@ pub enum Event {
     Received { name: Option<String>, data: String },
     /// A message this side sent.
     Sent { data: String },
+    /// Something about the session that is not a message, such as a typed
+    /// message that could not be sent.
+    Note { text: String },
     /// The connection ended, and why.
     Closed { reason: String },
 }
@@ -58,7 +64,8 @@ pub struct Timed {
 /// Opens the connection `req` describes and reports each event to `emit`,
 /// until the server closes it, `emit` returns `false`, or `outgoing` closes.
 /// Each message on `outgoing` is sent as a WebSocket text frame; an SSE
-/// stream ignores them. The last event is always [`Event::Closed`]. Returns
+/// stream ignores them. A gRPC call runs as a session too: see
+/// [`crate::grpc::live`], where a closed `outgoing` ends the sending side only. The last event is always [`Event::Closed`]. Returns
 /// an error when the connection failed rather than ended.
 pub async fn open(
     req: &Resolved,
@@ -73,9 +80,13 @@ pub async fn open(
             event,
         })
     };
-    let result = match kind(req) {
-        Some(Kind::WebSocket) => websocket(req, auth, &mut outgoing, &mut tell).await,
-        _ => sse(req, auth, &mut tell).await,
+    let result = if req.is_grpc() {
+        grpc(req, auth, &mut outgoing, &mut tell).await
+    } else {
+        match kind(req) {
+            Some(Kind::WebSocket) => websocket(req, auth, &mut outgoing, &mut tell).await,
+            _ => sse(req, auth, &mut tell).await,
+        }
     };
     let reason = match &result {
         Ok(reason) => reason.clone(),
@@ -107,6 +118,19 @@ async fn bearer(
         .await
         .map_err(|e| crate::chain(&e))?;
     Ok(Some(token.access_token))
+}
+
+async fn grpc(
+    req: &Resolved,
+    auth: Option<&oauth::Authorizer<'_>>,
+    outgoing: &mut mpsc::UnboundedReceiver<String>,
+    tell: &mut impl FnMut(Event) -> bool,
+) -> Result<String, String> {
+    let token = match req.oauth() {
+        Some(_) => bearer(&stream_client()?, req, auth).await?,
+        None => None,
+    };
+    crate::grpc::live(req, token.as_deref(), outgoing, tell).await
 }
 
 /// Reads an SSE stream. Returns why it ended.

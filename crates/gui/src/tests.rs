@@ -875,7 +875,8 @@ fn a_websocket_tab_connects_logs_and_sends() {
     a.docs[0].live = Some(doc::Live {
         log: reqlite_gui::live::Log::default(),
         tx: Some(tx),
-        websocket: true,
+        input: true,
+        half_close: false,
         open: false,
         message: String::new(),
         started: Instant::now(),
@@ -935,6 +936,85 @@ fn a_websocket_tab_connects_logs_and_sends() {
     let mut ui = simulator(view::view(&a));
     assert!(ui.find("Closed").is_ok() && ui.find("closed by the server: 1000 done").is_ok());
     assert!(ui.find("Connect").is_ok(), "it can connect again");
+}
+
+#[test]
+fn a_grpc_tab_streams_takes_messages_early_and_can_stop_sending() {
+    use reqlite_engine::stream::{Event, Timed};
+    let mut a = app(Some(
+        "version = 4\nname = \"chat\"\nurl = \"http://h:1\"\n\n[grpc]\nmethod = \"t.S/Chat\"\n",
+    ));
+    let id = a.docs[0].id;
+    let mut ui = simulator(view::view(&a));
+    assert!(
+        ui.find("Stream").is_ok(),
+        "a gRPC call can run as a session"
+    );
+    drop(ui);
+
+    // The state Stream leaves, with the engine's events fed in by hand.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_task, handle) = Task::<Msg>::none().abortable();
+    a.docs[0].send = Send::Running(handle);
+    a.docs[0].live = Some(doc::Live {
+        log: reqlite_gui::live::Log::default(),
+        tx: Some(tx),
+        input: true,
+        half_close: true,
+        open: false,
+        message: String::new(),
+        started: Instant::now(),
+    });
+    let feed = |a: &mut App, ms, event| {
+        let at = Duration::from_millis(ms);
+        drop(update(a, Msg::Live(id, Timed { at, event })));
+    };
+    feed(
+        &mut a,
+        1,
+        Event::Note {
+            text: "Chat is bidirectional streaming".into(),
+        },
+    );
+
+    // A gRPC server may hold its headers back, so a message can go first.
+    drop(update(&mut a, Msg::LiveMessage("{\"id\": \"1\"}".into())));
+    drop(update(&mut a, Msg::LiveSend));
+    assert_eq!(rx.try_recv().unwrap(), "{\"id\": \"1\"}");
+    feed(&mut a, 2, Event::Open { status: 200 });
+    feed(
+        &mut a,
+        3,
+        Event::Received {
+            name: None,
+            data: "{\"id\":\"1\"}".into(),
+        },
+    );
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("Chat is bidirectional streaming").is_ok());
+    assert!(ui.find("Done sending").is_ok());
+    drop(ui);
+
+    // Done sending closes the sending side only: the call goes on.
+    drop(update(&mut a, Msg::LiveDone));
+    let live = a.docs[0].live.as_ref().unwrap();
+    assert!(live.tx.is_none() && a.docs[0].running());
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ),
+        "the channel is closed, not just empty"
+    );
+    feed(
+        &mut a,
+        9,
+        Event::Closed {
+            reason: "ended with status 0 OK".into(),
+        },
+    );
+    let mut ui = simulator(view::view(&a));
+    assert!(ui.find("ended with status 0 OK").is_ok());
 }
 
 #[test]

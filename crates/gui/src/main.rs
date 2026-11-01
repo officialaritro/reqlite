@@ -94,6 +94,10 @@ enum Msg {
     Send,
     /// Ask the GraphQL server for its schema, and show it as the response.
     Schema,
+    /// Run a gRPC call as a live session: messages show as they arrive.
+    Stream,
+    /// End a gRPC session's sending side. The call goes on.
+    LiveDone,
     Cancel,
     Sent(DocId, Box<Finished>),
     /// A frame or pulse tick, while something moves.
@@ -388,8 +392,9 @@ fn update(app: &mut App, msg: Msg) -> Task<Msg> {
     }
     match msg {
         Msg::Tick(_) => {}
-        Msg::Send => return start_send(app, false),
-        Msg::Schema => return start_send(app, true),
+        Msg::Send => return start_send(app, Mode::Send),
+        Msg::Schema => return start_send(app, Mode::Schema),
+        Msg::Stream => return start_send(app, Mode::Stream),
         Msg::Save => return save(app),
         Msg::Sent(id, done) => {
             let Finished {
@@ -605,6 +610,12 @@ fn edit(doc: &mut Doc, msg: Msg, now: Instant) {
                 };
             }
         }
+        Msg::LiveDone => {
+            if let Some(live) = doc.live.as_mut().filter(|l| l.half_close) {
+                // Dropping the sender ends the sending side; the engine logs it.
+                live.tx = None;
+            }
+        }
         Msg::LiveMessage(m) => {
             if let Some(live) = &mut doc.live {
                 live.message = m;
@@ -614,7 +625,7 @@ fn edit(doc: &mut Doc, msg: Msg, now: Instant) {
             if let Some(live) = doc
                 .live
                 .as_mut()
-                .filter(|l| l.open && !l.message.is_empty())
+                .filter(|l| (l.open || l.half_close) && !l.message.is_empty())
             {
                 if let Some(tx) = &live.tx {
                     // The Sent event logs it.
@@ -691,6 +702,7 @@ fn live_event(doc: &mut Doc, t: reqlite_engine::stream::Timed, now: Instant) {
         }
         Event::Received { name, data } => (Dir::In, name, data),
         Event::Sent { data } => (Dir::Out, None, data),
+        Event::Note { text } => (Dir::Info, None, text),
         Event::Closed { reason } => {
             live.open = false;
             live.tx = None;
@@ -721,7 +733,7 @@ fn sign_in(
     }
 }
 
-/// Opens a WebSocket or SSE connection for `doc`. Its events come back as
+/// Opens a WebSocket, SSE or gRPC session for `doc`. Its events come back as
 /// [`Msg::Live`], one by one.
 fn start_live(
     doc: &mut Doc,
@@ -729,13 +741,15 @@ fn start_live(
     kind: reqlite_engine::stream::Kind,
 ) -> Task<Msg> {
     use iced::futures::StreamExt;
-    let websocket = kind == reqlite_engine::stream::Kind::WebSocket;
+    use reqlite_engine::stream::Kind;
+    let input = kind != Kind::Sse;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let message = doc.live.take().map(|l| l.message).unwrap_or_default();
     doc.live = Some(doc::Live {
         log: reqlite_gui::live::Log::default(),
-        tx: websocket.then_some(tx),
-        websocket,
+        tx: input.then_some(tx),
+        input,
+        half_close: kind == Kind::Grpc,
         open: false,
         message,
         started: Instant::now(),
@@ -775,8 +789,19 @@ fn start_live(
     task
 }
 
-/// Sends the shown request, or with `schema`, its GraphQL introspection.
-fn start_send(app: &mut App, schema: bool) -> Task<Msg> {
+/// What the request bar asked for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Send,
+    /// The GraphQL introspection of the shown request.
+    Schema,
+    /// The shown gRPC call, as a live session.
+    Stream,
+}
+
+/// Sends the shown request, or runs it as `mode` asks.
+fn start_send(app: &mut App, mode: Mode) -> Task<Msg> {
+    let schema = mode == Mode::Schema;
     let (Some(client), env_path) = (app.client.clone(), app.env.clone()) else {
         return Task::none();
     };
@@ -827,6 +852,9 @@ fn start_send(app: &mut App, schema: bool) -> Task<Msg> {
             return Task::none();
         }
     };
+    if mode == Mode::Stream && resolved.is_grpc() {
+        return start_live(doc, resolved, reqlite_engine::stream::Kind::Grpc);
+    }
     if let Some(kind) = reqlite_engine::stream::kind(&resolved).filter(|_| !schema) {
         return start_live(doc, resolved, kind);
     }

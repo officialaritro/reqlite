@@ -3770,7 +3770,12 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 name = "reqlite"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "clap",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "reqlite-engine",
  "reqlite-format",
  "reqlite-import",

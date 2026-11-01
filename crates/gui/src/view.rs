@@ -444,7 +444,17 @@ fn body_editor<'a, E: Into<Element<'a, Msg>>>(
                 &doc.grpc_proto,
                 Msg::GrpcProto
             ),
-            note("Message, as JSON"),
+            row![
+                container(note(
+                    "Message, as JSON. An array sends several to a client stream."
+                ))
+                .width(Length::Fill),
+                button(text("Stream").size(12))
+                    .padding([3, 10])
+                    .on_press(Msg::Stream)
+                    .style(|t, s| style::tab(t, s, false)),
+            ]
+            .align_y(Alignment::Center),
             editor(&doc.body, "{\"id\": \"{{user_id}}\"}", Msg::Body).into(),
         ]
         .spacing(6)
@@ -467,7 +477,7 @@ fn body_editor<'a, E: Into<Element<'a, Msg>>>(
         K::Multipart => "@ marks a file part, read when the request is sent.",
         K::File => "",
         K::Graphql => "Sent as a JSON POST. Schema shows the server's types.",
-        K::Grpc => "A unary gRPC call to the URL's server, http:// or https://.",
+        K::Grpc => "Send collects the answer. Stream shows messages as they arrive.",
     };
     column![
         row![kind, note(hint)]
@@ -654,25 +664,38 @@ fn live_pane<'a>(doc: &'a Doc, live: &'a crate::doc::Live) -> container::Contain
         .width(Length::Fill)
         .height(Length::Fill);
     let mut col = column![header, divider(), log].spacing(8);
-    if live.websocket {
-        let can_send = live.open && !live.message.is_empty();
-        col = col.push(
-            row![
-                text_input("Message, text or JSON", &live.message)
-                    .on_input(Msg::LiveMessage)
-                    .on_submit(Msg::LiveSend)
-                    .font(style::MONO)
-                    .size(13)
-                    .padding([8, 10])
-                    .style(style::input),
-                button(text("Send").size(13))
+    if live.input {
+        let sending = live.tx.is_some();
+        let can_send = sending && (live.open || live.half_close) && !live.message.is_empty();
+        let hint = if live.half_close {
+            "Message, as JSON"
+        } else {
+            "Message, text or JSON"
+        };
+        let mut bar = row![
+            text_input(hint, &live.message)
+                .on_input(Msg::LiveMessage)
+                .on_submit(Msg::LiveSend)
+                .font(style::MONO)
+                .size(13)
+                .padding([8, 10])
+                .style(style::input),
+            button(text("Send").size(13))
+                .padding([7, 14])
+                .on_press_maybe(can_send.then_some(Msg::LiveSend))
+                .style(style::neutral),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        if live.half_close {
+            bar = bar.push(
+                button(text("Done sending").size(13))
                     .padding([7, 14])
-                    .on_press_maybe(can_send.then_some(Msg::LiveSend))
+                    .on_press_maybe((sending && doc.running()).then_some(Msg::LiveDone))
                     .style(style::neutral),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        );
+            );
+        }
+        col = col.push(bar);
     }
     panel(col)
 }
