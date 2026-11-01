@@ -39,14 +39,17 @@ enum Command {
         #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
         timeout: Option<u64>,
     },
-    /// Open a WebSocket (a ws:// or wss:// URL) or an SSE stream (a request
-    /// with `Accept: text/event-stream`) and print each message as it comes,
-    /// with its time. Each line typed on stdin is sent as a WebSocket message.
+    /// Open a WebSocket (a ws:// or wss:// URL), an SSE stream (a request
+    /// with `Accept: text/event-stream`) or a gRPC call of any kind, and print
+    /// each message as it comes, with its time. Each line typed on stdin is
+    /// sent as a WebSocket message, or as a JSON message to a client-streaming
+    /// gRPC method; the end of stdin ends a gRPC call's sending side.
     Listen {
         file: PathBuf,
         #[arg(long, short)]
         env: Option<PathBuf>,
-        /// Send this WebSocket message once connected. Repeat for more.
+        /// Send this message once connected: WebSocket text, or a JSON message
+        /// for a gRPC call. Repeat for more.
         #[arg(long, value_name = "MESSAGE")]
         send: Vec<String>,
         /// Close after SECS.
@@ -646,9 +649,12 @@ fn listen(
     for m in messages {
         tx.send(m).ok();
     }
-    // Lines typed on stdin go out as they come. The end of stdin closes
-    // nothing, so a run with no input keeps listening.
+    // Lines typed on stdin go out as they come. For a gRPC call the end of
+    // stdin ends the sending side, so a client-streaming call gets its
+    // answer. For a WebSocket it closes nothing, so a run with no input
+    // keeps listening.
     let typed = tx.clone();
+    let keep_open = (!req.is_grpc()).then_some(tx);
     std::thread::spawn(move || {
         for line in std::io::stdin().lines().map_while(Result::ok) {
             if typed.send(line).is_err() {
@@ -703,7 +709,7 @@ fn listen(
             }
         },
     };
-    drop(tx);
+    drop(keep_open);
     result.map_err(Failure::Answer)
 }
 
