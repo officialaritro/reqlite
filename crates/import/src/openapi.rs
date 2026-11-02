@@ -349,7 +349,7 @@ impl<'a> Doc<'a> {
         let url = format!("{{{{base_url}}}}{}", self.template(path));
         let body = self.body(op, id, &mut headers);
         let auth = self.auth(op, id);
-        let method = Method::try_from(method.to_string()).map_err(&invalid)?;
+        let method = Method::try_from(method.to_string()).map_err(invalid)?;
         let mut req = Request {
             version: 1,
             name: label.into(),
