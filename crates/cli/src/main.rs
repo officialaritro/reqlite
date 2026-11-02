@@ -140,6 +140,19 @@ enum ImportFrom {
         #[arg(long)]
         force: bool,
     },
+    /// An OpenAPI 3.0 or 3.1 document, JSON or YAML, from a file or an
+    /// http(s) URL. Writes one request file per operation, one directory per
+    /// tag, and envs/<api>.toml with the server URL and the variables the
+    /// requests use. Credentials become secrets with no value.
+    Openapi {
+        spec: String,
+        /// Directory to write into.
+        #[arg(long, short)]
+        out: PathBuf,
+        /// Replace files that already exist.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -206,6 +219,9 @@ fn main() -> ExitCode {
                     force,
                 },
         } => import_postman(&collection, &out, force),
+        Command::Import {
+            from: ImportFrom::Openapi { spec, out, force },
+        } => import_openapi(&spec, &out, force),
         Command::Export {
             to: ExportTo::Curl { file },
         } => export_curl(&file),
@@ -304,6 +320,14 @@ struct ReadError {
 #[derive(Debug, thiserror::Error)]
 #[error("cannot create {path}")]
 struct CreateDirError {
+    path: PathBuf,
+    #[source]
+    source: std::io::Error,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("cannot write {path}")]
+struct WriteError {
     path: PathBuf,
     #[source]
     source: std::io::Error,
@@ -871,6 +895,81 @@ fn import_postman(collection: &Path, out: &Path, force: bool) -> Result<(), Fail
             source,
         })
     })?;
+    write_collection(&imported, out, force, None)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("cannot fetch {url}")]
+struct FetchError {
+    url: String,
+    #[source]
+    source: reqwest::Error,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("cannot fetch {url}: the server answered {status}")]
+struct FetchStatus {
+    url: String,
+    status: reqwest::StatusCode,
+}
+
+fn import_openapi(spec: &str, out: &Path, force: bool) -> Result<(), Failure> {
+    let is_url = spec.starts_with("http://") || spec.starts_with("https://");
+    let text = if is_url {
+        fetch(spec)?
+    } else {
+        std::fs::read_to_string(spec).map_err(|source| {
+            Failure::input(ReadError {
+                path: PathBuf::from(spec),
+                source,
+            })
+        })?
+    };
+    let api = reqlite_import::openapi::import(&text, is_url.then_some(spec)).map_err(|source| {
+        Failure::input(InFile {
+            path: PathBuf::from(spec),
+            source,
+        })
+    })?;
+    let env_text =
+        reqlite_format::env_to_string(&api.vars, &api.secrets).map_err(Failure::input)?;
+    let env_path = out
+        .join(reqlite_format::workspace::ENVS)
+        .join(format!("{}.toml", api.env));
+    write_collection(&api.collection, out, force, Some((&env_path, &env_text)))?;
+    eprintln!("wrote the environment {}", env_path.display());
+    Ok(())
+}
+
+/// Reads a document over HTTP with the engine's client and its time limits.
+fn fetch(url: &str) -> Result<String, Failure> {
+    let failed = |source| {
+        Failure::input(FetchError {
+            url: url.into(),
+            source,
+        })
+    };
+    let client = reqlite_engine::client().map_err(failed)?;
+    runtime()?.block_on(async {
+        let response = client.get(url).send().await.map_err(failed)?;
+        if !response.status().is_success() {
+            return Err(Failure::input(FetchStatus {
+                url: url.into(),
+                status: response.status(),
+            }));
+        }
+        response.text().await.map_err(failed)
+    })
+}
+
+/// Writes the request files, and `extra` when given. Nothing is written when
+/// a file exists and `force` is off.
+fn write_collection(
+    imported: &reqlite_import::Collection,
+    out: &Path,
+    force: bool,
+    extra: Option<(&Path, &str)>,
+) -> Result<(), Failure> {
     for w in &imported.warnings {
         eprintln!("warning: {w}");
     }
@@ -880,20 +979,36 @@ fn import_postman(collection: &Path, out: &Path, force: bool) -> Result<(), Fail
         .map(|(rel, req)| (out.join(rel), req))
         .collect();
     if !force {
-        if let Some((path, _)) = targets.iter().find(|(p, _)| p.exists()) {
+        let existing = targets
+            .iter()
+            .map(|(p, _)| p.as_path())
+            .chain(extra.map(|(p, _)| p))
+            .find(|p| p.exists());
+        if let Some(path) = existing {
             return Err(Failure::input(Exists(path.display().to_string())));
         }
     }
+    let create_dir = |path: &Path| match path.parent() {
+        Some(dir) => std::fs::create_dir_all(dir).map_err(|source| {
+            Failure::input(CreateDirError {
+                path: dir.to_path_buf(),
+                source,
+            })
+        }),
+        None => Ok(()),
+    };
     for (path, req) in &targets {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|source| {
-                Failure::input(CreateDirError {
-                    path: dir.to_path_buf(),
-                    source,
-                })
-            })?;
-        }
+        create_dir(path)?;
         reqlite_format::save(path, req).map_err(Failure::input)?;
+    }
+    if let Some((path, text)) = extra {
+        create_dir(path)?;
+        std::fs::write(path, text).map_err(|source| {
+            Failure::input(WriteError {
+                path: path.to_path_buf(),
+                source,
+            })
+        })?;
     }
     eprintln!(
         "wrote {} requests from {:?} to {}",

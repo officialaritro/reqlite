@@ -1,21 +1,34 @@
 //! Environment files. `dev.toml` is shared and committed. `dev.local.toml` sits
 //! next to it, is gitignored, and holds secret values and personal overrides.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The environment file version this build reads.
 pub const ENV_VERSION: u32 = 1;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SharedFile {
     version: u32,
-    #[serde(default)]
-    vars: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     secrets: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    vars: BTreeMap<String, String>,
+}
+
+/// The text of a shared environment file. Secrets are declared by name only;
+/// their values belong in the `.local.toml` file.
+pub fn env_to_string(
+    vars: &BTreeMap<String, String>,
+    secrets: &BTreeSet<String>,
+) -> Result<String, toml::ser::Error> {
+    toml::to_string(&SharedFile {
+        version: ENV_VERSION,
+        secrets: secrets.clone(),
+        vars: vars.clone(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +261,30 @@ mod tests {
         assert_eq!(e.get("id"), Some(&Var::Plain("42".into())));
         assert_eq!(e.get("token"), Some(&Var::Secret("t0k".into())));
         assert_eq!(e.get("new"), Some(&Var::Plain("x".into())));
+    }
+
+    #[test]
+    fn a_written_file_reads_back_with_its_vars_and_secrets() {
+        let vars = BTreeMap::from([
+            (
+                "base_url".to_string(),
+                "https://api.example.com/v1".to_string(),
+            ),
+            ("id".to_string(), String::new()),
+        ]);
+        let secrets = BTreeSet::from(["token".to_string()]);
+        let text = env_to_string(&vars, &secrets).unwrap();
+        let e = env(&text, None).unwrap();
+        assert_eq!(
+            e.get("base_url"),
+            Some(&Var::Plain("https://api.example.com/v1".into()))
+        );
+        assert_eq!(e.get("id"), Some(&Var::Plain(String::new())));
+        assert_eq!(e.get("token"), Some(&Var::MissingSecret));
+        assert_eq!(
+            env_to_string(&BTreeMap::new(), &BTreeSet::new()).unwrap(),
+            "version = 1\n"
+        );
     }
 
     #[test]

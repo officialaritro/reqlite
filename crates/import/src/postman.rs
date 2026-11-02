@@ -2,12 +2,12 @@
 //! and each request a file. Postman and Reqlite both write `{{name}}`, so
 //! placeholders carry over unchanged.
 
-use crate::{Warning, is_literal_credential};
+use crate::{Collection, Warning, file_name, is_literal_credential, unique};
 use reqlite_format::{Auth as ReqAuth, Body as ReqBody, KeyIn, Method, Params, Part, Request};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PostmanError {
@@ -17,14 +17,6 @@ pub enum PostmanError {
     Schema(String),
     #[error("{item}: {reason}")]
     Invalid { item: String, reason: String },
-}
-
-#[derive(Debug)]
-pub struct Collection {
-    pub name: String,
-    /// Paths relative to the output directory, in collection order.
-    pub files: Vec<(PathBuf, Request)>,
-    pub warnings: Vec<Warning>,
 }
 
 #[derive(Deserialize)]
@@ -550,43 +542,6 @@ fn text(v: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
         v => v.to_string(),
-    }
-}
-
-/// A name safe on Windows, macOS and Linux.
-fn file_name(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c.is_control() || "/\\:*?\"<>|".contains(c) {
-                '-'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let cleaned = cleaned.trim().trim_end_matches('.').trim();
-    if cleaned.is_empty() {
-        "untitled".into()
-    } else {
-        cleaned.into()
-    }
-}
-
-/// Appends ` 2`, ` 3` and so on when a sibling already has the name. Comparison
-/// ignores case, because macOS and Windows file systems do.
-fn unique(taken: &mut BTreeSet<String>, base: &str, ext: &str) -> String {
-    let mut n = 1;
-    loop {
-        let name = if n == 1 {
-            format!("{base}{ext}")
-        } else {
-            format!("{base} {n}{ext}")
-        };
-        if taken.insert(name.to_lowercase()) {
-            return name;
-        }
-        n += 1;
     }
 }
 

@@ -15,7 +15,9 @@ mod grpc;
 pub mod workspace;
 pub use body::{Auth, Body, ClientAuth, Grant, KeyIn, OAuth2, Part, graphql_json};
 pub use check::{Assert, JsonPath, Op, Source, Step, Subject};
-pub use env::{EnvError, Environment, Var, is_var_name, load_env, local_path, parse_env};
+pub use env::{
+    EnvError, Environment, Var, env_to_string, is_var_name, load_env, local_path, parse_env,
+};
 pub use grpc::Grpc;
 
 /// The newest request file version this build reads and writes. Files use the
