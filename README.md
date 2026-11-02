@@ -358,6 +358,19 @@ reqlite import postman Shop.postman_collection.json -o shop/
 
 Each folder becomes a directory and each request a file. `{{placeholders}}` carry over unchanged. Auth set on a folder or the collection is copied into each request that inherits it, as an `[auth]` table: bearer, basic and API key. A literal token or password becomes a `{{placeholder}}` with a warning. URL-encoded and form-data bodies, including file fields, file bodies, and GraphQL bodies with their variables carry over. Reqlite runs no scripts, so every pre-request and test script prints a warning that names its request. Disabled headers, parameters and form fields, saved example responses and collection variables also print warnings.
 
+### OpenAPI import
+
+```sh
+reqlite import openapi petstore.yaml -o api/
+reqlite import openapi https://petstore3.swagger.io/api/v3/openapi.json -o api/
+```
+
+Reqlite reads OpenAPI 3.0 and 3.1, in JSON or YAML, from a file or an `http(s)` URL. Swagger 2.0 is refused with an error: convert the file to OpenAPI 3 first. Each operation becomes a request file, named from its `summary`, then its `operationId`, then its method and path. The operation's first tag becomes a directory.
+
+The import also writes `envs/<api-name>.toml`. It holds `base_url`, taken from the first server with its variables set to their defaults. A relative server URL is resolved against the URL you imported from. Path parameters become `{{placeholders}}` declared in the same file. Query and header parameters get their example or default, or else a `{{placeholder}}`. A JSON body comes from the media type's example, or a sample built from the schema. Form and multipart bodies get one field per schema property.
+
+Bearer, basic, API key and OAuth 2.0 (client credentials and authorization code) security schemes become `[auth]` tables. Every credential is a `{{secret}}` declared in the environment file with no value, so no credential is written to a file. Set the values in the `.local.toml` file or with `reqlite secret set`. Anything without a mapping prints a warning that names the operation: a `$ref` to another file, callbacks, webhooks, cookie parameters, and the other request content types when there is more than one. Import refuses to replace an existing file unless you pass `--force`.
+
 ### History
 
 Each send is saved to a local history file, `history.db` in your data directory (for example `~/Library/Application Support/reqlite` on macOS). Set `REQLITE_DATA_DIR` to put it somewhere else. History never leaves your machine and is never committed. Secret values are replaced with `{{name}}` before anything is saved, including in response bodies and headers that echo them. History keeps the first 256 KiB of each response body.
@@ -401,7 +414,7 @@ A send that passes a limit exits with code 1, and the message names the limits t
 | `crates/format` | Request and environment file formats: schema, parser, writer |
 | `crates/engine` | Resolves placeholders, sends a request, returns the response. No UI code. |
 | `crates/store` | Local request history in SQLite |
-| `crates/import` | cURL import and export, Postman import |
+| `crates/import` | cURL import and export, Postman and OpenAPI import |
 | `crates/gui` | The `reqlite-gui` desktop app (iced) |
 | `crates/cli` | The `reqlite` command |
 
